@@ -13,9 +13,9 @@
 //! implements "EDF restricted to a `CpuSet`" (cluster reservation via
 //! `NUM_CLUSTERED_TASKS_ALIVE`, preemption, the lot), so a heavy DAG's
 //! cluster is simply a `ClusteredEDF` cpu_set computed here; a light DAG uses
-//! plain [`SchedulerType::GEDF`]. Both already compute one shared
-//! per-instance absolute deadline for every node of a DAG via
-//! [`super::gedf::calculate_and_update_dag_deadline`], so this module does
+//! plain [`SchedulerType::GEDF`]. Both already compute a per-job-instance
+//! absolute deadline for every node of a DAG via
+//! [`crate::dag::calculate_and_update_dag_deadline`], so this module does
 //! not duplicate that logic — it only decides *which* scheduler and *which*
 //! cores.
 //!
@@ -34,7 +34,7 @@ use awkernel_lib::{
 
 use alloc::vec::Vec;
 
-use super::SchedulerType;
+use super::{pool::is_dag_pool_core, SchedulerType};
 
 /// Where a [`DagAdmissionConfig`]'s `volume`/`critical_path` came from.
 ///
@@ -263,36 +263,6 @@ fn utilization_scaled(volume: u64, period: u64) -> u64 {
     volume.saturating_mul(UTILIZATION_SCALE) / period.max(1)
 }
 
-/// Whether the DAG pool / regular pool split (see [`is_dag_pool_core`] /
-/// [`is_regular_pool_core`]) is in effect. Splitting off one core needs at
-/// least 2 worker cores to leave anything for the DAG side, so systems with
-/// only 1 worker (`num_cpu() < 3`) fall back to every worker being eligible
-/// for both — i.e. today's shared-pool behavior, not a broken one.
-pub(crate) fn dag_pool_split_active() -> bool {
-    num_cpu() >= 3
-}
-
-/// True if `cpu_id` may run light-DAG (GEDF) work.
-///
-/// The last worker core is carved out for regular (non-DAG) tasks — the
-/// shell, driver services, and the like — so a Federated-light DAG task is
-/// never delayed by interference the admission math (`u = C/T`,
-/// [`reserve_light_utilization`]) has no way to account for: none of that
-/// analysis models shell/service load, only DAG-to-DAG contention. See
-/// [`super::get_next_task`] for where this gates dispatch, and
-/// [`super::gedf::calculate_and_update_dag_deadline`]'s callers for where it
-/// gates preemption targets.
-pub(crate) fn is_dag_pool_core(cpu_id: usize) -> bool {
-    cpu_id != 0 && (!dag_pool_split_active() || cpu_id != num_cpu() - 1)
-}
-
-/// True if `cpu_id` may run regular (non-DAG) work: the complement of
-/// [`is_dag_pool_core`] among worker cores while the split is active, and
-/// (like it) true everywhere while the split is inactive.
-pub(crate) fn is_regular_pool_core(cpu_id: usize) -> bool {
-    cpu_id != 0 && (!dag_pool_split_active() || cpu_id == num_cpu() - 1)
-}
-
 /// Shared state for the Federated admission layer, bundled behind one lock
 /// so a heavy admission (which shrinks the light pool) and a light
 /// admission (which checks against it) can never interleave inconsistently.
@@ -502,29 +472,6 @@ mod tests {
             classify_dag(&static_config),
             classify_dag(&measured_config)
         );
-    }
-
-    #[test]
-    fn test_dag_pool_split() {
-        unsafe {
-            awkernel_lib::cpu::set_num_cpu(10); // workers 1..10; last (9) is the regular-pool core
-        }
-        assert!(dag_pool_split_active());
-        assert!(is_regular_pool_core(9));
-        assert!(!is_dag_pool_core(9));
-        for cpu in 1..9 {
-            assert!(is_dag_pool_core(cpu), "cpu {cpu} should be in the DAG pool");
-            assert!(!is_regular_pool_core(cpu), "cpu {cpu} should not be the regular-pool core");
-        }
-
-        // Too few workers to split: every worker is eligible for both pools
-        // (today's shared-pool behavior), not eligible for neither.
-        unsafe {
-            awkernel_lib::cpu::set_num_cpu(2); // 1 worker only
-        }
-        assert!(!dag_pool_split_active());
-        assert!(is_dag_pool_core(1));
-        assert!(is_regular_pool_core(1));
     }
 
     // Exercises allocate_cluster/release_cluster/admit_dag together in one

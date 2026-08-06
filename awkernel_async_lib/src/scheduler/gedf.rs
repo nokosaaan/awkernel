@@ -4,11 +4,11 @@ use core::cmp::max;
 
 use super::{Scheduler, SchedulerType, Task};
 use crate::{
-    dag::{get_dag, get_dag_absolute_deadline, set_dag_absolute_deadline, to_node_index},
+    dag::calculate_and_update_dag_deadline,
     scheduler::GLOBAL_WAKE_GET_MUTEX,
     scheduler::{get_priority, peek_preemption_pending, push_preemption_pending},
     task::{
-        get_task, get_tasks_running, set_current_task, set_need_preemption, DagInfo, State,
+        get_task, get_tasks_running, set_current_task, set_need_preemption, State,
         MAX_TASK_PRIORITY,
     },
 };
@@ -170,7 +170,7 @@ impl GEDFScheduler {
             // and a GEDF (DAG-pool) task must never target the regular-pool core.
             .filter(|rt| {
                 !crate::task::is_cpu_reserved(rt.cpu_id)
-                    && crate::scheduler::federated::is_dag_pool_core(rt.cpu_id)
+                    && crate::scheduler::pool::is_dag_pool_core(rt.cpu_id)
             })
             .filter_map(|rt| {
                 get_task(rt.task_id).map(|t| {
@@ -198,36 +198,4 @@ impl GEDFScheduler {
 
         false
     }
-}
-
-fn get_dag_sink_relative_deadline_ms(dag_id: u32) -> u64 {
-    let dag = get_dag(dag_id).unwrap_or_else(|| panic!("GEDF scheduler: DAG {dag_id} not found"));
-    dag.get_sink_relative_deadline()
-        .map(|deadline| deadline.as_millis() as u64)
-        .unwrap_or_else(|| panic!("GEDF scheduler: DAG {dag_id} has no sink relative deadline set"))
-}
-
-fn calculate_and_set_dag_deadline(dag_id: u32, wake_time: u64) -> u64 {
-    let relative_deadline_ms = get_dag_sink_relative_deadline_ms(dag_id);
-    let dag_absolute_deadline = wake_time + relative_deadline_ms;
-    set_dag_absolute_deadline(dag_id, dag_absolute_deadline);
-    dag_absolute_deadline
-}
-
-pub fn calculate_and_update_dag_deadline(dag_info: &DagInfo, wake_time: u64) -> u64 {
-    let dag_id = dag_info.dag_id;
-    let node_id = dag_info.node_id;
-
-    if let Some(absolute_deadline) = get_dag_absolute_deadline(dag_id) {
-        let dag =
-            get_dag(dag_id).unwrap_or_else(|| panic!("GEDF scheduler: DAG {dag_id} not found"));
-        let current_node_index = to_node_index(node_id);
-        if !dag.is_source_node(current_node_index) {
-            return absolute_deadline;
-        }
-
-        return calculate_and_set_dag_deadline(dag_id, wake_time);
-    }
-
-    calculate_and_set_dag_deadline(dag_id, wake_time)
 }

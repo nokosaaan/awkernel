@@ -1779,12 +1779,11 @@ pub fn wake_workers() {
 
         // A woken DAG-pool core can only ever dequeue a DAG-pool task, and
         // likewise for a regular-pool core (see
-        // `scheduler::federated::is_dag_pool_core`/`is_regular_pool_core`),
+        // `scheduler::pool::is_dag_pool_core`/`is_regular_pool_core`),
         // so each pool's budget is only spent on a core eligible for it.
-        let serves_dag_pool =
-            crate::scheduler::federated::is_dag_pool_core(i) && num_dag_pool_tasks > 0;
+        let serves_dag_pool = crate::scheduler::pool::is_dag_pool_core(i) && num_dag_pool_tasks > 0;
         let serves_regular_pool =
-            crate::scheduler::federated::is_regular_pool_core(i) && num_regular_pool_tasks > 0;
+            crate::scheduler::pool::is_regular_pool_core(i) && num_regular_pool_tasks > 0;
 
         // Even if neither budget currently applies to this CPU, keep
         // scanning: a higher-numbered CPU may still have clustered tasks

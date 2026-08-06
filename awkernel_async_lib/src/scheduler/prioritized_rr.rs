@@ -151,7 +151,7 @@ impl PrioritizedRRScheduler {
             // and a regular-pool task must never target a DAG-pool core.
             .filter(|rt| {
                 !crate::task::is_cpu_reserved(rt.cpu_id)
-                    && crate::scheduler::federated::is_regular_pool_core(rt.cpu_id)
+                    && crate::scheduler::pool::is_regular_pool_core(rt.cpu_id)
             })
             .filter_map(|rt| {
                 get_task(rt.task_id).map(|t| {

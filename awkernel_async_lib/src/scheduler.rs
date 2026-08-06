@@ -21,6 +21,7 @@ mod clustered_edf;
 pub mod federated;
 pub mod gedf;
 pub(super) mod panicked;
+pub(crate) mod pool;
 mod prioritized_fifo;
 mod prioritized_rr;
 
@@ -133,7 +134,7 @@ impl SchedulerType {
     /// GEDF). Update this function when adding a second DAG-oriented global
     /// scheduler; it is the single source of truth for the DAG-pool slice of
     /// `PRIORITY_LIST` immediately following the clustered prefix (see
-    /// `federated::is_dag_pool_core`).
+    /// `pool::is_dag_pool_core`).
     pub const fn is_dag_pool_scheduler(&self) -> bool {
         matches!(self, SchedulerType::GEDF(_))
     }
@@ -311,15 +312,15 @@ pub(crate) fn get_next_task(execution_ensured: bool) -> Option<Arc<Task>> {
     //
     // Within that remainder, the DAG pool (GEDF) and the regular pool
     // (PrioritizedFIFO/RR/Panicked) are further split by cpu_id (see
-    // `federated::is_dag_pool_core`/`is_regular_pool_core`): a DAG-pool core
+    // `pool::is_dag_pool_core`/`is_regular_pool_core`): a DAG-pool core
     // may only serve DAG-pool entries, a regular-pool core only regular-pool
     // entries. While the split is inactive (too few workers), both
     // predicates are true everywhere, so every entry is tried on every core
     // — identical to the pre-split behavior.
     let dag_pool_start = get_num_clustered_schedulers();
     let dag_pool_end = dag_pool_start + get_num_dag_pool_schedulers();
-    let may_run_dag_pool = federated::is_dag_pool_core(cpu_id);
-    let may_run_regular_pool = federated::is_regular_pool_core(cpu_id);
+    let may_run_dag_pool = pool::is_dag_pool_core(cpu_id);
+    let may_run_regular_pool = pool::is_regular_pool_core(cpu_id);
 
     PRIORITY_LIST[dag_pool_start..]
         .iter()

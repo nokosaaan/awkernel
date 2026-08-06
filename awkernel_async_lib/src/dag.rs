@@ -82,7 +82,7 @@ use alloc::{
     vec::Vec,
 };
 use awkernel_lib::sync::mutex::{MCSNode, Mutex};
-use core::{future::Future, pin::Pin, time::Duration};
+use core::{future::Future, pin::Pin, sync::atomic::Ordering, time::Duration};
 
 #[cfg(feature = "perf")]
 use performance::ResponseInfo;
@@ -176,10 +176,54 @@ impl core::fmt::Display for DagError {
 pub struct Dag {
     id: u32,
     graph: Mutex<graph::Graph<NodeInfo, EdgeInfo>>,
-    absolute_deadline: Mutex<Option<u64>>,
+    job_table: Mutex<DagJobTable>,
 
     #[cfg(feature = "perf")]
     response_info: Mutex<ResponseInfo>,
+}
+
+/// Number of concurrent job (DAG instance) absolute deadlines a single
+/// [`Dag`] can track at once, indexed by `job_index % DAG_JOB_TABLE_SIZE`.
+///
+/// A DAG whose relative deadline `D` exceeds its period `T` ("arbitrary
+/// deadline") can have more than one instance in flight at the same time —
+/// up to roughly `ceil(D / T)` of them, since the source releases a new
+/// instance every `T` while an older instance's downstream nodes may still
+/// be running. Sizing this per-DAG would need a dynamic allocation on the
+/// scheduling-critical wake path, so it is instead one fixed, generous bound
+/// shared by every DAG (bounded WCET, allocation-free lookups). If a DAG's
+/// `D / T` ratio ever exceeds this, [`calculate_and_update_dag_deadline`]
+/// logs a warning and falls back to an approximation rather than silently
+/// reusing a stale entry.
+const DAG_JOB_TABLE_SIZE: usize = 16;
+
+/// Per-DAG-instance ("job") absolute deadlines, keyed by a monotonically
+/// increasing job index. Replaces a single `Mutex<Option<u64>>` shared by
+/// every node of a DAG, which corrupted the deadline of an older, still
+/// in-flight instance whenever a newer instance's source node recomputed and
+/// overwrote it (see [`DAG_JOB_TABLE_SIZE`]).
+struct DagJobTable {
+    deadlines: [Option<u64>; DAG_JOB_TABLE_SIZE],
+}
+
+impl DagJobTable {
+    const fn new() -> Self {
+        Self {
+            deadlines: [None; DAG_JOB_TABLE_SIZE],
+        }
+    }
+
+    fn slot(job_index: u64) -> usize {
+        (job_index % DAG_JOB_TABLE_SIZE as u64) as usize
+    }
+
+    fn set(&mut self, job_index: u64, deadline: u64) {
+        self.deadlines[Self::slot(job_index)] = Some(deadline);
+    }
+
+    fn get(&self, job_index: u64) -> Option<u64> {
+        self.deadlines[Self::slot(job_index)]
+    }
 }
 
 impl Dag {
@@ -481,18 +525,24 @@ impl Dag {
         }
     }
 
+    /// Record `deadline` as the absolute deadline of job `job_index` of this
+    /// DAG. Called once per instance, by that instance's source node.
     #[inline(always)]
-    pub fn set_absolute_deadline(&self, deadline: u64) {
+    fn set_job_absolute_deadline(&self, job_index: u64, deadline: u64) {
         let mut node = MCSNode::new();
-        let mut absolute_deadline = self.absolute_deadline.lock(&mut node);
-        *absolute_deadline = Some(deadline);
+        let mut job_table = self.job_table.lock(&mut node);
+        job_table.set(job_index, deadline);
     }
 
+    /// Look up the absolute deadline previously recorded for job `job_index`
+    /// of this DAG. Returns `None` if the source has not recorded it yet, or
+    /// if it was already overwritten by a later job wrapping around the
+    /// fixed-size ring (see [`DAG_JOB_TABLE_SIZE`]).
     #[inline(always)]
-    pub fn get_absolute_deadline(&self) -> Option<u64> {
+    fn get_job_absolute_deadline(&self, job_index: u64) -> Option<u64> {
         let mut node = MCSNode::new();
-        let absolute_deadline = self.absolute_deadline.lock(&mut node);
-        *absolute_deadline
+        let job_table = self.job_table.lock(&mut node);
+        job_table.get(job_index)
     }
 }
 
@@ -550,7 +600,7 @@ impl Dags {
                 let dag = Arc::new(Dag {
                     id,
                     graph: Mutex::new(graph::Graph::new()),
-                    absolute_deadline: Mutex::new(None),
+                    job_table: Mutex::new(DagJobTable::new()),
 
                     #[cfg(feature = "perf")]
                     response_info: Mutex::new(ResponseInfo::new()),
@@ -613,18 +663,86 @@ pub fn get_all_dag_edges() -> Vec<(u32, u32, u32)> {
     edges
 }
 
-#[inline(always)]
-pub fn get_dag_absolute_deadline(dag_id: u32) -> Option<u64> {
-    get_dag(dag_id)?.get_absolute_deadline()
+fn get_dag_sink_relative_deadline_ms(dag_id: u32) -> u64 {
+    let dag = get_dag(dag_id).unwrap_or_else(|| panic!("DAG {dag_id} not found"));
+    dag.get_sink_relative_deadline()
+        .map(|deadline| deadline.as_millis() as u64)
+        .unwrap_or_else(|| panic!("DAG {dag_id} has no sink relative deadline set"))
 }
 
-#[inline(always)]
-pub fn set_dag_absolute_deadline(dag_id: u32, deadline: u64) -> bool {
-    if let Some(dag) = get_dag(dag_id) {
-        dag.set_absolute_deadline(deadline);
-        true
+/// This node's job index: how many jobs (DAG instances) it has already
+/// consumed/released so far, i.e. the index of the job whose message this
+/// wake is about to process.
+///
+/// Derived from [`DagInfo::period_index`], which every reactor body
+/// (source/intermediate/sink, see `spawn_reactor` and friends) stores to
+/// only once it has actually consumed (or, for the source, released) a
+/// job's data. At `wake_task` time — before the future runs and reads the
+/// new message — the counter therefore still holds the *previous* job's
+/// index, so the job this wake belongs to is always `previous + 1`. This
+/// holds uniformly for the source (whose "previous" is the job it released
+/// last) and for intermediate/sink nodes (whose "previous" is the job whose
+/// message they last consumed): every node sees every job exactly once, in
+/// release order, because pubsub topics have a single publisher and an
+/// in-order queue, and no node here filters, reorders, or drops jobs.
+///
+/// Without the `period-index-propagation` feature the counter never moves
+/// off `0`, so every job maps to the same slot here — i.e. this degrades to
+/// the pre-fix single-shared-deadline behavior (no worse than before)
+/// rather than silently mis-tracking jobs it has no way to distinguish.
+fn next_job_index(dag_info: &DagInfo) -> u64 {
+    dag_info.period_index.load(Ordering::Relaxed) as u64 + 1
+}
+
+/// Compute (for a source node) or look up (for every other node) the
+/// absolute deadline of the job this wake belongs to, disambiguated by
+/// [`next_job_index`] so that two instances of the same DAG in flight at
+/// once (an "arbitrary deadline" DAG, i.e. relative deadline `D` > period
+/// `T`) do not clobber each other's deadline — see [`DAG_JOB_TABLE_SIZE`].
+pub fn calculate_and_update_dag_deadline(dag_info: &DagInfo, wake_time: u64) -> u64 {
+    let dag_id = dag_info.dag_id;
+    let job_index = next_job_index(dag_info);
+
+    let dag = get_dag(dag_id).unwrap_or_else(|| panic!("DAG {dag_id} not found"));
+    let current_node_index = to_node_index(dag_info.node_id);
+
+    if dag.is_source_node(current_node_index) {
+        // Source: this wake always releases a brand-new job, so always
+        // compute and record a fresh deadline for it.
+        let relative_deadline_ms = get_dag_sink_relative_deadline_ms(dag_id);
+        let absolute_deadline = wake_time + relative_deadline_ms;
+        dag.set_job_absolute_deadline(job_index, absolute_deadline);
+        absolute_deadline
+    } else if let Some(absolute_deadline) = dag.get_job_absolute_deadline(job_index) {
+        absolute_deadline
     } else {
-        false
+        // A miss here has two distinct, identical-looking causes:
+        //
+        // 1. Startup transient (harmless): every task — including every
+        //    non-source DAG node — gets one initial wake right after
+        //    `spawn_dag` creates it, before any real message has ever
+        //    arrived (see `task::inner_spawn`'s `task.wake()`), and
+        //    non-source nodes are spawned *before* the source (`spawn_dag`
+        //    spawns the source last, precisely so it never publishes before
+        //    its subscribers exist). That poll immediately re-suspends on
+        //    `recv` without consuming anything, so `next_job_index` never
+        //    advances past this — it can only ever land within the ring's
+        //    first lap (`job_index <= DAG_JOB_TABLE_SIZE`).
+        // 2. Ring wraparound (actionable): this node is running further
+        //    behind the source's releases than the fixed-size ring
+        //    (`DAG_JOB_TABLE_SIZE`) can track — its D/T ratio is wider than
+        //    provisioned — and the entry was overwritten. Only possible once
+        //    `job_index` has lapped the ring at least once.
+        //
+        // Only the second case is worth an operator's attention.
+        if job_index > DAG_JOB_TABLE_SIZE as u64 {
+            log::warn!(
+                "DAG {dag_id} job {job_index}: absolute deadline not found in the job table \
+                 (DAG_JOB_TABLE_SIZE={DAG_JOB_TABLE_SIZE} may be too small for this DAG's D/T \
+                 ratio); falling back to wake_time + relative_deadline"
+            );
+        }
+        wake_time + get_dag_sink_relative_deadline_ms(dag_id)
     }
 }
 

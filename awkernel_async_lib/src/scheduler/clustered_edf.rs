@@ -7,9 +7,10 @@
 
 use super::{Scheduler, SchedulerType, Task};
 use crate::{
+    dag::calculate_and_update_dag_deadline,
     scheduler::{
-        gedf::calculate_and_update_dag_deadline, get_priority, peek_preemption_pending,
-        push_preemption_pending, ClusteredTask, GLOBAL_WAKE_GET_MUTEX,
+        get_priority, peek_preemption_pending, push_preemption_pending, ClusteredTask,
+        GLOBAL_WAKE_GET_MUTEX,
     },
     task::{
         get_task, get_task_running, set_current_task, set_need_preemption, State, MAX_TASK_PRIORITY,
