@@ -704,44 +704,22 @@ pub mod perf {
     // This value represents the type of pubsub (publish only, subscribe only, or both publish and subscribe)
     // and is a fixed value.
     const MAX_PUBSUB: usize = 3;
-    // This value indicates the maximum number of nodes in the DAG
-    // and can be adjusted based on the structure of the DAG used for evaluation.
-    const MAX_NODES: usize = 15;
     #[derive(Clone)]
     struct PubSubTable {
-        timestamps: [[[u64; MAX_NODES]; MAX_PUBSUB]; MAX_LOGS],
-        used_indices: Vec<usize>,
+        // Indexed by ring-buffer log index, then pub/sub role id (see `MAX_PUBSUB`).
+        // Keyed by (dag_id, node_id) rather than a plain node-id array because
+        // `node_id` is only unique within a single DAG's own graph (see
+        // `dag.rs`'s `node_idx.index()`); without `dag_id`, concurrent DAG
+        // instances would collide on the same cell, unlike the exec-time
+        // tables (`SEND_OUTER_TIMESTAMP` etc.) which already key on `dag_id`.
+        timestamps: [[BTreeMap<(u32, u32), u64>; MAX_PUBSUB]; MAX_LOGS],
     }
 
     impl Default for PubSubTable {
         fn default() -> Self {
             Self {
-                timestamps: [[[0; MAX_NODES]; MAX_PUBSUB]; MAX_LOGS],
-                used_indices: Vec::new(),
+                timestamps: core::array::from_fn(|_| core::array::from_fn(|_| BTreeMap::new())),
             }
-        }
-    }
-
-    impl PubSubTable {
-        #[inline(always)]
-        fn flat_index(index: usize, pub_id: usize, node_id: usize) -> usize {
-            (index * MAX_PUBSUB * MAX_NODES) + (pub_id * MAX_NODES) + node_id
-        }
-
-        #[inline(always)]
-        fn decode_flat_index(flat_index: usize) -> (usize, usize, usize) {
-            let per_log = MAX_PUBSUB * MAX_NODES;
-            let index = flat_index / per_log;
-            let rem = flat_index % per_log;
-            let pub_id = rem / MAX_NODES;
-            let node_id = rem % MAX_NODES;
-            (index, pub_id, node_id)
-        }
-
-        #[inline(always)]
-        fn mark_used(&mut self, index: usize, pub_id: usize, node_id: usize) {
-            self.used_indices
-                .push(Self::flat_index(index, pub_id, node_id));
         }
     }
 
@@ -805,6 +783,7 @@ pub mod perf {
         period_index: usize,
         new_timestamp: u64,
         pub_id: u32,
+        dag_id: u32,
         node_id: u32,
     ) {
         let log_index = to_ring_buffer_index(period_index);
@@ -817,32 +796,22 @@ pub mod perf {
             return;
         }
 
-        let node_id_usize = node_id as usize;
-        if node_id_usize >= MAX_NODES {
-            log::warn!(
-                "Publish node ID out of bounds: {} (max {})",
-                node_id_usize,
-                MAX_NODES
-            );
-            return;
-        }
-
         let mut node = MCSNode::new();
         let mut recorder_opt = PUBLISH.lock(&mut node);
 
         let recorder = recorder_opt.get_or_insert_with(|| Box::new(PubSubTable::default()));
         let pub_id = pub_id as usize;
 
-        if recorder.timestamps[log_index][pub_id][node_id_usize] == 0 {
-            recorder.timestamps[log_index][pub_id][node_id_usize] = new_timestamp;
-            recorder.mark_used(log_index, pub_id, node_id_usize);
-        }
+        recorder.timestamps[log_index][pub_id]
+            .entry((dag_id, node_id))
+            .or_insert(new_timestamp);
     }
 
     pub fn record_subscribe_timestamp(
         period_index: usize,
         new_timestamp: u64,
         sub_id: u32,
+        dag_id: u32,
         node_id: u32,
     ) {
         let log_index = to_ring_buffer_index(period_index);
@@ -855,26 +824,15 @@ pub mod perf {
             return;
         }
 
-        let node_id_usize = node_id as usize;
-        if node_id_usize >= MAX_NODES {
-            log::warn!(
-                "Subscribe node ID out of bounds: {} (max {})",
-                node_id_usize,
-                MAX_NODES
-            );
-            return;
-        }
-
         let mut node = MCSNode::new();
         let mut recorder_opt = SUBSCRIBE.lock(&mut node);
 
         let recorder = recorder_opt.get_or_insert_with(|| Box::new(PubSubTable::default()));
         let sub_id = sub_id as usize;
 
-        if recorder.timestamps[log_index][sub_id][node_id_usize] == 0 {
-            recorder.timestamps[log_index][sub_id][node_id_usize] = new_timestamp;
-            recorder.mark_used(log_index, sub_id, node_id_usize);
-        }
+        recorder.timestamps[log_index][sub_id]
+            .entry((dag_id, node_id))
+            .or_insert(new_timestamp);
     }
 
     // For precision of the cycle
@@ -1012,39 +970,48 @@ pub mod perf {
         let publish_opt = PUBLISH.lock(&mut node1);
         let subscribe_opt = SUBSCRIBE.lock(&mut node2);
 
-        let mut indices = Vec::new();
-        if let Some(publish) = publish_opt.as_ref() {
-            indices.extend_from_slice(&publish.used_indices);
+        // (log_index, pub_id, dag_id, node_id)
+        let mut keys: Vec<(usize, usize, u32, u32)> = Vec::new();
+        for table_opt in [&publish_opt, &subscribe_opt] {
+            if let Some(table) = table_opt.as_ref() {
+                for (log_index, per_pub) in table.timestamps.iter().enumerate() {
+                    for (pub_id, map) in per_pub.iter().enumerate() {
+                        keys.extend(
+                            map.keys()
+                                .map(|&(dag_id, node_id)| (log_index, pub_id, dag_id, node_id)),
+                        );
+                    }
+                }
+            }
         }
-        if let Some(subscribe) = subscribe_opt.as_ref() {
-            indices.extend_from_slice(&subscribe.used_indices);
-        }
-        indices.sort_unstable();
-        indices.dedup();
+        keys.sort_unstable();
+        keys.dedup();
 
         log::info!("--- Pub/Sub Timestamp Summary (in nanoseconds) ---");
         log::info!(
-            "{: ^5} | {: ^10} | {: ^7} | {: ^14} | {: ^14}",
+            "{: ^5} | {: ^10} | {: ^6} | {: ^7} | {: ^14} | {: ^14}",
             "Index",
             "Pub/Sub ID",
+            "DAG ID",
             "Node ID",
             "Publish Time",
             "Subscribe Time"
         );
-        log::info!("-----|------------|---------|----------------|----------------");
-        for flat_index in indices {
-            let (i, j, k) = PubSubTable::decode_flat_index(flat_index);
-            // Skip if decoded indices are out of bounds
-            if i >= MAX_LOGS || j >= MAX_PUBSUB || k >= MAX_NODES {
-                log::warn!("Decoded index out of bounds: ({}, {}, {})", i, j, k);
-                continue;
-            }
+        log::info!("-----|------------|--------|---------|----------------|----------------");
+        for (log_index, pub_id, dag_id, node_id) in keys {
+            let key = (dag_id, node_id);
             let publish_time = match &*publish_opt {
-                Some(table) => table.timestamps[i][j][k],
+                Some(table) => table.timestamps[log_index][pub_id]
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(0),
                 None => 0,
             };
             let subscribe_time = match &*subscribe_opt {
-                Some(table) => table.timestamps[i][j][k],
+                Some(table) => table.timestamps[log_index][pub_id]
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(0),
                 None => 0,
             };
 
@@ -1058,10 +1025,11 @@ pub mod perf {
                 };
 
                 log::info!(
-                    "{: >5} | {: >10} | {: >7} | {: >14} | {: >14}",
-                    i,
-                    j,
-                    k,
+                    "{: >5} | {: >10} | {: >6} | {: >7} | {: >14} | {: >14}",
+                    log_index,
+                    pub_id,
+                    dag_id,
+                    node_id,
                     format_ts(publish_time),
                     format_ts(subscribe_time),
                 );

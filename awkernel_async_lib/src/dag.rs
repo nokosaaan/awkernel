@@ -1094,11 +1094,23 @@ where
 
                 // [end] pubsub communication latency
                 let end = awkernel_lib::time::Time::now().uptime().as_nanos() as u64;
-                record_subscribe_timestamp(period_index as usize, end, 1, dag_info.node_id);
+                record_subscribe_timestamp(
+                    period_index as usize,
+                    end,
+                    1,
+                    dag_info.dag_id,
+                    dag_info.node_id,
+                );
 
                 let results = f(args);
                 publishers
-                    .send_all_with_period_index(results, 1, period_index as usize, dag_info.node_id)
+                    .send_all_with_period_index(
+                        results,
+                        1,
+                        period_index as usize,
+                        dag_info.dag_id,
+                        dag_info.node_id,
+                    )
                     .await;
             }
 
@@ -1167,7 +1179,13 @@ where
                 }
                 let results = f();
                 publishers
-                    .send_all_with_period_index(results, 0, index, dag_info.node_id)
+                    .send_all_with_period_index(
+                        results,
+                        0,
+                        index,
+                        dag_info.dag_id,
+                        dag_info.node_id,
+                    )
                     .await;
                 increment_period_index(dag_info.dag_id);
             }
@@ -1223,7 +1241,13 @@ where
 
                 // [end] pubsub communication latency
                 let end = awkernel_lib::time::Time::now().uptime().as_nanos() as u64;
-                record_subscribe_timestamp(period_index as usize, end, 2, dag_info.node_id);
+                record_subscribe_timestamp(
+                    period_index as usize,
+                    end,
+                    2,
+                    dag_info.dag_id,
+                    dag_info.node_id,
+                );
 
                 let timenow = awkernel_lib::time::Time::now().uptime().as_nanos() as u64;
                 if period_index != 0 {
