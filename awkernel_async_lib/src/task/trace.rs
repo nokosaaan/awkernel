@@ -124,6 +124,11 @@ pub fn start() {
     CAL_START_TSC.store(awkernel_lib::delay::cpu_counter(), Ordering::Relaxed);
     CAL_START_US.store(awkernel_lib::delay::uptime(), Ordering::Relaxed);
 
+    // Start this recording window with an empty pubsub table rather than
+    // whatever accumulated the last time recording was on.
+    #[cfg(feature = "period-index-propagation")]
+    super::perf::reset_pubsub_tables();
+
     // Buffers must be visible before any CPU starts recording.
     ENABLED.store(true, Ordering::Release);
 }
@@ -234,6 +239,12 @@ pub fn dump_to_console() {
     for (dag_id, src, dst) in crate::dag::get_all_dag_edges() {
         console::print(&format!("TRACE_DAG,{dag_id},{src},{dst}\r\n"));
     }
+
+    // TRACE_PUBSUB,<dag_id>,<node_id>,<period>,<publish_ns|->,<subscribe_ns|->
+    // Pubsub latency for this same recording window; see
+    // `perf::dump_pubsub_to_console` for the format and scoping rationale.
+    #[cfg(feature = "period-index-propagation")]
+    super::perf::dump_pubsub_to_console();
 
     for cpu_id in 0..awkernel_lib::cpu::num_cpu() {
         let evs = events(cpu_id);

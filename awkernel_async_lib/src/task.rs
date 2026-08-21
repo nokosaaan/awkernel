@@ -706,25 +706,39 @@ pub mod perf {
     const MAX_PUBSUB: usize = 3;
     #[derive(Clone)]
     struct PubSubTable {
-        // Indexed by ring-buffer log index, then pub/sub role id (see `MAX_PUBSUB`).
-        // Keyed by (dag_id, node_id) rather than a plain node-id array because
-        // `node_id` is only unique within a single DAG's own graph (see
-        // `dag.rs`'s `node_idx.index()`); without `dag_id`, concurrent DAG
-        // instances would collide on the same cell, unlike the exec-time
-        // tables (`SEND_OUTER_TIMESTAMP` etc.) which already key on `dag_id`.
-        timestamps: [[BTreeMap<(u32, u32), u64>; MAX_PUBSUB]; MAX_LOGS],
+        // Indexed by pub/sub role id (see `MAX_PUBSUB`), keyed by the DAG's
+        // *absolute* (period_index, dag_id, node_id) — not a ring-buffer log
+        // index. Unlike `SEND_OUTER_TIMESTAMP` etc. (which are fine to wrap
+        // at `MAX_LOGS` since they only need the *latest* value per dag_id),
+        // this table is read back as a per-period timeline: wrapping would
+        // silently drop or misattribute periods once a DAG runs past
+        // `MAX_LOGS` releases, with no signal that it happened. Recording is
+        // gated on `trace::is_enabled()` and reset in `trace::start()`, so
+        // it stays scoped to one recording window and bounded in practice.
+        timestamps: [BTreeMap<(u32, u32, u32), u64>; MAX_PUBSUB],
     }
 
     impl Default for PubSubTable {
         fn default() -> Self {
             Self {
-                timestamps: core::array::from_fn(|_| core::array::from_fn(|_| BTreeMap::new())),
+                timestamps: core::array::from_fn(|_| BTreeMap::new()),
             }
         }
     }
 
     static PUBLISH: Mutex<Option<Box<PubSubTable>>> = Mutex::new(None);
     static SUBSCRIBE: Mutex<Option<Box<PubSubTable>>> = Mutex::new(None);
+
+    /// Clear recorded pubsub timestamps. Called from `trace::start()` so a
+    /// new recording window starts with an empty table instead of carrying
+    /// over data (possibly stale, possibly from a different workload) from
+    /// whenever recording last ran.
+    pub(crate) fn reset_pubsub_tables() {
+        let mut node = MCSNode::new();
+        *PUBLISH.lock(&mut node) = None;
+        let mut node = MCSNode::new();
+        *SUBSCRIBE.lock(&mut node) = None;
+    }
 
     #[inline(always)]
     fn to_ring_buffer_index(period_index: usize) -> usize {
@@ -786,7 +800,9 @@ pub mod perf {
         dag_id: u32,
         node_id: u32,
     ) {
-        let log_index = to_ring_buffer_index(period_index);
+        if !super::trace::is_enabled() {
+            return;
+        }
         if (pub_id as usize) >= MAX_PUBSUB {
             log::warn!(
                 "Publish ID out of bounds: {} (max {})",
@@ -802,8 +818,8 @@ pub mod perf {
         let recorder = recorder_opt.get_or_insert_with(|| Box::new(PubSubTable::default()));
         let pub_id = pub_id as usize;
 
-        recorder.timestamps[log_index][pub_id]
-            .entry((dag_id, node_id))
+        recorder.timestamps[pub_id]
+            .entry((period_index as u32, dag_id, node_id))
             .or_insert(new_timestamp);
     }
 
@@ -814,7 +830,9 @@ pub mod perf {
         dag_id: u32,
         node_id: u32,
     ) {
-        let log_index = to_ring_buffer_index(period_index);
+        if !super::trace::is_enabled() {
+            return;
+        }
         if (sub_id as usize) >= MAX_PUBSUB {
             log::warn!(
                 "Subscribe ID out of bounds: {} (max {})",
@@ -830,8 +848,8 @@ pub mod perf {
         let recorder = recorder_opt.get_or_insert_with(|| Box::new(PubSubTable::default()));
         let sub_id = sub_id as usize;
 
-        recorder.timestamps[log_index][sub_id]
-            .entry((dag_id, node_id))
+        recorder.timestamps[sub_id]
+            .entry((period_index as u32, dag_id, node_id))
             .or_insert(new_timestamp);
     }
 
@@ -970,17 +988,17 @@ pub mod perf {
         let publish_opt = PUBLISH.lock(&mut node1);
         let subscribe_opt = SUBSCRIBE.lock(&mut node2);
 
-        // (log_index, pub_id, dag_id, node_id)
-        let mut keys: Vec<(usize, usize, u32, u32)> = Vec::new();
+        // (period_index, pub_id, dag_id, node_id)
+        let mut keys: Vec<(u32, usize, u32, u32)> = Vec::new();
         for table_opt in [&publish_opt, &subscribe_opt] {
             if let Some(table) = table_opt.as_ref() {
-                for (log_index, per_pub) in table.timestamps.iter().enumerate() {
-                    for (pub_id, map) in per_pub.iter().enumerate() {
-                        keys.extend(
-                            map.keys()
-                                .map(|&(dag_id, node_id)| (log_index, pub_id, dag_id, node_id)),
-                        );
-                    }
+                for (pub_id, map) in table.timestamps.iter().enumerate() {
+                    keys.extend(
+                        map.keys()
+                            .map(|&(period_index, dag_id, node_id)| {
+                                (period_index, pub_id, dag_id, node_id)
+                            }),
+                    );
                 }
             }
         }
@@ -989,29 +1007,23 @@ pub mod perf {
 
         log::info!("--- Pub/Sub Timestamp Summary (in nanoseconds) ---");
         log::info!(
-            "{: ^5} | {: ^10} | {: ^6} | {: ^7} | {: ^14} | {: ^14}",
-            "Index",
+            "{: ^7} | {: ^10} | {: ^6} | {: ^7} | {: ^14} | {: ^14}",
+            "Period",
             "Pub/Sub ID",
             "DAG ID",
             "Node ID",
             "Publish Time",
             "Subscribe Time"
         );
-        log::info!("-----|------------|--------|---------|----------------|----------------");
-        for (log_index, pub_id, dag_id, node_id) in keys {
-            let key = (dag_id, node_id);
+        log::info!("--------|------------|--------|---------|----------------|----------------");
+        for (period_index, pub_id, dag_id, node_id) in keys {
+            let key = (period_index, dag_id, node_id);
             let publish_time = match &*publish_opt {
-                Some(table) => table.timestamps[log_index][pub_id]
-                    .get(&key)
-                    .copied()
-                    .unwrap_or(0),
+                Some(table) => table.timestamps[pub_id].get(&key).copied().unwrap_or(0),
                 None => 0,
             };
             let subscribe_time = match &*subscribe_opt {
-                Some(table) => table.timestamps[log_index][pub_id]
-                    .get(&key)
-                    .copied()
-                    .unwrap_or(0),
+                Some(table) => table.timestamps[pub_id].get(&key).copied().unwrap_or(0),
                 None => 0,
             };
 
@@ -1025,8 +1037,8 @@ pub mod perf {
                 };
 
                 log::info!(
-                    "{: >5} | {: >10} | {: >6} | {: >7} | {: >14} | {: >14}",
-                    log_index,
+                    "{: >7} | {: >10} | {: >6} | {: >7} | {: >14} | {: >14}",
+                    period_index,
                     pub_id,
                     dag_id,
                     node_id,
@@ -1036,6 +1048,63 @@ pub mod perf {
             }
         }
         log::info!("--------------------------------------------------------------");
+    }
+
+    /// Dump recorded pubsub timestamps in the `TRACE_PUBSUB` line format
+    /// consumed by `awkernel_script`'s pubsub-latency tooling. Called from
+    /// `trace::dump_to_console()`, alongside `TRACE_TASK`/`TRACE_DAG`, so a
+    /// single serial capture carries both exec-time and pubsub data for the
+    /// same recording window.
+    ///
+    /// `TRACE_PUBSUB,<dag_id>,<node_id>,<period>,<publish_ns|->,<subscribe_ns|->`
+    /// Timestamps are already absolute uptime nanoseconds (`Time::now()`),
+    /// so unlike `TRACE_EV` no calibration conversion is needed on the host.
+    pub(crate) fn dump_pubsub_to_console() {
+        use awkernel_lib::console;
+
+        let mut node1 = MCSNode::new();
+        let mut node2 = MCSNode::new();
+
+        let publish_opt = PUBLISH.lock(&mut node1);
+        let subscribe_opt = SUBSCRIBE.lock(&mut node2);
+
+        // (dag_id, node_id, period_index)
+        let mut keys: Vec<(u32, u32, u32)> = Vec::new();
+        for table_opt in [&publish_opt, &subscribe_opt] {
+            if let Some(table) = table_opt.as_ref() {
+                for map in table.timestamps.iter() {
+                    keys.extend(
+                        map.keys()
+                            .map(|&(period_index, dag_id, node_id)| (dag_id, node_id, period_index)),
+                    );
+                }
+            }
+        }
+        keys.sort_unstable();
+        keys.dedup();
+
+        for (dag_id, node_id, period_index) in keys {
+            let key = (period_index, dag_id, node_id);
+            let lookup = |table_opt: &Option<Box<PubSubTable>>| -> Option<u64> {
+                table_opt
+                    .as_ref()
+                    .and_then(|table| table.timestamps.iter().find_map(|m| m.get(&key).copied()))
+            };
+
+            let publish_ns = lookup(&*publish_opt);
+            let subscribe_ns = lookup(&*subscribe_opt);
+
+            let fmt = |ts: Option<u64>| match ts {
+                Some(ts) => alloc::format!("{ts}"),
+                None => "-".to_string(),
+            };
+
+            console::print(&alloc::format!(
+                "TRACE_PUBSUB,{dag_id},{node_id},{period_index},{},{}\r\n",
+                fmt(publish_ns),
+                fmt(subscribe_ns)
+            ));
+        }
     }
 
     fn update_time_and_state(next_state: PerfState) {
