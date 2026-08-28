@@ -268,6 +268,26 @@ impl Dag {
         graph.node_weight_mut(node_idx).unwrap().relative_deadline = Some(deadline);
     }
 
+    /// Set a scheduling-policy priority for node `node_id` (the same id
+    /// carried on [`crate::task::DagInfo::node_id`], i.e. the registration
+    /// order of `register_reactor`/`register_periodic_reactor`/
+    /// `register_sink_reactor` for this DAG). `dag.rs` never interprets this
+    /// value itself; it exists so a `dag_sched` policy (e.g. a laxity-based
+    /// or other node-importance ranking, computed once the whole DAG's
+    /// structure is known) can annotate individual nodes after registration.
+    ///
+    /// Silently does nothing if `node_id` does not name a node of this DAG.
+    /// Call before [`finish_create_dags`], like [`Self::set_relative_deadline`]
+    /// — nodes are already spawned and reading their `SchedulerType` by then.
+    pub fn set_node_priority(&self, node_id: u32, priority: u64) {
+        let node_idx = to_node_index(node_id);
+        let mut node = MCSNode::new();
+        let mut graph = self.graph.lock(&mut node);
+        if let Some(info) = graph.node_weight_mut(node_idx) {
+            info.priority = Some(priority);
+        }
+    }
+
     fn add_node_with_topic_edges(
         &self,
         subscribe_topic_names: &[Cow<'static, str>],
@@ -278,6 +298,7 @@ impl Dag {
             subscribe_topic_names: subscribe_topic_names.to_vec(),
             publish_topic_names: publish_topic_names.to_vec(),
             relative_deadline: None,
+            priority: None,
         };
 
         let mut node = MCSNode::new();
@@ -568,6 +589,13 @@ struct NodeInfo {
     subscribe_topic_names: Vec<Cow<'static, str>>,
     publish_topic_names: Vec<Cow<'static, str>>,
     relative_deadline: Option<Duration>,
+    /// Scheduling-policy priority for this node (e.g. a laxity value, or any
+    /// other node-importance metric a `dag_sched` policy computes), opaque
+    /// to `dag.rs` itself: higher sorts first, mirroring
+    /// [`crate::scheduler::SchedulerType::PrioritizedFIFO`]'s convention.
+    /// `None` (the default) is treated as `0` (lowest) by
+    /// [`get_node_priority`]. Set via [`Dag::set_node_priority`].
+    priority: Option<u64>,
 }
 
 pub fn to_node_index(index: u32) -> NodeIndex {
@@ -635,6 +663,24 @@ pub fn get_dag(id: u32) -> Option<Arc<Dag>> {
     let mut node = MCSNode::new();
     let dags = DAGS.lock(&mut node);
     dags.id_to_dag.get(&id).cloned()
+}
+
+/// Look up the scheduling-policy priority set via [`Dag::set_node_priority`]
+/// for `(dag_id, node_id)`, defaulting to `0` (lowest) if unset, or if the
+/// DAG or node cannot be found. Used by the GEDF/ClusteredEDF run queues to
+/// order same-deadline nodes; regular (non-DAG) tasks are never looked up
+/// here and are treated as priority `0` by their callers instead.
+pub fn get_node_priority(dag_id: u32, node_id: u32) -> u64 {
+    let Some(dag) = get_dag(dag_id) else {
+        return 0;
+    };
+    let node_idx = to_node_index(node_id);
+    let mut node = MCSNode::new();
+    let graph = dag.graph.lock(&mut node);
+    graph
+        .node_weight(node_idx)
+        .and_then(|info| info.priority)
+        .unwrap_or(0)
 }
 
 /// `(dag_id, src_node_id, dst_node_id)` of every edge of every registered DAG.

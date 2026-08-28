@@ -23,6 +23,12 @@ pub struct GEDFScheduler {
 struct GEDFTask {
     task: Arc<Task>,
     absolute_deadline: u64,
+    /// Scheduling-policy priority (see [`crate::dag::get_node_priority`]),
+    /// `0` for regular (non-DAG) tasks and DAG nodes with none set. Only
+    /// ever breaks ties between tasks sharing the same `absolute_deadline`
+    /// (e.g. several ready nodes of the same DAG job instance); higher
+    /// sorts first, same convention as `SchedulerType::PrioritizedFIFO`.
+    node_priority: u64,
     wake_time: u64,
 }
 
@@ -34,15 +40,20 @@ impl PartialOrd for GEDFTask {
 
 impl PartialEq for GEDFTask {
     fn eq(&self, other: &Self) -> bool {
-        self.absolute_deadline == other.absolute_deadline && self.wake_time == other.wake_time
+        self.absolute_deadline == other.absolute_deadline
+            && self.node_priority == other.node_priority
+            && self.wake_time == other.wake_time
     }
 }
 
 impl Ord for GEDFTask {
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
         match other.absolute_deadline.cmp(&self.absolute_deadline) {
-            core::cmp::Ordering::Equal => other.wake_time.cmp(&self.wake_time),
-            other => other,
+            core::cmp::Ordering::Equal => match self.node_priority.cmp(&other.node_priority) {
+                core::cmp::Ordering::Equal => other.wake_time.cmp(&self.wake_time),
+                ord => ord,
+            },
+            ord => ord,
         }
     }
 }
@@ -63,26 +74,29 @@ impl GEDFData {
 
 impl Scheduler for GEDFScheduler {
     fn wake_task(&self, task: Arc<Task>) {
-        let (wake_time, absolute_deadline) = {
+        let (wake_time, absolute_deadline, node_priority) = {
             let mut node_inner = MCSNode::new();
             let mut info = task.info.lock(&mut node_inner);
             let dag_info = info.get_dag_info();
             match info.scheduler_type {
                 SchedulerType::GEDF(relative_deadline) => {
                     let wake_time = awkernel_lib::delay::uptime();
-                    let absolute_deadline = if let Some(ref dag_info) = dag_info {
-                        calculate_and_update_dag_deadline(dag_info, wake_time)
+                    let (absolute_deadline, node_priority) = if let Some(ref dag_info) = dag_info {
+                        (
+                            calculate_and_update_dag_deadline(dag_info, wake_time),
+                            crate::dag::get_node_priority(dag_info.dag_id, dag_info.node_id),
+                        )
                     } else {
                         // If dag_info is not present, the task is treated as a regular task, and
                         // the absolute_deadline is calculated using the scheduler's relative_deadline.
-                        wake_time + relative_deadline
+                        (wake_time + relative_deadline, 0)
                     };
 
                     task.priority
                         .update_priority_info(self.priority, MAX_TASK_PRIORITY - absolute_deadline);
                     info.update_absolute_deadline(absolute_deadline);
 
-                    (wake_time, absolute_deadline)
+                    (wake_time, absolute_deadline, node_priority)
                 }
                 _ => unreachable!(),
             }
@@ -97,6 +111,7 @@ impl Scheduler for GEDFScheduler {
             internal_data.queue.push(GEDFTask {
                 task: task.clone(),
                 absolute_deadline,
+                node_priority,
                 wake_time,
             });
         }

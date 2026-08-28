@@ -23,11 +23,20 @@ use awkernel_lib::{
     sync::mutex::{MCSNode, Mutex},
 };
 
-/// The run queue. Priority is `(absolute_deadline, wake_time)`; smaller values
-/// dequeue first, and entries with fully equal keys are FIFO-ordered by the
-/// queue's internal sequence number.
+/// The run queue. Priority is `(absolute_deadline, inverted_node_priority,
+/// wake_time)`; smaller values dequeue first, and entries with fully equal
+/// keys are FIFO-ordered by the queue's internal sequence number.
+///
+/// `inverted_node_priority` is `u64::MAX - `[`get_node_priority`]` so that a
+/// higher node priority (see [`crate::dag::get_node_priority`]) packs to a
+/// smaller key and dequeues first among nodes sharing the same
+/// `absolute_deadline` — the same inversion `MAX_TASK_PRIORITY -
+/// absolute_deadline` already uses elsewhere to turn a
+/// larger-is-more-urgent value into a smaller-sorts-first one.
+///
+/// [`get_node_priority`]: crate::dag::get_node_priority
 type EDFQueue =
-    AffinityBTreeQueue<(u64, u64), ClusteredTask<Arc<Task>>, DEFAULT_MIN_DEGREE, CPU_SET_WORDS>;
+    AffinityBTreeQueue<(u64, u64, u64), ClusteredTask<Arc<Task>>, DEFAULT_MIN_DEGREE, CPU_SET_WORDS>;
 
 pub struct ClusteredEDFScheduler {
     // `AffinityBTreeQueue::new` is not a const fn, so the queue is lazily
@@ -38,26 +47,29 @@ pub struct ClusteredEDFScheduler {
 
 impl Scheduler for ClusteredEDFScheduler {
     fn wake_task(&self, task: Arc<Task>) {
-        let (wake_time, absolute_deadline) = {
+        let (wake_time, absolute_deadline, node_priority) = {
             let mut node_inner = MCSNode::new();
             let mut info = task.info.lock(&mut node_inner);
             let dag_info = info.get_dag_info();
             match info.scheduler_type {
                 SchedulerType::ClusteredEDF(relative_deadline, _) => {
                     let wake_time = awkernel_lib::delay::uptime();
-                    let absolute_deadline = if let Some(ref dag_info) = dag_info {
-                        calculate_and_update_dag_deadline(dag_info, wake_time)
+                    let (absolute_deadline, node_priority) = if let Some(ref dag_info) = dag_info {
+                        (
+                            calculate_and_update_dag_deadline(dag_info, wake_time),
+                            crate::dag::get_node_priority(dag_info.dag_id, dag_info.node_id),
+                        )
                     } else {
                         // If dag_info is not present, the task is treated as a regular task, and
                         // the absolute_deadline is calculated using the scheduler's relative_deadline.
-                        wake_time + relative_deadline
+                        (wake_time + relative_deadline, 0)
                     };
 
                     task.priority
                         .update_priority_info(self.priority, MAX_TASK_PRIORITY - absolute_deadline);
                     info.update_absolute_deadline(absolute_deadline);
 
-                    (wake_time, absolute_deadline)
+                    (wake_time, absolute_deadline, node_priority)
                 }
                 _ => unreachable!(),
             }
@@ -80,7 +92,7 @@ impl Scheduler for ClusteredEDFScheduler {
             let queue = data.get_or_insert_with(|| EDFQueue::new(num_cpu()));
             queue
                 .push(
-                    (absolute_deadline, wake_time),
+                    (absolute_deadline, u64::MAX - node_priority, wake_time),
                     cpu_set,
                     ClusteredTask::new(task.clone()),
                 )
