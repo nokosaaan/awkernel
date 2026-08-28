@@ -21,20 +21,14 @@ use crate::pcie::{
     pcie_id,
     virtio::{
         config::{
-            virtio_blk_config::VirtioBlkConfig,
-            virtio_common_config::VirtioCommonConfig,
+            virtio_blk_config::VirtioBlkConfig, virtio_common_config::VirtioCommonConfig,
             virtio_notify_config::VirtioNotifyConfig,
         },
         VirtioDriverErr,
     },
     PCIeDevice, PCIeDeviceErr, PCIeInfo,
 };
-use alloc::{
-    borrow::Cow,
-    collections::LinkedList,
-    sync::Arc,
-    vec::Vec,
-};
+use alloc::{borrow::Cow, collections::LinkedList, sync::Arc, vec::Vec};
 use awkernel_lib::{
     addr::Addr,
     barrier::{membar_consumer, membar_producer},
@@ -112,7 +106,12 @@ struct VirtqAvail {
 
 impl Default for VirtqAvail {
     fn default() -> Self {
-        VirtqAvail { flags: 0, idx: 0, ring: [0; MAX_VQ_SIZE], used_event: 0 }
+        VirtqAvail {
+            flags: 0,
+            idx: 0,
+            ring: [0; MAX_VQ_SIZE],
+            used_event: 0,
+        }
     }
 }
 
@@ -133,7 +132,12 @@ struct VirtqUsed {
 
 impl Default for VirtqUsed {
     fn default() -> Self {
-        VirtqUsed { flags: 0, idx: 0, ring: [VirtqUsedElem::default(); MAX_VQ_SIZE], avail_event: 0 }
+        VirtqUsed {
+            flags: 0,
+            idx: 0,
+            ring: [VirtqUsedElem::default(); MAX_VQ_SIZE],
+            avail_event: 0,
+        }
     }
 }
 
@@ -142,7 +146,7 @@ struct VirtqDMA {
     desc: [VirtqDesc; MAX_VQ_SIZE], // 4096 bytes
     avail: VirtqAvail,              // 518 bytes
     _pad: [u8; 3578],
-    used: VirtqUsed,                // 2054 bytes
+    used: VirtqUsed, // 2054 bytes
     _pad2: [u8; 2042],
 }
 
@@ -351,7 +355,8 @@ impl VirtioBlkInner {
         let negotiated = device_features & driver_features;
 
         self.common_cfg.virtio_set_driver_features(negotiated);
-        self.common_cfg.virtio_set_device_status(STATUS_FEATURES_OK)?;
+        self.common_cfg
+            .virtio_set_device_status(STATUS_FEATURES_OK)?;
 
         let status = self.common_cfg.virtio_get_device_status()?;
         if status & STATUS_FEATURES_OK == 0 {
@@ -380,8 +385,7 @@ impl VirtioBlkInner {
             DMAPool::new(0, pages).ok_or(VirtioDriverErr::DMAPool)?;
         *vq_dma.as_mut() = VirtqDMA::default();
 
-        let req: DMAPool<VirtioBlkReq> =
-            DMAPool::new(0, 1).ok_or(VirtioDriverErr::DMAPool)?;
+        let req: DMAPool<VirtioBlkReq> = DMAPool::new(0, 1).ok_or(VirtioDriverErr::DMAPool)?;
         let data_buf: DMAPool<[u8; MAX_TRANSFER_BYTES]> =
             DMAPool::new(0, MAX_TRANSFER_BYTES.div_ceil(PAGESIZE))
                 .ok_or(VirtioDriverErr::DMAPool)?;
@@ -417,8 +421,10 @@ impl VirtioBlkInner {
         let used_offset = 8192u64;
         self.common_cfg.virtio_set_queue_select(0)?;
         self.common_cfg.virtio_set_queue_desc(phy_addr)?;
-        self.common_cfg.virtio_set_queue_avail(phy_addr + avail_offset)?;
-        self.common_cfg.virtio_set_queue_used(phy_addr + used_offset)?;
+        self.common_cfg
+            .virtio_set_queue_avail(phy_addr + avail_offset)?;
+        self.common_cfg
+            .virtio_set_queue_used(phy_addr + used_offset)?;
         self.common_cfg.virtio_set_queue_enable(1)?;
 
         // 8. Signal DRIVER_OK
@@ -463,7 +469,10 @@ impl VirtioBlkInner {
         self.vq.status.as_mut().status = !VIRTIO_BLK_S_OK;
 
         // Build 3-descriptor chain: [header] → [data] → [status]
-        let slot = self.vq.enqueue_prep().ok_or(StorageDevError::DeviceNotReady)?;
+        let slot = self
+            .vq
+            .enqueue_prep()
+            .ok_or(StorageDevError::DeviceNotReady)?;
         self.vq
             .enqueue_reserve(slot, 3)
             .map_err(|_| StorageDevError::DeviceNotReady)?;
@@ -643,11 +652,9 @@ pub fn attach(mut info: PCIeInfo) -> Result<Arc<dyn PCIeDevice + Sync + Send>, P
     let dummy_vq_dma: DMAPool<VirtqDMA> =
         DMAPool::new(0, core::mem::size_of::<VirtqDMA>().div_ceil(PAGESIZE))
             .ok_or(PCIeDeviceErr::InitFailure)?;
-    let dummy_req: DMAPool<VirtioBlkReq> =
-        DMAPool::new(0, 1).ok_or(PCIeDeviceErr::InitFailure)?;
+    let dummy_req: DMAPool<VirtioBlkReq> = DMAPool::new(0, 1).ok_or(PCIeDeviceErr::InitFailure)?;
     let dummy_data: DMAPool<[u8; MAX_TRANSFER_BYTES]> =
-        DMAPool::new(0, MAX_TRANSFER_BYTES.div_ceil(PAGESIZE))
-            .ok_or(PCIeDeviceErr::InitFailure)?;
+        DMAPool::new(0, MAX_TRANSFER_BYTES.div_ceil(PAGESIZE)).ok_or(PCIeDeviceErr::InitFailure)?;
     let dummy_status: DMAPool<VirtioBlkStatus> =
         DMAPool::new(0, 1).ok_or(PCIeDeviceErr::InitFailure)?;
 

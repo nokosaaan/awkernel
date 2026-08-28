@@ -53,13 +53,13 @@ pub type TaskResult = Result<(), Cow<'static, str>>;
 static TASKS: Mutex<Tasks> = Mutex::new(Tasks::new()); // Set of tasks.
 static RUNNING: [AtomicU32; NUM_MAX_CPU] = array![_ => AtomicU32::new(0); NUM_MAX_CPU]; // IDs of running tasks.
 pub(crate) static MAX_TASK_PRIORITY: u64 = (1 << 56) - 1; // Maximum task priority.
-// Split by DAG-pool/regular-pool membership (see
-// `scheduler::federated::is_dag_pool_core`/`is_regular_pool_core`) instead of
-// one combined counter, so `wake_workers` can budget wakeups per pool: a
-// woken DAG-pool core can only ever dequeue a DAG-pool (GEDF) task, so
-// counting it against a combined budget could exhaust the budget on cores
-// that can't actually serve a pending regular-pool (FIFO/RR/Panicked) task,
-// leaving the one core that could serve it never woken.
+                                                          // Split by DAG-pool/regular-pool membership (see
+                                                          // `scheduler::pool::is_dag_pool_core`/`is_regular_pool_core`) instead of
+                                                          // one combined counter, so `wake_workers` can budget wakeups per pool: a
+                                                          // woken DAG-pool core can only ever dequeue a DAG-pool (GEDF) task, so
+                                                          // counting it against a combined budget could exhaust the budget on cores
+                                                          // that can't actually serve a pending regular-pool (FIFO/RR/Panicked) task,
+                                                          // leaving the one core that could serve it never woken.
 #[cfg(target_pointer_width = "64")]
 pub(crate) static NUM_DAG_POOL_TASK_IN_QUEUE: AtomicU32 = AtomicU32::new(0);
 #[cfg(target_pointer_width = "64")]
@@ -106,8 +106,7 @@ static PREEMPTION_REQUEST: [AtomicBool; NUM_MAX_CPU] =
 /// recorded) or only the kernel bookkeeping around it (recording a pause
 /// there would emit spurious unpaired trace events and misattribute kernel
 /// time to the task).
-pub(crate) static POLLING: [AtomicU32; NUM_MAX_CPU] =
-    array![_ => AtomicU32::new(0); NUM_MAX_CPU];
+pub(crate) static POLLING: [AtomicU32; NUM_MAX_CPU] = array![_ => AtomicU32::new(0); NUM_MAX_CPU];
 
 /// Task has ID, future, information, and a reference to a scheduler.
 pub struct Task {
@@ -993,12 +992,9 @@ pub mod perf {
         for table_opt in [&publish_opt, &subscribe_opt] {
             if let Some(table) = table_opt.as_ref() {
                 for (pub_id, map) in table.timestamps.iter().enumerate() {
-                    keys.extend(
-                        map.keys()
-                            .map(|&(period_index, dag_id, node_id)| {
-                                (period_index, pub_id, dag_id, node_id)
-                            }),
-                    );
+                    keys.extend(map.keys().map(|&(period_index, dag_id, node_id)| {
+                        (period_index, pub_id, dag_id, node_id)
+                    }));
                 }
             }
         }
@@ -1074,8 +1070,9 @@ pub mod perf {
             if let Some(table) = table_opt.as_ref() {
                 for map in table.timestamps.iter() {
                     keys.extend(
-                        map.keys()
-                            .map(|&(period_index, dag_id, node_id)| (dag_id, node_id, period_index)),
+                        map.keys().map(|&(period_index, dag_id, node_id)| {
+                            (dag_id, node_id, period_index)
+                        }),
                     );
                 }
             }

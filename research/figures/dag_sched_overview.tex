@@ -1,0 +1,97 @@
+% DAG scheduling architecture overview + implementation progress tracker.
+%
+% Update this figure whenever a Phase (see the legend/table) lands, rather
+% than creating a new figure per phase, so it stays the single up-to-date
+% picture referenced from Notion "Awkernel研究". Compile with:
+%   pdflatex -interaction=nonstopmode dag_sched_overview.tex
+%   pdftoppm -png -r 200 dag_sched_overview.pdf dag_sched_overview
+\documentclass[border=6pt]{standalone}
+\usepackage{tikz}
+\usepackage{amssymb}
+\usepackage{fontspec}
+\setmainfont{IPAexGothic}
+\setsansfont{IPAexGothic}
+\usetikzlibrary{shapes.geometric, arrows.meta, positioning, fit, backgrounds, calc}
+
+\definecolor{done}{HTML}{2E7D32}
+\definecolor{doneFill}{HTML}{E8F5E9}
+\definecolor{todo}{HTML}{9E9E9E}
+\definecolor{todoFill}{HTML}{F5F5F5}
+\definecolor{layerFill}{HTML}{FAFAFA}
+\definecolor{extFill}{HTML}{E3F2FD}
+\definecolor{ext}{HTML}{1565C0}
+
+\begin{document}
+\begin{tikzpicture}[
+  font=\sffamily\small,
+  node distance=6mm and 8mm,
+  doneBox/.style={draw=done, fill=doneFill, rounded corners=2pt, minimum height=8mm, text width=32mm, align=center, inner sep=2pt},
+  todoBox/.style={draw=todo, dashed, fill=todoFill, rounded corners=2pt, minimum height=8mm, text width=32mm, align=center, inner sep=2pt, text=todo},
+  extBox/.style={draw=ext, fill=extFill, rounded corners=2pt, minimum height=8mm, text width=34mm, align=center, inner sep=2pt},
+  layer/.style={draw=black!40, fill=layerFill, rounded corners=4pt, inner sep=4mm},
+  lbl/.style={font=\sffamily\bfseries\small, anchor=west},
+  arr/.style={-{Latex[length=2mm]}, thick, black!60},
+]
+
+% ---------- external caller ----------
+\node[extBox] (buildDag) {applications/rd\_gen\_to\_dags\\ build\_dag.rs\\ \footnotesize (host: DAG YAML $\to$ admit\_dag)};
+
+% ---------- dag.rs: graph structure ----------
+\node[doneBox, below=of buildDag] (dagrs) {dag.rs\\ \footnotesize graph (NodeInfo/EdgeInfo),\\ DagJobTable};
+
+% ---------- dag_sched layer ----------
+\node[doneBox, below=14mm of dagrs, xshift=-38mm] (metrics) {dag\_sched/\\metrics.rs\\ \footnotesize DagMetrics, MetricsSource};
+\node[doneBox, right=of metrics] (provision) {dag\_sched/\\provision.rs\\ \footnotesize Provision $\to$ SchedulerType};
+\node[doneBox, right=of provision] (resource) {dag\_sched/\\resource.rs\\ \footnotesize PoolLedger, ResourceError};
+
+\node[doneBox, below=8mm of provision] (fed) {dag\_sched/policy/\\federated.rs\\ \footnotesize classify\_dag, admit\_dag};
+\node[todoBox, left=of fed] (vfed) {dag\_sched/policy/\\v\_fed.rs\\ \footnotesize (Phase 1 拡張, 未着手)};
+\node[todoBox, right=of fed] (ssa) {dag\_sched/policy/\\(SSA-DAG 等)\\ \footnotesize スコープ外};
+
+\begin{pgfonlayer}{background}
+\node[layer, fit=(metrics)(provision)(resource)(fed)(vfed)(ssa), label={[lbl]north west:dag\_sched.rs\ \ --\ policy layer (Phase 1, NEW)}] (dagschedLayer) {};
+\end{pgfonlayer}
+
+% ---------- scheduler layer ----------
+\node[doneBox, below=22mm of dagschedLayer.south, xshift=-46mm] (pool) {scheduler/\\pool.rs\\ \footnotesize is\_dag\_pool\_core (Phase 0)};
+\node[doneBox, right=of pool] (gedf) {scheduler/\\gedf.rs};
+\node[doneBox, right=of gedf] (cedf) {scheduler/\\clustered\_edf.rs};
+\node[doneBox, right=of cedf] (fifoRR) {prioritized\_fifo.rs\\ prioritized\_rr.rs\\ panicked.rs};
+\node[todoBox, right=of fifoRR] (dpfair) {scheduler/\\dp\_fair.rs\\ \footnotesize DAG-Fluid (Phase 3c, 未着手)};
+
+\begin{pgfonlayer}{background}
+\node[layer, fit=(pool)(gedf)(cedf)(fifoRR)(dpfair), label={[lbl]north west:scheduler.rs\ \ --\ mechanism layer (run queues)}] (schedLayer) {};
+\end{pgfonlayer}
+
+% ---------- arrows ----------
+\draw[arr] (buildDag) -- (dagrs);
+\draw[arr] (buildDag.east) .. controls +(35mm,0mm) and +(0mm,30mm) .. (fed.north east)
+  node[midway, right, font=\sffamily\footnotesize, black!70, xshift=1mm] {admit\_dag(DagMetrics)};
+\draw[arr] (fed.north) -- (provision.south);
+\draw[arr] (fed.east) -- (resource.south);
+\draw[arr] (provision.south) -- (gedf.north);
+\draw[arr] (provision.south) .. controls +(18mm,-14mm) and +(0mm,18mm) .. (cedf.north);
+
+% ---------- phase progress panel ----------
+\node[draw=black!40, fill=white, rounded corners=2pt, align=left, text width=52mm,
+      font=\sffamily\footnotesize, right=16mm of dagschedLayer.east, yshift=-6mm, inner sep=3mm] (phases) {
+\textbf{実装フェーズ進捗 (2026-08-21)}\\[3pt]
+{\color{done}\textbf{$\checkmark$}} Phase 0: \texttt{scheduler/pool.rs} 分離\\
+{\color{done}\textbf{$\checkmark$}} Phase 1: \texttt{dag\_sched/} 新設, \texttt{Provision} 導入 \textbf{(今回)}\\
+{\color{todo}$\square$} Phase 1 拡張: \texttt{policy/v\_fed.rs}\\
+{\color{todo}$\square$} Phase 2: \texttt{runtime.rs} 拡張 (remaining\_volume 等)\\
+{\color{todo}$\square$} Phase 3c: \texttt{dp\_fair.rs} (DAG-Fluid)\\
+{\color{todo}$\square$} SSA-DAG: スコープ外(方針決定済み)\\
+};
+
+% ---------- legend ----------
+\node[draw=black!30, fill=white, rounded corners=2pt, align=left, text width=40mm,
+      font=\sffamily\footnotesize, below=10mm of schedLayer, inner sep=3mm] (legend) {
+\textbf{凡例}\\[2pt]
+\tikz\draw[done, fill=doneFill, rounded corners=1pt] (0,0) rectangle (4mm,2.4mm); 実装済み\\[2pt]
+\tikz\draw[todo, dashed, fill=todoFill, rounded corners=1pt] (0,0) rectangle (4mm,2.4mm); 未着手 / 対象外\\[2pt]
+\tikz\draw[ext, fill=extFill, rounded corners=1pt] (0,0) rectangle (4mm,2.4mm); 別クレート(rd\_gen\_to\_dags)\\
+};
+
+\end{tikzpicture}
+\end{document}

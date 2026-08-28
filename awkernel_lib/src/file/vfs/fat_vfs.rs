@@ -165,9 +165,7 @@ where
 
         let mut entries = Vec::new();
         for r in dir.iter() {
-            let e = r.map_err(|err| {
-                VfsError::from(VfsErrorKind::from(err)).with_path(path)
-            })?;
+            let e = r.map_err(|err| VfsError::from(VfsErrorKind::from(err)).with_path(path))?;
             entries.push(VfsDirEntry {
                 name: e.file_name(),
                 file_type: if e.is_dir() {

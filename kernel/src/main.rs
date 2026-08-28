@@ -226,7 +226,10 @@ fn init_ramdisk_fatfs() {
     let _device_id = add_storage_device(ramdisk.clone());
 
     match format_and_mount_fatfs(ramdisk) {
-        Ok(()) => log::info!("RAM disk FAT filesystem mounted ({}KiB).", NUM_BLOCKS * BLOCK_SIZE as u64 / 1024),
+        Ok(()) => log::info!(
+            "RAM disk FAT filesystem mounted ({}KiB).",
+            NUM_BLOCKS * BLOCK_SIZE as u64 / 1024
+        ),
         Err(e) => log::warn!("Failed to mount RAM disk FAT filesystem: {e}"),
     }
 }

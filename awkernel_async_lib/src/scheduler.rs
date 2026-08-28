@@ -18,7 +18,6 @@ use awkernel_lib::{
 use alloc::boxed::Box;
 
 mod clustered_edf;
-pub mod federated;
 pub mod gedf;
 pub(super) mod panicked;
 pub(crate) mod pool;

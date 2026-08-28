@@ -18,10 +18,7 @@ use crate::{
         memfs::InMemoryDisk,
     },
     paging::PAGESIZE,
-    storage::{
-        disk_adapter::BlockDeviceDisk,
-        storage_device::StorageDevice,
-    },
+    storage::{disk_adapter::BlockDeviceDisk, storage_device::StorageDevice},
     sync::rwlock::RwLock,
 };
 
@@ -92,9 +89,7 @@ static FAT_FS_STORAGE_INSTANCE: RwLock<
 ///
 /// Use for a brand-new or blank device (e.g. a fresh RAM disk).
 /// All existing data on the device will be destroyed.
-pub fn format_and_mount_fatfs(
-    device: Arc<dyn StorageDevice + Sync + Send>,
-) -> Result<(), String> {
+pub fn format_and_mount_fatfs(device: Arc<dyn StorageDevice + Sync + Send>) -> Result<(), String> {
     let mut fs_guard = FAT_FS_STORAGE_INSTANCE.write();
     if fs_guard.is_some() {
         return Err("Storage-backed FAT filesystem has already been initialized.".into());
@@ -121,9 +116,7 @@ pub fn format_and_mount_fatfs(
 ///
 /// Use for persistent devices (e.g. virtio-blk) that survive across reboots:
 /// the first boot formats the disk, subsequent boots just mount it.
-pub fn mount_or_format_fatfs(
-    device: Arc<dyn StorageDevice + Sync + Send>,
-) -> Result<(), String> {
+pub fn mount_or_format_fatfs(device: Arc<dyn StorageDevice + Sync + Send>) -> Result<(), String> {
     let mut fs_guard = FAT_FS_STORAGE_INSTANCE.write();
     if fs_guard.is_some() {
         return Err("Storage-backed FAT filesystem has already been initialized.".into());
@@ -158,8 +151,8 @@ pub fn mount_or_format_fatfs(
 ///
 /// Panics if neither `format_and_mount_fatfs` nor `mount_or_format_fatfs` has
 /// been called yet.
-pub fn get_storage_fatfs(
-) -> Arc<FileSystem<BlockDeviceDisk, NullTimeProvider, LossyOemCpConverter>> {
+pub fn get_storage_fatfs() -> Arc<FileSystem<BlockDeviceDisk, NullTimeProvider, LossyOemCpConverter>>
+{
     let fs_guard = FAT_FS_STORAGE_INSTANCE.read();
     (*fs_guard)
         .clone()

@@ -159,7 +159,9 @@ pub fn calibration() -> (u64, u64, u64, u64) {
 
 /// Number of events dropped on `cpu_id` because the buffer was full.
 pub fn num_dropped(cpu_id: usize) -> usize {
-    IDX[cpu_id].load(Ordering::Relaxed).saturating_sub(TRACE_CAP)
+    IDX[cpu_id]
+        .load(Ordering::Relaxed)
+        .saturating_sub(TRACE_CAP)
 }
 
 /// Copy of the recorded events on `cpu_id`.  Call only after `stop()`.
@@ -274,7 +276,10 @@ pub fn dump_to_console() {
                 }
             }
             #[cfg(not(feature = "period-index-propagation"))]
-            out.push_str(&format!("TRACE_EV,{cpu_id},{},{kind},{}\r\n", e.task_id, e.tsc));
+            out.push_str(&format!(
+                "TRACE_EV,{cpu_id},{},{kind},{}\r\n",
+                e.task_id, e.tsc
+            ));
 
             // Flush in chunks so a single huge String is not required.
             if out.len() > 4096 {

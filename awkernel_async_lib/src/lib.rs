@@ -11,6 +11,7 @@ pub mod action;
 mod anydict;
 pub mod channel;
 pub mod dag;
+pub mod dag_sched;
 pub mod file;
 pub mod future;
 mod join_handle;

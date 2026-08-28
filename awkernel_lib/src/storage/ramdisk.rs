@@ -1,5 +1,5 @@
-use alloc::{borrow::Cow, sync::Arc, vec, vec::Vec};
 use crate::sync::rwlock::RwLock;
+use alloc::{borrow::Cow, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::storage_device::{StorageDevError, StorageDevice, StorageDeviceType};
@@ -32,8 +32,6 @@ impl RamDisk {
             seq_pos: AtomicU64::new(0),
         }
     }
-
-
 }
 
 impl StorageDevice for RamDisk {

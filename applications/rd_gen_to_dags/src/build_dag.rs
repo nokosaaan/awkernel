@@ -5,10 +5,11 @@ use crate::time_unit::{convert_duration, simulated_execution_time};
 use alloc::{borrow::Cow, format, sync::Arc, vec::Vec};
 use awkernel_async_lib::{
     dag::{Dag, create_dag},
-    scheduler::{
-        federated::{admit_dag, DagAdmissionConfig, FederatedError},
-        SchedulerType,
+    dag_sched::{
+        metrics::DagMetrics,
+        policy::federated::{FederatedError, admit_dag},
     },
+    scheduler::SchedulerType,
 };
 
 /// Represents errors related to the number of links for a node.
@@ -312,7 +313,7 @@ pub(super) async fn build_dag(dag_data: DagData) -> Result<Arc<Dag>, BuildDagErr
         .and_then(NodeData::get_end_to_end_deadline)
         .ok_or(BuildDagError::MissingDagTiming(dag_id))?;
 
-    let assignment = admit_dag(DagAdmissionConfig::from_static(
+    let assignment = admit_dag(DagMetrics::from_static(
         stats.volume,
         stats.critical_path,
         period,
