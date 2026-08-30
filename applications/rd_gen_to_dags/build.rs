@@ -12,7 +12,7 @@ use std::{
 /// Folder to load every `dag_<N>.yaml` file from (searched recursively).
 /// Point this at a different RD-Gen output directory to change the DAG set
 /// the kernel spawns.
-const DAGS_DIR: &str = "/home/nokosan/azumi-lab/RD-Gen/test/TU=3/DAGs";
+const DAGS_DIR: &str = "/home/nokosan/azumi-lab/RD-Gen/test/awkernel";
 
 /// True for `dag_<N>.yaml`/`.yml` files. RD-Gen writes sibling files in the
 /// same directory that are not DAG definitions (e.g. `combination_log.yaml`,
