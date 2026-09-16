@@ -594,10 +594,16 @@ impl awkernel_lib::timer::Timer for TimerXapic {
             log::warn!("TimerXapic::reset(): initial_count is 0");
         }
 
-        registers::XAPIC_LVT_TIMER.write(
-            TIMER_IRQ as u32 | registers::LVT_TIMER_PERIODIC,
-            self.apic_base,
-        );
+        // See `awkernel_lib::timer`'s own doc for why periodic mode is the
+        // default (a safety net against a lost edge-triggered interrupt) and
+        // why `fully_one_shot_timer` opts into losing that net in exchange
+        // for true one-shot, arm-at-arbitrary-timestamp semantics.
+        #[cfg(feature = "fully_one_shot_timer")]
+        let lvt_mode = 0; // mode bits 00 = one-shot (no periodic bit).
+        #[cfg(not(feature = "fully_one_shot_timer"))]
+        let lvt_mode = registers::LVT_TIMER_PERIODIC;
+
+        registers::XAPIC_LVT_TIMER.write(TIMER_IRQ as u32 | lvt_mode, self.apic_base);
         registers::XAPIC_TIMER_DIV.write(self.timer_div, self.apic_base);
         registers::XAPIC_TIMER_INITIAL_COUNT.write(initial_count, self.apic_base);
     }
@@ -631,9 +637,13 @@ impl awkernel_lib::timer::Timer for TimerX2apic {
             log::warn!("TimerX2apic::reset(): initial_count is 0");
         }
 
+        #[cfg(feature = "fully_one_shot_timer")]
+        let lvt_mode: u64 = 0; // mode bits 00 = one-shot (no periodic bit).
+        #[cfg(not(feature = "fully_one_shot_timer"))]
+        let lvt_mode: u64 = registers::LVT_TIMER_PERIODIC as u64;
+
         unsafe {
-            registers::X2APIC_LVT_TIMER
-                .write(TIMER_IRQ as u64 | registers::LVT_TIMER_PERIODIC as u64);
+            registers::X2APIC_LVT_TIMER.write(TIMER_IRQ as u64 | lvt_mode);
             registers::X2APIC_TIMER_DIV.write(self.timer_div as u64);
             registers::X2APIC_TIMER_INITIAL_COUNT.write(initial_count);
         }

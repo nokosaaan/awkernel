@@ -2,6 +2,7 @@
 extern crate alloc;
 
 mod build_dag;
+pub mod dag_fluid;
 mod dag_stats;
 mod parse_yaml;
 mod time_unit;
@@ -51,6 +52,48 @@ pub fn dag_metrics_from_yaml(yaml_files: &[&str]) -> Result<Vec<DagMetrics>, Str
                 period,
                 relative_deadline,
             ))
+        })
+        .collect()
+}
+
+/// Parse a batch of RD-Gen DAG YAML documents into `(DagMetrics,
+/// Vec<dag_fluid::Segment>)` pairs -- the same pipeline as
+/// [`dag_metrics_from_yaml`], plus a [`dag_fluid::decompose_segments`] call
+/// per DAG. Kept as a *separate* function (not a parameter on
+/// `dag_metrics_from_yaml`) so existing Federated/V-Fed-only callers don't
+/// pay for segment decomposition they don't use.
+pub fn dag_metrics_and_fluid_segments_from_yaml(
+    yaml_files: &[&str],
+) -> Result<Vec<(DagMetrics, Vec<dag_fluid::Segment>)>, String> {
+    let dags_data =
+        parse_yaml::parse_dags(yaml_files).map_err(|e| alloc::format!("failed to parse: {e}"))?;
+
+    dags_data
+        .iter()
+        .map(|dag_data| {
+            let stats = dag_stats::compute_dag_stats(dag_data);
+            let period = dag_data
+                .get_nodes()
+                .iter()
+                .find(|node| node.is_source())
+                .and_then(parse_yaml::NodeData::get_period)
+                .ok_or_else(|| String::from("DAG has no source node with a period"))?;
+            let relative_deadline = dag_data
+                .get_nodes()
+                .iter()
+                .find(|node| node.is_sink())
+                .and_then(parse_yaml::NodeData::get_end_to_end_deadline)
+                .ok_or_else(|| {
+                    String::from("DAG has no sink node with an end_to_end_deadline")
+                })?;
+            let metrics = DagMetrics::from_static(
+                stats.volume,
+                stats.critical_path,
+                period,
+                relative_deadline,
+            );
+            let segments = dag_fluid::decompose_segments(dag_data);
+            Ok((metrics, segments))
         })
         .collect()
 }

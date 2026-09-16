@@ -52,7 +52,19 @@
 //! machinery needed.
 //!
 //! Usage: `acceptance_ratio <pool_dir> <u_norm_min> <u_norm_max> <u_norm_step>`,
-//! prints `u_norm,federated_ratio,vfed_ratio` CSV to stdout.
+//! prints `u_norm,federated_ratio,vfed_ratio,dag_fluid_ratio` CSV to stdout.
+//!
+//! # DAG-Fluid's third column
+//! DAG-Fluid (Guan, Qiao, Han, IEEE TC 2020/2021) is included here as a
+//! third, *static-only* schedulability test (segment decomposition +
+//! Algorithm 2's execution-rate assignment, see `rd_gen_to_dags::dag_fluid`'s
+//! own doc) — no runtime/dispatch layer exists for it in this codebase, so
+//! this column is a pure admission-math comparison, exactly like the other
+//! two. Segments are structure-derived and unaffected by
+//! `override_deadline`/`override_period`/`assign_max_parallelism` (which
+//! only touch each DAG's `DagMetrics` half), so they're computed once at
+//! pool-load time and carried alongside each `DagMetrics` through every
+//! later resample.
 
 use std::{env, fs, path::Path, process::ExitCode};
 
@@ -64,6 +76,7 @@ use awkernel_async_lib::dag_sched::{
     },
 };
 use rand::{seq::IndexedRandom, Rng};
+use rd_gen_to_dags::dag_fluid::{self, Segment};
 
 /// N in the paper's own "N=8 DAGs per task set".
 const DAGS_PER_SET: usize = 8;
@@ -108,37 +121,55 @@ fn main() -> ExitCode {
 
     let mut rng = rand::rng();
 
-    println!("u_norm,federated_ratio,vfed_ratio");
+    println!("u_norm,federated_ratio,vfed_ratio,dag_fluid_ratio");
 
     let mut u_norm = u_norm_min;
     while u_norm <= u_norm_max + u_norm_step / 2.0 {
         let mut fed_accepted = 0usize;
         let mut vfed_accepted = 0usize;
+        let mut dag_fluid_accepted = 0usize;
 
         for _ in 0..TRIALS_PER_LEVEL {
-            let set: Vec<DagMetrics> = (0..DAGS_PER_SET)
-                .map(|_| *pool.choose(&mut rng).expect("pool checked non-empty above"))
+            let set: Vec<&(DagMetrics, Vec<Segment>)> = (0..DAGS_PER_SET)
+                .map(|_| pool.choose(&mut rng).expect("pool checked non-empty above"))
                 .collect();
+            let metrics: Vec<DagMetrics> = set.iter().map(|(m, _)| *m).collect();
 
-            let u_sigma: f64 = set.iter().map(|d| d.volume as f64 / d.period as f64).sum();
+            let u_sigma: f64 = metrics.iter().map(|d| d.volume as f64 / d.period as f64).sum();
             // u_sigma > 0 always (every WCET is >= 1), so this is never 0/0;
             // ceil() can still round down to 0 when u_norm is large enough
             // that a fractional core would suffice, which we round up to 1
             // since M=0 cores can admit nothing.
             let m = ((u_sigma / u_norm).ceil() as u16).max(1);
 
-            if federated_batch_feasible(&set, m) {
+            if federated_batch_feasible(&metrics, m) {
                 fed_accepted += 1;
             }
-            if vfed::is_batch_feasible(&set, m, PackingStrategy::BestFit) {
+            if vfed::is_batch_feasible(&metrics, m, PackingStrategy::BestFit) {
                 vfed_accepted += 1;
+            }
+            let dag_fluid_entries: Vec<(u64, u64, u64, u64, &[Segment])> = set
+                .iter()
+                .map(|(metrics, segments)| {
+                    (
+                        metrics.volume,
+                        metrics.period,
+                        metrics.critical_path,
+                        metrics.relative_deadline,
+                        segments.as_slice(),
+                    )
+                })
+                .collect();
+            if dag_fluid::is_batch_feasible(&dag_fluid_entries, m) {
+                dag_fluid_accepted += 1;
             }
         }
 
         println!(
-            "{u_norm:.4},{:.2},{:.2}",
+            "{u_norm:.4},{:.2},{:.2},{:.2}",
             100.0 * fed_accepted as f64 / TRIALS_PER_LEVEL as f64,
             100.0 * vfed_accepted as f64 / TRIALS_PER_LEVEL as f64,
+            100.0 * dag_fluid_accepted as f64 / TRIALS_PER_LEVEL as f64,
         );
 
         u_norm += u_norm_step;
@@ -154,8 +185,10 @@ fn parse_positive_f64(s: &str) -> Option<f64> {
 
 /// Load every `dag_<N>.yaml` directly inside `pool_dir` (skipping RD-Gen's
 /// own `combination_log.yaml`), overriding each one's `relative_deadline`
-/// per [`override_deadline`].
-fn load_pool(pool_dir: &Path) -> Result<Vec<DagMetrics>, String> {
+/// per [`override_deadline`], and pairing each resulting [`DagMetrics`] with
+/// its DAG-Fluid [`Segment`] decomposition (structure-derived, so computed
+/// once here and left untouched by the later per-`DagMetrics` overrides).
+fn load_pool(pool_dir: &Path) -> Result<Vec<(DagMetrics, Vec<Segment>)>, String> {
     let mut yaml_paths: Vec<_> = fs::read_dir(pool_dir)
         .map_err(|e| format!("cannot read directory '{}': {e}", pool_dir.display()))?
         .filter_map(|entry| entry.ok().map(|e| e.path()))
@@ -174,16 +207,17 @@ fn load_pool(pool_dir: &Path) -> Result<Vec<DagMetrics>, String> {
         .collect::<Result<_, _>>()?;
     let yaml_refs: Vec<&str> = yaml_contents.iter().map(String::as_str).collect();
 
-    let all = rd_gen_to_dags::dag_metrics_from_yaml(&yaml_refs)
+    let all = rd_gen_to_dags::dag_metrics_and_fluid_segments_from_yaml(&yaml_refs)
         .map_err(|e| format!("failed to parse DAG pool in '{}': {e}", pool_dir.display()))?;
 
     let mut rng = rand::rng();
     Ok(all
         .into_iter()
-        .map(|config| {
+        .map(|(config, segments)| {
             let config = override_deadline(config, &mut rng);
             let config = override_period(config, &mut rng);
-            assign_max_parallelism(config, &mut rng)
+            let config = assign_max_parallelism(config, &mut rng);
+            (config, segments)
         })
         .collect())
 }

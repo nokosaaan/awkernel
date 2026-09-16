@@ -26,7 +26,11 @@ struct ResetTimer;
 
 impl Drop for ResetTimer {
     fn drop(&mut self) {
-        crate::timer::disable();
+        // Only cancel *this* consumer's own request -- `crate::timer::disable()`
+        // would also kill any other logical consumer's pending deadline
+        // sharing the same per-core physical timer (see
+        // `crate::timer::TimerRequestId`'s own doc).
+        crate::timer::cancel(crate::timer::TimerRequestId::IdleWakeup);
     }
 }
 
@@ -38,7 +42,7 @@ impl SleepCpu for SleepCpuNoStd {
         let start = crate::time::Time::now();
 
         let _timer = if let Some(timeout) = timeout.as_ref() {
-            crate::timer::reset(*timeout);
+            crate::timer::request_at(crate::timer::TimerRequestId::IdleWakeup, start + *timeout);
             Some(ResetTimer)
         } else {
             None
@@ -213,13 +217,27 @@ fn is_virtualized() -> bool {
 pub(super) unsafe fn init() {
     use alloc::boxed::Box;
 
+    // This CPU's own idle-wakeup deadman: whenever it fires, just re-request
+    // another `wakeup_interval()` out. Registered once per boot; the timer
+    // IRQ handler below dispatches to whichever `TimerRequestId`(s) are
+    // actually due via the shared multiplexer, not directly to this
+    // callback.
+    crate::timer::register_timer_callback(
+        crate::timer::TimerRequestId::IdleWakeup,
+        Box::new(|| {
+            crate::timer::request_at(
+                crate::timer::TimerRequestId::IdleWakeup,
+                crate::time::Time::now() + wakeup_interval(),
+            );
+        }),
+    );
+
     // Set-up timer interrupt.
     if let Some(irq) = crate::timer::irq_id() {
         crate::interrupt::enable_irq(irq);
 
         let timer_callback = Box::new(|_irq| {
-            // Re-enable timer.
-            crate::timer::reset(wakeup_interval());
+            crate::timer::handle_timer_fire();
         });
 
         if crate::interrupt::register_handler(irq, "local timer".into(), timer_callback).is_ok() {
@@ -244,6 +262,9 @@ pub fn reset_wakeup_timer() {
     let state = CPU_SLEEP_TAG[cpu_id].load(Ordering::Relaxed);
 
     if state == SleepTag::Waiting as u32 || state == SleepTag::Waking as u32 {
-        crate::timer::reset(wakeup_interval());
+        crate::timer::request_at(
+            crate::timer::TimerRequestId::IdleWakeup,
+            crate::time::Time::now() + wakeup_interval(),
+        );
     }
 }

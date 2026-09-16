@@ -147,6 +147,7 @@ aarch64_virt = [
 ]
 spinlock = ["awkernel_lib/spinlock"]
 linux = []
+fully_one_shot_timer = ["awkernel_drivers/fully_one_shot_timer"]
 test_clustered_edf = ["userland/test_clustered_edf"]
 test_active_vp = ["userland/test_active_vp"]
 rd_gen_vfed = ["userland/rd_gen_vfed"]

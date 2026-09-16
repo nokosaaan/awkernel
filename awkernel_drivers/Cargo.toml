@@ -82,6 +82,13 @@ aarch64 = [
 spinlock = ["awkernel_lib/spinlock"]
 std = ["awkernel_lib/std"]
 
+# Force the x86_64 LAPIC timer into true one-shot mode (no LVT_TIMER_PERIODIC
+# bit) instead of the default periodic-mode-as-safety-net behavior. See
+# `awkernel_lib::timer`'s own doc for why this is off by default. Orthogonal
+# to which `rd_gen_to_dags` admission policy is active -- usable (and
+# independently measurable) with any of them, not just DAG-Fluid.
+fully_one_shot_timer = []
+
 # Documentation
 doc = ["awkernel_lib/aarch64", "raspi", "all_device"]
 
