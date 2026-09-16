@@ -61,5 +61,8 @@ pub async fn main() -> Result<(), Cow<'static, str>> {
     #[cfg(feature = "test_clustered_dag")]
     test_clustered_dag::run().await; // test_dag's DAG shape, pinned to one CpuSet via ClusteredEDF
 
+    #[cfg(feature = "test_active_vp")]
+    test_active_vp::run().await; // smoke test for V-Fed's pure active-VP scheduling path
+
     Ok(())
 }

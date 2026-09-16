@@ -86,12 +86,21 @@ optional = true
 path = "../applications/tests/test_clustered_dag"
 optional = true
 
+[dependencies.test_active_vp]
+path = "../applications/tests/test_active_vp"
+optional = true
+
 [features]
 default = ["rd_gen_to_dags"]
 perf = ["awkernel_services/perf"]
 
 # Evaluation applications
 rd_gen_to_dags = ["dep:rd_gen_to_dags"]
+# Switch rd_gen_to_dags's admission policy from Federated (default) to V-Fed.
+rd_gen_vfed = ["rd_gen_to_dags", "rd_gen_to_dags/vfed"]
+# Switch rd_gen_to_dags's admission policy from Federated (default) to the
+# static Laxity-Based baseline (plain GEDF + per-node priority).
+rd_gen_laxity = ["rd_gen_to_dags", "rd_gen_to_dags/laxity"]
 autoware = ["dep:autoware"]
 
 # Test applications
@@ -109,3 +118,4 @@ test_dag = ["dep:test_dag"]
 test_voluntary_preemption = ["dep:test_voluntary_preemption"]
 test_clustered_edf = ["dep:test_clustered_edf"]
 test_clustered_dag = ["dep:test_clustered_dag"]
+test_active_vp = ["dep:test_active_vp"]

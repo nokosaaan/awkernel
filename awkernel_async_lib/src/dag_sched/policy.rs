@@ -3,3 +3,4 @@
 //! from it, a [`crate::scheduler::SchedulerType`] for a DAG's nodes.
 
 pub mod federated;
+pub mod vfed;

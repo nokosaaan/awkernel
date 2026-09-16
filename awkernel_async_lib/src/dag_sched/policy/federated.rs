@@ -1,12 +1,26 @@
-//! Federated Scheduling admission policy (Li et al., RTSS 2014) for DAG tasks.
+//! Federated Scheduling admission policy (Li et al., RTSS 2014, generalized
+//! to constrained/arbitrary-deadline DAGs by Baruah) for DAG tasks.
 //!
-//! Federated Scheduling classifies a DAG by utilization `u = C/T`:
-//! - **Heavy** (`u > 1`): given an exclusive cluster of `m` cores.
-//! - **Light** (`u <= 1`): shares the remaining cores with other light DAGs,
-//!   admitted only while the sum of every admitted light DAG's utilization
+//! Federated Scheduling classifies a DAG by its *density* `C / min(D, T)`
+//! (volume over the shorter of relative deadline and period — see
+//! [`density_window`]):
+//! - **Heavy** (`density > 1`): given an exclusive cluster of `m` cores.
+//! - **Light** (`density <= 1`): shares the remaining cores with other light
+//!   DAGs, admitted only while the sum of every admitted light DAG's density
 //!   still fits the pool (see [`resource::reserve_light_utilization`]) — a
 //!   heavy DAG's theorem-backed core count is worthless if the light side is
 //!   silently oversubscribed instead.
+//!
+//! Li et al.'s original design only covers implicit-deadline DAGs (`D = T`),
+//! where density and plain utilization `u = C/T` coincide. For a
+//! constrained-deadline DAG (`D < T`), using `u = C/T` alone would
+//! under-count a DAG whose deadline is tighter than its period: it could
+//! read as comfortably light by utilization while still needing an entire
+//! core continuously to finish within its shorter deadline window. Using
+//! `min(D, T)` throughout (density) instead of `T` alone (utilization)
+//! covers both the classical implicit case and Baruah's constrained/
+//! arbitrary-deadline generalization with the same formula, since `D >= T`
+//! reduces `min(D, T)` back to `T`.
 //!
 //! This module is admission-time only. It does not add a new run queue or a
 //! new [`crate::scheduler::Scheduler`] impl: [`SchedulerType::ClusteredEDF`]
@@ -93,24 +107,23 @@ impl core::fmt::Display for FederatedError {
     }
 }
 
-/// `u = C/T`: a DAG is heavy iff its WCET volume exceeds its period.
-const fn is_heavy(volume: u64, period: u64) -> bool {
-    volume > period
+/// `density = C / window`: a DAG is heavy iff its WCET volume exceeds
+/// `window`, which the caller has already narrowed to `min(D, T)` (see
+/// [`density_window`]) so this reduces to the classical `u = C/T` test for
+/// an implicit/lenient (`D >= T`) DAG.
+const fn is_heavy(volume: u64, window: u64) -> bool {
+    volume > window
 }
 
-/// `m = ceil((C - L) / (D - L))`, clamped to at least 1: a DAG whose volume
-/// equals its critical path has no exploitable parallelism, but still needs
-/// one dedicated core to run on. Returns `None` if `D <= L` (infeasible,
-/// checked by the caller before this runs) or if the result does not fit a
-/// `u16` (unreachable in practice: bounded by `NUM_MAX_CPU`).
-fn required_cores(volume: u64, critical_path: u64, relative_deadline: u64) -> Option<u16> {
-    let numerator = volume.checked_sub(critical_path)?;
-    let denominator = relative_deadline.checked_sub(critical_path)?;
-    if denominator == 0 {
-        return None;
+/// `min(D, T)`: the interval a DAG's volume must be spread over for the
+/// heavy/light density test and the light-pool ledger to remain a valid
+/// bound regardless of deadline model (see the module-level doc comment).
+const fn density_window(config: &DagMetrics) -> u64 {
+    if config.relative_deadline < config.period {
+        config.relative_deadline
+    } else {
+        config.period
     }
-    let cores = numerator.div_ceil(denominator).max(1);
-    u16::try_from(cores).ok()
 }
 
 /// Classify a DAG and, if heavy, compute its required core count. Does not
@@ -124,15 +137,11 @@ pub fn classify_dag(config: &DagMetrics) -> Result<TaskClass, FederatedError> {
         });
     }
 
-    if !is_heavy(config.volume, config.period) {
+    if !is_heavy(config.volume, density_window(config)) {
         return Ok(TaskClass::Light);
     }
 
-    let Some(required_cores) = required_cores(
-        config.volume,
-        config.critical_path,
-        config.relative_deadline,
-    ) else {
+    let Some(required_cores) = config.min_dedicated_cores() else {
         return Err(FederatedError::Infeasible {
             critical_path: config.critical_path,
             relative_deadline: config.relative_deadline,
@@ -155,7 +164,7 @@ pub fn admit_dag(config: DagMetrics) -> Result<FederatedAssignment, FederatedErr
     match classify_dag(&config)? {
         TaskClass::Light => {
             let utilization_scaled =
-                resource::reserve_light_utilization(config.volume, config.period)?;
+                resource::reserve_light_utilization(config.volume, density_window(&config))?;
             let provision = Provision::Shared { utilization_scaled };
             Ok(FederatedAssignment {
                 class: TaskClass::Light,
@@ -191,20 +200,28 @@ mod tests {
     #[test]
     fn test_required_cores_formula() {
         // m = ceil((100 - 20) / (50 - 20)) = ceil(80 / 30) = 3
-        assert_eq!(required_cores(100, 20, 50), Some(3));
+        let config = DagMetrics::from_static(100, 20, 1000, 50);
+        assert_eq!(config.min_dedicated_cores(), Some(3));
     }
 
     #[test]
     fn test_required_cores_sequential_dag_clamped_to_one() {
         // A DAG with no exploitable parallelism (volume == critical_path)
         // still needs exactly one dedicated core.
-        assert_eq!(required_cores(50, 50, 60), Some(1));
+        let config = DagMetrics::from_static(50, 50, 1000, 60);
+        assert_eq!(config.min_dedicated_cores(), Some(1));
     }
 
     #[test]
     fn test_required_cores_infeasible_deadline() {
-        assert_eq!(required_cores(100, 50, 50), None); // D <= L
-        assert_eq!(required_cores(100, 50, 40), None); // D < L
+        assert_eq!(
+            DagMetrics::from_static(100, 50, 1000, 50).min_dedicated_cores(),
+            None
+        ); // D <= L
+        assert_eq!(
+            DagMetrics::from_static(100, 50, 1000, 40).min_dedicated_cores(),
+            None
+        ); // D < L
     }
 
     #[test]
@@ -221,18 +238,33 @@ mod tests {
 
     #[test]
     fn test_classify_dag_light() {
-        // volume(80) <= period(100) => Light
+        // density_window = min(D=90, T=100) = 90; volume(80) <= 90 => Light
         let config = DagMetrics::from_static(80, 20, 100, 90);
         assert_eq!(classify_dag(&config), Ok(TaskClass::Light));
     }
 
     #[test]
     fn test_classify_dag_heavy() {
-        // volume(100) > period(50) => Heavy
+        // D == T (implicit deadline): density_window = 50; volume(100) > 50 => Heavy
         let config = DagMetrics::from_static(100, 20, 50, 50);
         assert_eq!(
             classify_dag(&config),
             Ok(TaskClass::Heavy { required_cores: 3 }) // ceil((100-20)/(50-20)) = 3
+        );
+    }
+
+    #[test]
+    fn test_classify_dag_constrained_deadline_reclassifies_as_heavy() {
+        // volume(60) <= period(100) => Light under plain utilization u=C/T
+        // (0.6), but relative_deadline(50) < period(100) makes this a
+        // constrained-deadline DAG whose density_window is 50, not 100:
+        // density = 60/50 = 1.2 > 1 => Heavy. A DAG this tight cannot
+        // actually be spread thin over the shared light pool just because
+        // its long-run utilization looks low.
+        let config = DagMetrics::from_static(60, 10, 100, 50);
+        assert_eq!(
+            classify_dag(&config),
+            Ok(TaskClass::Heavy { required_cores: 2 }) // ceil((60-10)/(50-10)) = 2
         );
     }
 
@@ -288,12 +320,14 @@ mod tests {
         assert!(heavy_c.iter().all(|cpu| !heavy_b.contains(cpu)));
 
         // admit_dag end-to-end: Light gets GEDF, Heavy gets a fresh cluster.
+        // density_window = min(D=50, T=100) = 50, so admit_dag reserves
+        // utilization against 50, not 100 — release must match.
         let light = admit_dag(DagMetrics::from_static(10, 5, 100, 50)).unwrap();
         assert_eq!(light.class, TaskClass::Light);
         assert_eq!(light.source, MetricsSource::Static);
         assert!(matches!(light.provision, Provision::Shared { .. }));
         assert!(matches!(light.scheduler_type, SchedulerType::GEDF(50)));
-        resource::release_light_utilization(10, 100); // undo admit_dag's reservation before the next scenario
+        resource::release_light_utilization(10, 50); // undo admit_dag's reservation before the next scenario
 
         resource::release_cluster(heavy_b);
         resource::release_cluster(heavy_c);

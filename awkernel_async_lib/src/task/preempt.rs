@@ -73,7 +73,7 @@ fn yield_preempted_and_wake_task(current_task: Arc<Task>, next_thread: PtrWorker
         let mut node = MCSNode::new();
         let info = current_task.info.lock(&mut node);
         info.get_dag_info()
-            .map(|d| d.period_index.load(Ordering::Relaxed))
+            .map(|d| d.period_index.load(Ordering::Acquire))
     };
 
     // An IPI can also land while `RUNNING` is still set but the task's poll

@@ -1,3 +1,5 @@
+#[cfg(feature = "laxity")]
+use crate::dag_stats::compute_node_laxity;
 use crate::dag_stats::compute_dag_stats;
 use crate::parse_yaml::{DagData, NodeData};
 use crate::time_unit::{convert_duration, simulated_execution_time};
@@ -5,12 +7,16 @@ use crate::time_unit::{convert_duration, simulated_execution_time};
 use alloc::{borrow::Cow, format, sync::Arc, vec::Vec};
 use awkernel_async_lib::{
     dag::{Dag, create_dag},
-    dag_sched::{
-        metrics::DagMetrics,
-        policy::federated::{FederatedError, admit_dag},
-    },
+    dag_sched::{metrics::DagMetrics, policy::federated::FederatedError},
     scheduler::SchedulerType,
 };
+#[cfg(not(any(feature = "vfed", feature = "laxity")))]
+use awkernel_async_lib::dag_sched::policy::federated::admit_dag;
+#[cfg(feature = "vfed")]
+use awkernel_async_lib::dag_sched::policy::vfed::{self, PackingStrategy, VFedError};
+
+#[cfg(all(feature = "vfed", feature = "laxity"))]
+compile_error!("features \"vfed\" and \"laxity\" select mutually exclusive admission policies");
 
 /// Represents errors related to the number of links for a node.
 /// `(DAG ID, Node ID)` tuple to identify the specific DAG and node where the error occurred.
@@ -37,13 +43,28 @@ impl core::fmt::Display for LinkNumError {
 }
 
 /// Errors that can prevent a DAG from being built, from either link-arity
-/// validation or Federated Scheduling admission.
+/// validation or admission (Federated Scheduling or, with the `vfed`
+/// feature, V-Fed).
 pub(crate) enum BuildDagError {
     LinkNum(LinkNumError),
     Federated(FederatedError),
+    #[cfg(feature = "vfed")]
+    VFed(VFedError),
+    /// `vfed::admit_one` succeeded but `into_scheduler_type` returned
+    /// `None` — should not happen for any `VFedAssignment` this crate's own
+    /// admission call can produce (see that method's own doc), kept only so
+    /// the conversion stays total rather than panicking on a should-never
+    /// happen case.
+    #[cfg(feature = "vfed")]
+    VFedSchedulerTypeMissing(u32),
     /// The DAG's source node has no `period`, or its sink node has no
-    /// `end_to_end_deadline` — both are required to run Federated admission.
+    /// `end_to_end_deadline` — both are required for admission.
     MissingDagTiming(u32),
+    /// (`laxity` feature only) `compute_node_laxity` found
+    /// `relative_deadline <= critical_path` — the DAG is unconditionally
+    /// infeasible under any policy, not specific to this one.
+    #[cfg(feature = "laxity")]
+    LaxityInfeasible(u32),
 }
 
 impl core::fmt::Display for BuildDagError {
@@ -51,9 +72,21 @@ impl core::fmt::Display for BuildDagError {
         match self {
             BuildDagError::LinkNum(e) => write!(f, "{e}"),
             BuildDagError::Federated(e) => write!(f, "{e}"),
+            #[cfg(feature = "vfed")]
+            BuildDagError::VFed(e) => write!(f, "{e:?}"),
+            #[cfg(feature = "vfed")]
+            BuildDagError::VFedSchedulerTypeMissing(dag_id) => write!(
+                f,
+                "DAG#{dag_id}: vfed admitted it but produced no SchedulerType"
+            ),
             BuildDagError::MissingDagTiming(dag_id) => write!(
                 f,
                 "DAG#{dag_id} has no source period or no sink end-to-end deadline"
+            ),
+            #[cfg(feature = "laxity")]
+            BuildDagError::LaxityInfeasible(dag_id) => write!(
+                f,
+                "DAG#{dag_id}: relative_deadline <= critical_path, unconditionally infeasible"
             ),
         }
     }
@@ -68,6 +101,13 @@ impl From<LinkNumError> for BuildDagError {
 impl From<FederatedError> for BuildDagError {
     fn from(e: FederatedError) -> Self {
         BuildDagError::Federated(e)
+    }
+}
+
+#[cfg(feature = "vfed")]
+impl From<VFedError> for BuildDagError {
+    fn from(e: VFedError) -> Self {
+        BuildDagError::VFed(e)
     }
 }
 
@@ -313,27 +353,57 @@ pub(super) async fn build_dag(dag_data: DagData) -> Result<Arc<Dag>, BuildDagErr
         .and_then(NodeData::get_end_to_end_deadline)
         .ok_or(BuildDagError::MissingDagTiming(dag_id))?;
 
-    let assignment = admit_dag(DagMetrics::from_static(
-        stats.volume,
-        stats.critical_path,
-        period,
-        relative_deadline,
-    ))?;
-    let sched_type = assignment.scheduler_type;
-    if let SchedulerType::ClusteredEDF(deadline, cluster) = sched_type {
-        let cores: Vec<usize> = cluster.iter().collect();
+    let config = DagMetrics::from_static(stats.volume, stats.critical_path, period, relative_deadline);
+
+    #[cfg(not(any(feature = "vfed", feature = "laxity")))]
+    let sched_type = {
+        let assignment = admit_dag(config)?;
+        let sched_type = assignment.scheduler_type;
+        if let SchedulerType::ClusteredEDF(deadline, cluster) = sched_type {
+            let cores: Vec<usize> = cluster.iter().collect();
+            log::info!(
+                "DAG#{dag_id}: admitted (federated) as {:?} ({:?}) -> ClusteredEDF(relative_deadline={deadline}, cores={cores:?})",
+                assignment.class,
+                assignment.source
+            );
+        } else {
+            log::info!(
+                "DAG#{dag_id}: admitted (federated) as {:?} ({:?}) -> {sched_type:?}",
+                assignment.class,
+                assignment.source
+            );
+        }
+        sched_type
+    };
+
+    #[cfg(feature = "vfed")]
+    let sched_type = {
+        let assignment = vfed::admit_one(config, PackingStrategy::FirstFit)?;
+        let sched_type = assignment
+            .into_scheduler_type(relative_deadline)
+            .ok_or(BuildDagError::VFedSchedulerTypeMissing(dag_id))?;
+        log::info!("DAG#{dag_id}: admitted (vfed) as {assignment:?} -> {sched_type:?}");
+        sched_type
+    };
+
+    // "Static Laxity-Based" baseline: plain (non-clustered) GEDF, with a
+    // per-node priority tie-break computed offline from `compute_node_laxity`
+    // (shorter laxity = more urgent = higher priority, per `dag.rs`/
+    // `gedf.rs`/`clustered_edf.rs`'s shared "higher `node_priority` picked
+    // first" convention). This baseline has no published primary source of
+    // its own -- see `compute_node_laxity`'s own doc for why -- it exists as
+    // a self-derived structural counterpart to He et al. 2019 for
+    // comparison purposes, not a reproduction of any specific paper.
+    #[cfg(feature = "laxity")]
+    let (sched_type, node_laxity) = {
+        let laxity =
+            compute_node_laxity(&dag_data, relative_deadline).ok_or(BuildDagError::LaxityInfeasible(dag_id))?;
+        let sched_type = SchedulerType::GEDF(relative_deadline);
         log::info!(
-            "DAG#{dag_id}: admitted as {:?} ({:?}) -> ClusteredEDF(relative_deadline={deadline}, cores={cores:?})",
-            assignment.class,
-            assignment.source
+            "DAG#{dag_id}: admitted (laxity) {config:?} -> {sched_type:?}, node_laxity={laxity:?}"
         );
-    } else {
-        log::info!(
-            "DAG#{dag_id}: admitted as {:?} ({:?}) -> {sched_type:?}",
-            assignment.class,
-            assignment.source
-        );
-    }
+        (sched_type, laxity)
+    };
 
     for node in dag_data.get_nodes() {
         if node.is_source() {
@@ -342,6 +412,22 @@ pub(super) async fn build_dag(dag_data: DagData) -> Result<Arc<Dag>, BuildDagErr
             register_sink_node(&dag, node, sched_type).await?;
         } else {
             register_intermediate_node(&dag, node, sched_type).await?;
+        }
+
+        // Shorter laxity = more urgent: invert so it maps to a *larger*
+        // `node_priority`, matching `gedf.rs`'s ordering
+        // (`GEDFTask`'s `Ord` picks the *largest* `node_priority` first
+        // among equal-deadline tasks). Called here, before
+        // `finish_create_dags`, per `set_node_priority`'s own doc
+        // requirement. `node.get_id()` is safe to use directly as the
+        // runtime `node_id`: `DagData::get_nodes()` is backed by a
+        // `BTreeMap<u32, NodeData>` keyed by this same id
+        // (parse_yaml.rs's `convert_to_dag`), so registration happens in
+        // ascending-id order and lines up with the sequential id
+        // `register_*_reactor` assigns internally.
+        #[cfg(feature = "laxity")]
+        if let Some(&laxity) = node_laxity.get(&node.get_id()) {
+            dag.set_node_priority(node.get_id(), u64::MAX.saturating_sub(laxity));
         }
     }
 

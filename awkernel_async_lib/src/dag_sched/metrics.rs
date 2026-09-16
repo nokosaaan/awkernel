@@ -45,6 +45,21 @@ pub struct DagMetrics {
     /// an opaque `u64`; callers must stay consistent, exactly as those two
     /// variants already require).
     pub relative_deadline: u64,
+    /// A task's own maximum degree of parallelism (how many nodes can ever
+    /// be eligible at once) — *not* the same quantity as `critical_path`,
+    /// despite both being called `L` in the literature. Only consulted by
+    /// [`super::policy::vfed`]'s OURS2 (PSF/`Π'`) refinement, to prove some
+    /// of a heavy DAG's own active-VPs are structurally always idle; every
+    /// other policy, and `vfed`'s own OURS1 path, ignores this field
+    /// entirely. `u16::MAX` (the value [`DagMetrics::from_static`]/
+    /// [`DagMetrics::from_measured`] set) means "unknown" — `vfed` then
+    /// falls back to its OURS1 behavior for this DAG, exactly as if this
+    /// field didn't exist. Set it explicitly (struct-update syntax; every
+    /// field here is `pub`) when it's known, e.g. an offline evaluation
+    /// harness drawing it the same way the V-Fed paper's own evaluation
+    /// does: `Uniform[ceil(m_i/2), m_i]` where `m_i` is this same DAG's
+    /// [`DagMetrics::min_dedicated_cores`].
+    pub max_parallelism: u16,
     pub source: MetricsSource,
 }
 
@@ -62,6 +77,7 @@ impl DagMetrics {
             critical_path,
             period,
             relative_deadline,
+            max_parallelism: u16::MAX,
             source: MetricsSource::Static,
         }
     }
@@ -80,12 +96,34 @@ impl DagMetrics {
             critical_path,
             period,
             relative_deadline,
+            max_parallelism: u16::MAX,
             source: MetricsSource::Measured,
         }
     }
 
     pub const fn is_measured(&self) -> bool {
         matches!(self.source, MetricsSource::Measured)
+    }
+
+    /// `m = ceil((C - L) / (D - L))`, clamped to at least 1: a DAG whose
+    /// volume equals its critical path has no exploitable parallelism, but
+    /// still needs one dedicated core to run on. Returns `None` if
+    /// `D <= L` (infeasible — no core count can help once the critical path
+    /// alone already exceeds the deadline) or if the result does not fit a
+    /// `u16` (unreachable in practice: bounded by `NUM_MAX_CPU`).
+    ///
+    /// Shared by every admission policy that dedicates a whole cluster to a
+    /// heavy DAG ([`super::policy::federated`], [`super::policy::vfed`]):
+    /// both derive the same minimum core count from the same three numbers,
+    /// so it lives here once instead of drifting apart in two copies.
+    pub fn min_dedicated_cores(&self) -> Option<u16> {
+        let numerator = self.volume.checked_sub(self.critical_path)?;
+        let denominator = self.relative_deadline.checked_sub(self.critical_path)?;
+        if denominator == 0 {
+            return None;
+        }
+        let cores = numerator.div_ceil(denominator).max(1);
+        u16::try_from(cores).ok()
     }
 }
 

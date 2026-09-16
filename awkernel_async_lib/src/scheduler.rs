@@ -17,9 +17,12 @@ use awkernel_lib::{
 #[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
 
+pub(crate) mod active_vp;
 mod clustered_edf;
 pub mod gedf;
+pub(crate) mod mixed_vp;
 pub(super) mod panicked;
+pub(crate) mod passive_vp;
 pub(crate) mod pool;
 mod prioritized_fifo;
 mod prioritized_rr;
@@ -74,6 +77,24 @@ pub fn move_preemption_pending(cpu_id: usize) -> Option<BinaryHeap<Arc<Task>>> {
 /// 0 is the lowest priority and 31 is the highest priority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchedulerType {
+    /// V-Fed active-VP scheduling: `(cpu_set, leading_cpu)` (see
+    /// `dag_sched::policy::vfed` and `scheduler::active_vp`). `cpu_set` is
+    /// a heavy DAG's dedicated active-VP group, normalized the same way as
+    /// `ClusteredEDF`'s; `leading_cpu` (a member of `cpu_set`) is the one
+    /// core privileged to be tried first for any eligible vertex. Each
+    /// core's replenishable per-job execution budget is tracked separately
+    /// (`active_vp::set_initial_budget`), not carried here.
+    ActiveVp(CpuSet, usize),
+    /// V-Fed mixed active+passive scheduling (Theorem 4):
+    /// `(active_set, leading_cpu, passive_set)` — a heavy DAG's own
+    /// (possibly partial) active-VP group plus other DAGs' leftover
+    /// passive-VPs pulled in to top it up (see `dag_sched::policy::vfed`'s
+    /// `VFedAssignment::Heavy` with a non-empty `passive`, and
+    /// `scheduler::mixed_vp`). `active_set`/`leading_cpu` are normalized and
+    /// budget/leading-gated exactly like `ActiveVp`'s; `passive_set` is
+    /// normalized and gated exactly like `PassiveVp`'s. Disjoint from
+    /// `active_set` by construction (a DAG never borrows its own cores).
+    MixedVp(CpuSet, usize, CpuSet),
     /// Clustered EDF: `(relative_deadline, cpu_set)`.
     ///
     /// `cpu_set` is the set of cores the task may run on. It is normalized at
@@ -83,6 +104,13 @@ pub enum SchedulerType {
     /// rejected; it falls back to all worker cores (`1..num_cpu()`) with a
     /// warning.
     ClusteredEDF(u64, CpuSet),
+    /// V-Fed passive-VP scheduling: `cpu_set` (see
+    /// `dag_sched::policy::vfed` and `scheduler::passive_vp`) — the set of
+    /// other DAGs' leftover active-VP cores this task draws on. Normalized
+    /// the same way as `ClusteredEDF`'s. No leading/budget concept: dispatch
+    /// is gated purely by whether each core's active-VP owner is currently
+    /// executing there (`passive_vp::active_vp_is_busy`).
+    PassiveVp(CpuSet),
     GEDF(u64), // relative deadline
     PrioritizedFIFO(u8),
     PrioritizedRR(u8),
@@ -93,11 +121,14 @@ impl SchedulerType {
     pub const fn equals(&self, other: &Self) -> bool {
         matches!(
             (self, other),
-            (SchedulerType::GEDF(_), SchedulerType::GEDF(_))
+            (SchedulerType::ActiveVp(_, _), SchedulerType::ActiveVp(_, _))
+                | (SchedulerType::MixedVp(_, _, _), SchedulerType::MixedVp(_, _, _))
+                | (SchedulerType::GEDF(_), SchedulerType::GEDF(_))
                 | (
                     SchedulerType::ClusteredEDF(_, _),
                     SchedulerType::ClusteredEDF(_, _)
                 )
+                | (SchedulerType::PassiveVp(_), SchedulerType::PassiveVp(_))
                 | (
                     SchedulerType::PrioritizedFIFO(_),
                     SchedulerType::PrioritizedFIFO(_)
@@ -110,13 +141,20 @@ impl SchedulerType {
         )
     }
 
-    /// Return the CPU affinity set if this is a [`SchedulerType::ClusteredEDF`] scheduler.
+    /// Return the CPU affinity set if this is a [`SchedulerType::ClusteredEDF`],
+    /// [`SchedulerType::ActiveVp`], [`SchedulerType::PassiveVp`], or
+    /// [`SchedulerType::MixedVp`] scheduler.
     ///
     /// Returns `Some(set)` where `set` is the set of CPU cores (`1..num_cpu()`) the task
     /// may run on. Returns `None` for all other scheduler variants.
     pub const fn cpu_set(&self) -> Option<CpuSet> {
         match self {
             SchedulerType::ClusteredEDF(_, set) => Some(*set),
+            SchedulerType::ActiveVp(set, _) => Some(*set),
+            SchedulerType::PassiveVp(set) => Some(*set),
+            SchedulerType::MixedVp(active_set, _, passive_set) => {
+                Some(active_set.union(*passive_set))
+            }
             _ => None,
         }
     }
@@ -126,7 +164,13 @@ impl SchedulerType {
     /// scheduler; it is the single source of truth for the clustered prefix
     /// of `PRIORITY_LIST`.
     pub const fn is_clustered(&self) -> bool {
-        matches!(self, SchedulerType::ClusteredEDF(_, _))
+        matches!(
+            self,
+            SchedulerType::ActiveVp(_, _)
+                | SchedulerType::MixedVp(_, _, _)
+                | SchedulerType::ClusteredEDF(_, _)
+                | SchedulerType::PassiveVp(_)
+        )
     }
 
     /// True if this scheduler carries DAG light-pool work (currently just
@@ -144,17 +188,43 @@ impl SchedulerType {
 /// `priority()` returns the priority of the scheduler for preemption.
 ///
 /// - The highest priority.
-///   - Clustered EDF scheduler.
+///   - Active-VP scheduler (V-Fed).
 /// - The second highest priority.
-///   - GEDF scheduler.
+///   - Mixed active+passive-VP scheduler (V-Fed, Theorem 4). Below
+///     `ActiveVp` so a mixed task can never preempt a core's *true*
+///     active-VP owner when running there as a mere borrower; above
+///     everything else because on its own (possibly partial) active-VP
+///     cores it is servicing the same heavy-DAG obligation `ActiveVp`
+///     does. Relative order versus `ClusteredEDF`/`PassiveVp`/`GEDF` below
+///     has no live scenario to matter for: a specific core is claimed by at
+///     most one active-VP owner and lent to at most one passive/mixed
+///     borrower at a time (see `dag_sched::policy::vfed`'s pool semantics),
+///     so those tiers never actually contend with `MixedVp` for a core —
+///     this ordering is chosen for its own sake, not forced by any such
+///     contention.
 /// - The third highest priority.
-///   - Prioritized FIFO scheduler.
+///   - Clustered EDF scheduler.
 /// - The fourth highest priority.
+///   - Passive-VP scheduler (V-Fed). Below `ClusteredEDF` because a
+///     passive-VP's whole premise is "leftover capacity", lower priority
+///     than any exclusive cluster reservation elsewhere; Federated and
+///     V-Fed are alternative policies rarely live in the same run, so this
+///     relative ordering mostly matters for `PriorityInfo`'s packed
+///     cross-tier comparisons, not for any scenario where they actually
+///     contend for the same core.
+/// - The fifth highest priority.
+///   - GEDF scheduler.
+/// - The sixth highest priority.
+///   - Prioritized FIFO scheduler.
+/// - The seventh highest priority.
 ///   - Prioritized Round-Robin scheduler.
 /// - The lowest priority.
 ///   - Panicked scheduler.
-static PRIORITY_LIST: [SchedulerType; 5] = [
+static PRIORITY_LIST: [SchedulerType; 8] = [
+    SchedulerType::ActiveVp(CpuSet::empty(), 0),
+    SchedulerType::MixedVp(CpuSet::empty(), 0, CpuSet::empty()),
     SchedulerType::ClusteredEDF(0, CpuSet::empty()),
+    SchedulerType::PassiveVp(CpuSet::empty()),
     SchedulerType::GEDF(0),
     SchedulerType::PrioritizedFIFO(0),
     SchedulerType::PrioritizedRR(0),
@@ -359,6 +429,9 @@ pub(crate) fn get_scheduler(sched_type: &SchedulerType) -> &'static dyn Schedule
         SchedulerType::PrioritizedRR(_) => &prioritized_rr::SCHEDULER,
         SchedulerType::GEDF(_) => &gedf::SCHEDULER,
         SchedulerType::ClusteredEDF(_, _) => &clustered_edf::SCHEDULER,
+        SchedulerType::ActiveVp(_, _) => &active_vp::SCHEDULER,
+        SchedulerType::MixedVp(_, _, _) => &mixed_vp::SCHEDULER,
+        SchedulerType::PassiveVp(_) => &passive_vp::SCHEDULER,
         SchedulerType::Panicked => &panicked::SCHEDULER,
     }
 }
@@ -496,12 +569,29 @@ pub(crate) fn sleep_task(sleep_handler: Box<dyn FnOnce() + Send>, dur: Duration)
 /// If there are sleeping tasks, this function returns the duration to wait.
 /// If there are no sleeping tasks, this function returns `None`.
 pub fn wake_task() -> Option<Duration> {
-    // Check whether each running task exceeds the time quantum.
+    // Check whether each running task exceeds the time quantum (RR) or its
+    // active-VP budget (V-Fed) — see `active_vp`'s WCET contract for the
+    // bound on this loop's per-cpu work.
     for cpu_id in 1..num_cpu() {
         if let Some(task_id) = get_current_task(cpu_id) {
-            if let Some(SchedulerType::PrioritizedRR(_)) = get_scheduler_type_by_task_id(task_id) {
-                prioritized_rr::SCHEDULER.invoke_preemption_tick(cpu_id, task_id)
+            match get_scheduler_type_by_task_id(task_id) {
+                Some(SchedulerType::PrioritizedRR(_)) => {
+                    prioritized_rr::SCHEDULER.invoke_preemption_tick(cpu_id, task_id)
+                }
+                Some(SchedulerType::ActiveVp(_, _)) => active_vp::tick_budget(cpu_id),
+                // Only while running as this group's own active-VP work —
+                // running here as a mere borrower of some *other* DAG's
+                // passive-VP falls through to the `_` arm below, exactly
+                // like a plain `PassiveVp` task already does, which is
+                // correct: budget belongs to the core's true owner, not to
+                // whoever it's currently lent to.
+                Some(SchedulerType::MixedVp(active_set, _, _)) if active_set.contains(cpu_id) => {
+                    active_vp::tick_budget(cpu_id)
+                }
+                _ => active_vp::mark_idle(cpu_id),
             }
+        } else {
+            active_vp::mark_idle(cpu_id);
         }
     }
 

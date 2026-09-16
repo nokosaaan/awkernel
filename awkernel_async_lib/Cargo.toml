@@ -39,6 +39,9 @@ path = "../smoltcp"
 default-features = false
 features = ["awkernel"]
 
+[dev-dependencies]
+rand = "0.9"
+
 [features]
 default = []
 std = ["awkernel_lib/std", "no_preempt"]

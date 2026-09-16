@@ -202,14 +202,21 @@ const DAG_JOB_TABLE_SIZE: usize = 16;
 /// every node of a DAG, which corrupted the deadline of an older, still
 /// in-flight instance whenever a newer instance's source node recomputed and
 /// overwrote it (see [`DAG_JOB_TABLE_SIZE`]).
+///
+/// Each slot stores the job index it was last written for alongside its
+/// deadline, so [`DagJobTable::get`] can tell a genuine hit apart from a
+/// slot that a *different* job index happens to map to (mod
+/// `DAG_JOB_TABLE_SIZE`) — a plain occupancy check (`Some`/`None`) cannot
+/// distinguish the two, since after the ring's first lap every slot is
+/// always occupied by *some* job's deadline.
 struct DagJobTable {
-    deadlines: [Option<u64>; DAG_JOB_TABLE_SIZE],
+    entries: [Option<(u64, u64)>; DAG_JOB_TABLE_SIZE],
 }
 
 impl DagJobTable {
     const fn new() -> Self {
         Self {
-            deadlines: [None; DAG_JOB_TABLE_SIZE],
+            entries: [None; DAG_JOB_TABLE_SIZE],
         }
     }
 
@@ -218,11 +225,17 @@ impl DagJobTable {
     }
 
     fn set(&mut self, job_index: u64, deadline: u64) {
-        self.deadlines[Self::slot(job_index)] = Some(deadline);
+        self.entries[Self::slot(job_index)] = Some((job_index, deadline));
     }
 
+    /// Returns the deadline recorded for `job_index`, or `None` if that
+    /// exact job's entry was never written or has since been overwritten by
+    /// a different job sharing the same slot (see [`DAG_JOB_TABLE_SIZE`]).
     fn get(&self, job_index: u64) -> Option<u64> {
-        self.deadlines[Self::slot(job_index)]
+        match self.entries[Self::slot(job_index)] {
+            Some((stored_job_index, deadline)) if stored_job_index == job_index => Some(deadline),
+            _ => None,
+        }
     }
 }
 
@@ -732,12 +745,23 @@ fn get_dag_sink_relative_deadline_ms(dag_id: u32) -> u64 {
 /// release order, because pubsub topics have a single publisher and an
 /// in-order queue, and no node here filters, reorders, or drops jobs.
 ///
+/// Before any job has been released/consumed, `period_index` holds
+/// [`crate::task::NO_PERIOD_YET`] rather than a real period, so this maps
+/// to job `0` directly instead of `previous + 1` — otherwise this generic
+/// post-spawn wake and the *first* real one would both compute job index
+/// `1` (real period `0`'s value), aliasing the source's premature
+/// pre-release deadline with period `0`'s real one in the job table.
+///
 /// Without the `period-index-propagation` feature the counter never moves
-/// off `0`, so every job maps to the same slot here — i.e. this degrades to
-/// the pre-fix single-shared-deadline behavior (no worse than before)
-/// rather than silently mis-tracking jobs it has no way to distinguish.
+/// off `NO_PERIOD_YET`, so every job maps to slot `0` here — i.e. this
+/// degrades to the pre-fix single-shared-deadline behavior (no worse than
+/// before) rather than silently mis-tracking jobs it has no way to
+/// distinguish.
 fn next_job_index(dag_info: &DagInfo) -> u64 {
-    dag_info.period_index.load(Ordering::Relaxed) as u64 + 1
+    match dag_info.period_index.load(Ordering::Acquire) {
+        crate::task::NO_PERIOD_YET => 0,
+        previous => previous as u64 + 1,
+    }
 }
 
 /// Compute (for a source node) or look up (for every other node) the
@@ -773,7 +797,7 @@ pub fn calculate_and_update_dag_deadline(dag_info: &DagInfo, wake_time: u64) -> 
         //    its subscribers exist). That poll immediately re-suspends on
         //    `recv` without consuming anything, so `next_job_index` never
         //    advances past this — it can only ever land within the ring's
-        //    first lap (`job_index <= DAG_JOB_TABLE_SIZE`).
+        //    first lap (`job_index < DAG_JOB_TABLE_SIZE`, 0-indexed).
         // 2. Ring wraparound (actionable): this node is running further
         //    behind the source's releases than the fixed-size ring
         //    (`DAG_JOB_TABLE_SIZE`) can track — its D/T ratio is wider than
@@ -781,7 +805,7 @@ pub fn calculate_and_update_dag_deadline(dag_info: &DagInfo, wake_time: u64) -> 
         //    `job_index` has lapped the ring at least once.
         //
         // Only the second case is worth an operator's attention.
-        if job_index > DAG_JOB_TABLE_SIZE as u64 {
+        if job_index >= DAG_JOB_TABLE_SIZE as u64 {
             log::warn!(
                 "DAG {dag_id} job {job_index}: absolute deadline not found in the job table \
                  (DAG_JOB_TABLE_SIZE={DAG_JOB_TABLE_SIZE} may be too small for this DAG's D/T \
@@ -790,6 +814,22 @@ pub fn calculate_and_update_dag_deadline(dag_info: &DagInfo, wake_time: u64) -> 
         }
         wake_time + get_dag_sink_relative_deadline_ms(dag_id)
     }
+}
+
+/// True if this wake is the moment `dag_info`'s DAG releases a new job —
+/// i.e. `dag_info.node_id` is the DAG's source node, the same condition
+/// [`calculate_and_update_dag_deadline`] uses to decide whether to compute
+/// a fresh deadline rather than look one up. Exposed so scheduler
+/// mechanisms that must react to "a new job just started" (e.g.
+/// `scheduler::active_vp`'s per-job budget replenishment) do not have to
+/// duplicate this DAG-structure lookup. Returns `false` if the DAG is
+/// unknown rather than panicking, since a scheduler's wake path must not
+/// panic on this check.
+pub(crate) fn is_job_release_wake(dag_info: &DagInfo) -> bool {
+    let Some(dag) = get_dag(dag_info.dag_id) else {
+        return false;
+    };
+    dag.is_source_node(to_node_index(dag_info.node_id))
 }
 
 pub async fn finish_create_dags(dags: &[Arc<Dag>]) -> Result<(), Vec<DagError>> {
@@ -1136,7 +1176,7 @@ where
                     <<Args as VectorToSubscribers>::Subscribers as MultipleReceiver>::Item,
                     u32,
                 ) = subscribers.recv_all_with_period_index().await;
-                period_index_cell.store(period_index, core::sync::atomic::Ordering::Relaxed);
+                period_index_cell.store(period_index, core::sync::atomic::Ordering::Release);
 
                 // [end] pubsub communication latency
                 let end = awkernel_lib::time::Time::now().uptime().as_nanos() as u64;
@@ -1217,7 +1257,7 @@ where
             #[cfg(feature = "period-index-propagation")]
             {
                 let index = get_period_index(dag_info.dag_id) as usize;
-                period_index_cell.store(index as u32, core::sync::atomic::Ordering::Relaxed);
+                period_index_cell.store(index as u32, core::sync::atomic::Ordering::Release);
                 if index != 0 {
                     // [start] cycle deviation index >= 1
                     let release_time = awkernel_lib::time::Time::now().uptime().as_nanos() as u64;
@@ -1283,7 +1323,7 @@ where
             {
                 let (args, period_index): (<Args::Subscribers as MultipleReceiver>::Item, u32) =
                     subscribers.recv_all_with_period_index().await;
-                period_index_cell.store(period_index, core::sync::atomic::Ordering::Relaxed);
+                period_index_cell.store(period_index, core::sync::atomic::Ordering::Release);
 
                 // [end] pubsub communication latency
                 let end = awkernel_lib::time::Time::now().uptime().as_nanos() as u64;

@@ -65,15 +65,25 @@ impl core::fmt::Display for ResourceError {
 /// Utilization is tracked as an integer scaled by this factor (parts per
 /// million) rather than a float, so the light-pool admission check below
 /// stays exact and panic-free. `u = 1.0` (100%) is represented as
-/// `1_000_000`.
-const UTILIZATION_SCALE: u64 = 1_000_000;
+/// `1_000_000`. `pub(crate)` so other admission policies needing the same
+/// scaled representation (e.g. `policy::vfed`'s partitioned-EDF density
+/// bin-packing) share one scale factor instead of each picking their own.
+pub(crate) const UTILIZATION_SCALE: u64 = 1_000_000;
 
-fn utilization_scaled(volume: u64, period: u64) -> u64 {
-    // `volume`/`period` are WCET sums/periods in the caller's time unit,
+/// `volume / window`, scaled. `window` is whatever interval the caller wants
+/// `volume`'s demand spread over for the purpose of this bound — the period
+/// for an implicit/lenient (`D >= T`) DAG, or the shorter of its relative
+/// deadline and period otherwise (see [`crate::dag_sched::policy::federated`]).
+/// This module stays agnostic to which: it only ever sees the resulting
+/// scaled ratio. `pub(crate)` so other policies can reuse this exact scaling
+/// (e.g. `policy::vfed`'s density-based partitioned-EDF bin-packing) instead
+/// of duplicating it.
+pub(crate) fn utilization_scaled(volume: u64, window: u64) -> u64 {
+    // `volume`/`window` are WCET sums/time bounds in the caller's time unit,
     // orders of magnitude below `u64::MAX / UTILIZATION_SCALE` for any DAG
     // anyone would actually declare, so this cannot overflow in practice.
-    // `period.max(1)` guards the degenerate `period == 0` input.
-    volume.saturating_mul(UTILIZATION_SCALE) / period.max(1)
+    // `window.max(1)` guards the degenerate `window == 0` input.
+    volume.saturating_mul(UTILIZATION_SCALE) / window.max(1)
 }
 
 /// Shared state for the ledger, bundled behind one lock so a cluster claim
@@ -106,6 +116,18 @@ fn light_pool_size(pool: &PoolLedger) -> usize {
         .count()
 }
 
+/// Number of DAG-pool worker CPUs not currently claimed by any exclusive
+/// cluster, i.e. the most [`allocate_cluster`] could hand out right now.
+/// Exposed for admission policies that need to search over candidate
+/// cluster sizes (e.g. `dag_sched::policy::vfed`'s search over how many
+/// cores to dedicate to heavy tasks as a whole) before committing to one.
+pub fn free_core_count() -> u16 {
+    let mut node = MCSNode::new();
+    let pool = POOL.lock(&mut node);
+    // `light_pool_size` is bounded by `num_cpu() <= NUM_MAX_CPU` (512), fits u16.
+    light_pool_size(&pool) as u16
+}
+
 /// Claim `required_cores` DAG-pool worker CPUs (`1..num_cpu()`, excluding
 /// CPU 0 and the regular-pool core; see [`is_dag_pool_core`]) not already
 /// claimed by another cluster.
@@ -132,6 +154,18 @@ pub fn allocate_cluster(required_cores: u16) -> Result<CpuSet, ResourceError> {
     }
 
     pool.claimed_cores = pool.claimed_cores.union(cluster);
+
+    // Reserve these cores against `crate::task::is_cpu_reserved` immediately,
+    // not just in this module's own ledger: this DAG's tasks are not spawned
+    // until later (`finish_create_dags`), and an already-admitted DAG spawned
+    // first can otherwise dispatch a global/regular task onto a core this
+    // cluster has already claimed but not yet spawned into, in the window
+    // between this admission and that spawn. Paired with `task::release_cpu`
+    // in `release_cluster`.
+    for cpu in cluster.iter() {
+        crate::task::reserve_cpu(cpu);
+    }
+
     Ok(cluster)
 }
 
@@ -142,20 +176,21 @@ pub fn release_cluster(cluster: CpuSet) {
     let mut pool = POOL.lock(&mut node);
     for cpu in cluster.iter() {
         pool.claimed_cores.remove(cpu);
+        crate::task::release_cpu(cpu);
     }
 }
 
-/// Commit `volume/period`'s utilization against the shared light pool,
+/// Commit `volume/window`'s utilization against the shared light pool,
 /// returning the scaled utilization actually reserved (release it later with
-/// the same `volume`/`period` via [`release_light_utilization`]).
+/// the same `volume`/`window` via [`release_light_utilization`]).
 ///
 /// This is the necessary condition every scheduling algorithm requires
 /// (`Σ light utilization <= light pool core count`); it is not by itself a
 /// sufficient schedulability proof for any particular global scheduler, but
 /// admitting past it is certain to be unschedulable, so it is enforced as a
 /// hard gate.
-pub fn reserve_light_utilization(volume: u64, period: u64) -> Result<u64, ResourceError> {
-    let additional = utilization_scaled(volume, period);
+pub fn reserve_light_utilization(volume: u64, window: u64) -> Result<u64, ResourceError> {
+    let additional = utilization_scaled(volume, window);
 
     let mut node = MCSNode::new();
     let mut pool = POOL.lock(&mut node);
@@ -175,9 +210,10 @@ pub fn reserve_light_utilization(volume: u64, period: u64) -> Result<u64, Resour
 }
 
 /// Release utilization previously committed by [`reserve_light_utilization`].
-pub fn release_light_utilization(volume: u64, period: u64) {
-    let released = utilization_scaled(volume, period);
+pub fn release_light_utilization(volume: u64, window: u64) {
+    let released = utilization_scaled(volume, window);
     let mut node = MCSNode::new();
     let mut pool = POOL.lock(&mut node);
     pool.light_utilization_scaled = pool.light_utilization_scaled.saturating_sub(released);
 }
+

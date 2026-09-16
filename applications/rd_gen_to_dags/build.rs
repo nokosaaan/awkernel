@@ -10,9 +10,13 @@ use std::{
 };
 
 /// Folder to load every `dag_<N>.yaml` file from (searched recursively).
-/// Point this at a different RD-Gen output directory to change the DAG set
-/// the kernel spawns.
-const DAGS_DIR: &str = "/home/nokosan/azumi-lab/RD-Gen/test/awkernel";
+/// Overridable via the `RD_GEN_DAGS_DIR` environment variable at build time
+/// (e.g. `RD_GEN_DAGS_DIR=/path/to/generated/DAGs cargo build ...`) so an
+/// automation pipeline can point the kernel at a freshly-generated RD-Gen
+/// output directory without editing this file; falls back to this fixed
+/// path — the small, hand-curated set this crate has always shipped with —
+/// when unset, so a plain `make x86_64` keeps working unchanged.
+const DEFAULT_DAGS_DIR: &str = "/home/nokosan/azumi-lab/RD-Gen/test/awkernel";
 
 /// True for `dag_<N>.yaml`/`.yml` files. RD-Gen writes sibling files in the
 /// same directory that are not DAG definitions (e.g. `combination_log.yaml`,
@@ -58,15 +62,17 @@ fn collect_dag_yaml_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 fn main() {
-    println!("cargo:rerun-if-changed={DAGS_DIR}");
+    println!("cargo:rerun-if-env-changed=RD_GEN_DAGS_DIR");
+    let dags_dir = env::var("RD_GEN_DAGS_DIR").unwrap_or_else(|_| DEFAULT_DAGS_DIR.to_string());
+    println!("cargo:rerun-if-changed={dags_dir}");
 
     let mut files = Vec::new();
-    collect_dag_yaml_files(Path::new(DAGS_DIR), &mut files);
+    collect_dag_yaml_files(Path::new(&dags_dir), &mut files);
     files.sort_by_key(|path| dag_index(path));
 
     assert!(
         !files.is_empty(),
-        "no dag_<N>.yaml files found under DAGS_DIR ({DAGS_DIR})"
+        "no dag_<N>.yaml files found under DAGS_DIR ({dags_dir})"
     );
 
     let mut generated = String::from(

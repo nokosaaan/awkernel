@@ -148,3 +148,6 @@ aarch64_virt = [
 spinlock = ["awkernel_lib/spinlock"]
 linux = []
 test_clustered_edf = ["userland/test_clustered_edf"]
+test_active_vp = ["userland/test_active_vp"]
+rd_gen_vfed = ["userland/rd_gen_vfed"]
+rd_gen_laxity = ["userland/rd_gen_laxity"]

@@ -88,6 +88,25 @@ pub(crate) fn is_cpu_reserved(cpu_id: usize) -> bool {
     NUM_CLUSTERED_TASKS_ALIVE[cpu_id].load(Ordering::Relaxed) > 0
 }
 
+/// Reserve `cpu` for clustered scheduling ahead of any task actually being
+/// spawned on it, e.g. when [`crate::dag_sched::resource`] claims a cluster's
+/// cores for a DAG at admission time, before any of that DAG's node tasks
+/// exist. Composes with the per-task reservation taken in [`Tasks::spawn`]
+/// and released in [`Tasks::remove`]: `cpu` stays reserved until every
+/// reservation on it — this one and each spawned task's — has been released,
+/// so `is_cpu_reserved` reflects the admission decision immediately instead
+/// of only once the DAG's first task is spawned.
+#[inline(always)]
+pub(crate) fn reserve_cpu(cpu_id: usize) {
+    NUM_CLUSTERED_TASKS_ALIVE[cpu_id].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Undo one [`reserve_cpu`] call.
+#[inline(always)]
+pub(crate) fn release_cpu(cpu_id: usize) {
+    NUM_CLUSTERED_TASKS_ALIVE[cpu_id].fetch_sub(1, Ordering::Relaxed);
+}
+
 #[cfg(target_pointer_width = "32")]
 pub(crate) static NUM_DAG_POOL_TASK_IN_QUEUE: AtomicU32 = AtomicU32::new(0);
 #[cfg(target_pointer_width = "32")]
@@ -309,11 +328,20 @@ struct Tasks {
     id_to_task: BTreeMap<u32, Arc<Task>>,
 }
 
+/// Sentinel [`DagInfo::period_index`] value meaning "this node has not yet
+/// released (as a source) or consumed (as an intermediate/sink) any job's
+/// data." Distinct from every real period index (which starts at `0` and
+/// only increases), so a freshly spawned node's first wake is never
+/// indistinguishable from "period 0 was already processed" — see
+/// `dag::next_job_index`, which is the only place this is interpreted.
+pub(crate) const NO_PERIOD_YET: u32 = u32::MAX;
+
 #[derive(Clone)]
 pub struct DagInfo {
     pub dag_id: u32,
     pub node_id: u32,
-    /// Which period (job) this node's *current* work belongs to.
+    /// Which period (job) this node's *current* work belongs to, or
+    /// [`NO_PERIOD_YET`] before the first one.
     ///
     /// Updated by the DAG reactor body (`dag::spawn_reactor`/
     /// `spawn_periodic_reactor`/`spawn_sink_reactor`) each time it learns the
@@ -335,7 +363,7 @@ impl DagInfo {
         Self {
             dag_id,
             node_id,
-            period_index: Arc::new(AtomicU32::new(0)),
+            period_index: Arc::new(AtomicU32::new(NO_PERIOD_YET)),
         }
     }
 }
@@ -383,6 +411,81 @@ impl Tasks {
                     };
                     scheduler_type = SchedulerType::ClusteredEDF(deadline, normalized);
                     Some(normalized)
+                } else if let SchedulerType::ActiveVp(set, leading_cpu) = scheduler_type {
+                    // Same normalization as ClusteredEDF above; ActiveVp
+                    // additionally carries a distinguished leading core, so
+                    // re-derive it if normalization changed the set (only
+                    // possible if the caller passed an invalid set to begin
+                    // with — `dag_sched::policy::vfed`'s admission never
+                    // does, since it only ever hands out cores it just
+                    // claimed from `resource::allocate_cluster`).
+                    let masked = masked_workers(set, num_cpu());
+                    let normalized = if masked.is_empty() {
+                        log::warn!(
+                            "ActiveVp: CPU set must contain at least one core between 1 and {}. Falling back to all worker cores. Given set: {:?}",
+                            num_cpu() - 1,
+                            set
+                        );
+                        all_workers(num_cpu())
+                    } else {
+                        masked
+                    };
+                    let normalized_leading = if normalized.contains(leading_cpu) {
+                        leading_cpu
+                    } else {
+                        log::warn!(
+                            "ActiveVp: leading cpu {leading_cpu} not in normalized set {normalized:?}; picking an arbitrary member instead."
+                        );
+                        normalized.iter().next().unwrap_or(leading_cpu)
+                    };
+                    scheduler_type = SchedulerType::ActiveVp(normalized, normalized_leading);
+                    Some(normalized)
+                } else if let SchedulerType::PassiveVp(set) = scheduler_type {
+                    // Same normalization as ClusteredEDF/ActiveVp above; no
+                    // leading core to re-derive.
+                    let masked = masked_workers(set, num_cpu());
+                    let normalized = if masked.is_empty() {
+                        log::warn!(
+                            "PassiveVp: CPU set must contain at least one core between 1 and {}. Falling back to all worker cores. Given set: {:?}",
+                            num_cpu() - 1,
+                            set
+                        );
+                        all_workers(num_cpu())
+                    } else {
+                        masked
+                    };
+                    scheduler_type = SchedulerType::PassiveVp(normalized);
+                    Some(normalized)
+                } else if let SchedulerType::MixedVp(active_set, leading_cpu, passive_set) =
+                    scheduler_type
+                {
+                    // Same per-set normalization as ActiveVp/PassiveVp
+                    // above, applied to each half of the union separately
+                    // (they must stay disjoint — a DAG never borrows its
+                    // own cores — so they cannot share one fallback).
+                    let masked_active = masked_workers(active_set, num_cpu());
+                    let normalized_active = if masked_active.is_empty() {
+                        log::warn!(
+                            "MixedVp: active CPU set must contain at least one core between 1 and {}. Falling back to all worker cores. Given set: {:?}",
+                            num_cpu() - 1,
+                            active_set
+                        );
+                        all_workers(num_cpu())
+                    } else {
+                        masked_active
+                    };
+                    let normalized_leading = if normalized_active.contains(leading_cpu) {
+                        leading_cpu
+                    } else {
+                        log::warn!(
+                            "MixedVp: leading cpu {leading_cpu} not in normalized active set {normalized_active:?}; picking an arbitrary member instead."
+                        );
+                        normalized_active.iter().next().unwrap_or(leading_cpu)
+                    };
+                    let masked_passive = masked_workers(passive_set, num_cpu());
+                    scheduler_type =
+                        SchedulerType::MixedVp(normalized_active, normalized_leading, masked_passive);
+                    Some(normalized_active.union(masked_passive))
                 } else {
                     None
                 };
@@ -703,6 +806,17 @@ pub mod perf {
     // This value represents the type of pubsub (publish only, subscribe only, or both publish and subscribe)
     // and is a fixed value.
     const MAX_PUBSUB: usize = 3;
+
+    /// Hard cap on the number of distinct `(period_index, dag_id, node_id)`
+    /// entries each [`PubSubTable`] slot will retain. Unlike the ring-buffer
+    /// tables above, this one cannot bound itself by wrapping at `MAX_LOGS`
+    /// (see the field doc below), so without a cap a recording window left
+    /// running for long enough grows this table — and the heap allocations
+    /// its inserts perform — without bound. `MAX_LOGS * 8` is a generous
+    /// multiple of the other tables' ring depth, since this one must retain
+    /// many periods at once rather than only the latest.
+    const MAX_PUBSUB_ENTRIES_PER_ROLE: usize = MAX_LOGS * 8;
+
     #[derive(Clone)]
     struct PubSubTable {
         // Indexed by pub/sub role id (see `MAX_PUBSUB`), keyed by the DAG's
@@ -711,16 +825,22 @@ pub mod perf {
         // at `MAX_LOGS` since they only need the *latest* value per dag_id),
         // this table is read back as a per-period timeline: wrapping would
         // silently drop or misattribute periods once a DAG runs past
-        // `MAX_LOGS` releases, with no signal that it happened. Recording is
-        // gated on `trace::is_enabled()` and reset in `trace::start()`, so
-        // it stays scoped to one recording window and bounded in practice.
+        // `MAX_LOGS` releases, with no signal that it happened. Bounded
+        // instead by [`MAX_PUBSUB_ENTRIES_PER_ROLE`] (see
+        // `record_publish_timestamp`/`record_subscribe_timestamp`), and reset
+        // in `trace::start()` so it stays scoped to one recording window.
         timestamps: [BTreeMap<(u32, u32, u32), u64>; MAX_PUBSUB],
+        /// Set once any slot has hit [`MAX_PUBSUB_ENTRIES_PER_ROLE`] and the
+        /// resulting warning has been logged, so a long recording window
+        /// logs it once instead of on every subsequent dropped insert.
+        capacity_warned: bool,
     }
 
     impl Default for PubSubTable {
         fn default() -> Self {
             Self {
                 timestamps: core::array::from_fn(|_| BTreeMap::new()),
+                capacity_warned: false,
             }
         }
     }
@@ -817,6 +937,17 @@ pub mod perf {
         let recorder = recorder_opt.get_or_insert_with(|| Box::new(PubSubTable::default()));
         let pub_id = pub_id as usize;
 
+        if recorder.timestamps[pub_id].len() >= MAX_PUBSUB_ENTRIES_PER_ROLE {
+            if !recorder.capacity_warned {
+                log::warn!(
+                    "publish pubsub trace table reached its {MAX_PUBSUB_ENTRIES_PER_ROLE}-entry \
+                     cap; further publish timestamps in this recording window will not be recorded"
+                );
+                recorder.capacity_warned = true;
+            }
+            return;
+        }
+
         recorder.timestamps[pub_id]
             .entry((period_index as u32, dag_id, node_id))
             .or_insert(new_timestamp);
@@ -846,6 +977,17 @@ pub mod perf {
 
         let recorder = recorder_opt.get_or_insert_with(|| Box::new(PubSubTable::default()));
         let sub_id = sub_id as usize;
+
+        if recorder.timestamps[sub_id].len() >= MAX_PUBSUB_ENTRIES_PER_ROLE {
+            if !recorder.capacity_warned {
+                log::warn!(
+                    "subscribe pubsub trace table reached its {MAX_PUBSUB_ENTRIES_PER_ROLE}-entry \
+                     cap; further subscribe timestamps in this recording window will not be recorded"
+                );
+                recorder.capacity_warned = true;
+            }
+            return;
+        }
 
         recorder.timestamps[sub_id]
             .entry((period_index as u32, dag_id, node_id))
@@ -1447,7 +1589,7 @@ pub fn run_main() {
                     let mut node = MCSNode::new();
                     let info = task.info.lock(&mut node);
                     info.get_dag_info()
-                        .map(|d| d.period_index.load(Ordering::Relaxed))
+                        .map(|d| d.period_index.load(Ordering::Acquire))
                 };
 
                 // Invoke a task.
