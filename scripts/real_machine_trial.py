@@ -144,21 +144,31 @@ def discover_boot_entry_windows(host, user):
 
 
 def discover_boot_entry_linux(host, user, target_mac):
-    # `efibootmgr -v` lines look like "Boot0003  Intel I226-LM  (igc, MAC:
-    # a0:ad:9f:c8:c3:af)" -- matching on the NIC's own MAC (which we already
-    # know, unlike on Windows) is more reliable than guessing at hint words
-    # in a driver/NIC name that varies per machine.
+    # `efibootmgr -v` writes the same MAC in at least two different
+    # delimiter styles on the same line -- "EFI PXE 0 for IPv4
+    # (80-FA-5B-79-11-E1)" (hyphens) alongside "MAC(80fa5b7911e1,0)" (no
+    # delimiter at all) -- so comparing after stripping all ':'/'-' from
+    # both sides is what actually matches reliably, not a straight
+    # colon-normalized substring check.
     result = ssh_run(host, user, "sudo efibootmgr -v", timeout=15)
-    mac_needle = target_mac.lower().replace("-", ":")
+    mac_needle = re.sub(r"[:-]", "", target_mac.lower())
+    matches = []
     for line in result.stdout.splitlines():
-        if mac_needle in line.lower():
+        if mac_needle in re.sub(r"[:-]", "", line.lower()):
             m = re.match(r"Boot([0-9A-Fa-f]{4})", line.strip())
             if m:
-                return m.group(1), line.strip()
-    raise RuntimeError(
-        f"no `efibootmgr -v` entry found whose MAC matches {target_mac}\n"
-        "raw output:\n" + result.stdout
-    )
+                matches.append((m.group(1), line.strip()))
+    if not matches:
+        raise RuntimeError(
+            f"no `efibootmgr -v` entry found whose MAC matches {target_mac}\n"
+            "raw output:\n" + result.stdout
+        )
+    # A NIC with both IPv4 and IPv6 firmware boot entries (and sometimes a
+    # stale duplicate of one) shares the same MAC across all of them --
+    # prefer an explicit IPv4 entry so we don't end up on IPv6 or a
+    # coincidental first match.
+    ipv4_matches = [m for m in matches if "ipv4" in m[1].lower()]
+    return (ipv4_matches or matches)[0]
 
 
 def get_boot_entry(host, user, cache_path, force_rediscover, target_os, target_mac):
@@ -368,7 +378,7 @@ def parse_args():
                    help="group-of-8 mode: consume acceptance_ratio.rs's per-trial JSONL top to "
                         "bottom instead of picking single DAGs from --pool-dir (see module docstring)")
     p.add_argument("--host", default="192.168.10.10")
-    p.add_argument("--user", default="azumikenadmin")
+    p.add_argument("--user", default="azumiken-admin")
     p.add_argument("--target-os", choices=["windows", "linux"], default="linux",
                     help="which one-shot-PXE-boot mechanism to drive over ssh: bcdedit+shutdown "
                          "(windows) or efibootmgr+reboot (linux)")
