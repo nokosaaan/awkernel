@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
 """Automates one or more real-machine trial cycles:
 
-  wait for target (Windows) reachable over SSH
+  wait for target reachable over SSH
   -> pick DAG(s) to stage and stage them (see "Two selection modes" below)
   -> build awkernel with them embedded (RD_GEN_DAGS_DIR)
-  -> print the log/trace_<n>.log path this trial expects a serial capture at
-  -> bcdedit bootnext=PXE + shutdown /r /t 0 on the target
-  -> wait for the trace to finish (marker in that log file, or a timeout)
-  -> record the trial in log/dag_selection.json
+  -> start minicom logging to log/trace_<n>.log
+  -> set the target's next boot to PXE (bcdedit or efibootmgr, see
+     --target-os) and reboot it
+  -> wait for the trace to finish (marker in the log, or a timeout)
+  -> stop minicom, record the trial in log/dag_selection.json
 
-Serial capture is intentionally NOT this script's job: run your own
-`minicom`/`picocom`/etc. against the printed log path yourself (in another
-terminal, before or during the trial) -- this script only ever polls that
-file's contents for the completion marker.
-
-Run repeatedly with --trials N to fire off N trials, pausing this script
-between them for you to (re)start serial capture as needed.
+Run repeatedly with --trials N to fire off N trials unattended.
 
 Two selection modes (mutually exclusive):
   - Default (single-DAG): picks the next not-yet-used dag_<N>.yaml from
@@ -31,10 +26,13 @@ Two selection modes (mutually exclusive):
 
 import argparse
 import json
+import os
+import pty
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -295,9 +293,104 @@ def run_build(awkernel_dir, staging_dir, dry_run):
     subprocess.run(
         ["make", "x86_64", "RELEASE=1"],
         cwd=awkernel_dir,
-        env={**__import__("os").environ, "RD_GEN_DAGS_DIR": str(staging_dir)},
+        env={**os.environ, "RD_GEN_DAGS_DIR": str(staging_dir)},
         check=True,
     )
+
+
+class MinicomHandle:
+    def __init__(self, proc, master_fd, drain_thread):
+        self.proc = proc
+        self.master_fd = master_fd
+        self.drain_thread = drain_thread
+
+
+def _drain_pty(master_fd, sink_path):
+    """Continuously reads the pty master side and discards it (to a file,
+    for post-mortem debugging) for as long as minicom is alive. minicom is a
+    full-screen terminal app: it redraws its own status line/screen
+    periodically even while otherwise idle, and an unread pty has a small
+    kernel buffer (same order as a pipe's) -- without something draining it
+    for the whole trial, minicom would eventually block trying to write to
+    it, same failure mode a pipe would have here."""
+    with sink_path.open("wb") as f:
+        while True:
+            try:
+                data = os.read(master_fd, 4096)
+            except OSError:
+                return
+            if not data:
+                return
+            f.write(data)
+            f.flush()
+
+
+def start_minicom(serial_device, baud, log_path, use_sudo, dry_run):
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    if log_path.exists():
+        log_path.unlink()
+    cmd = (["sudo"] if use_sudo else []) + [
+        "minicom", "-D", serial_device, "-b", str(baud), "-C", str(log_path),
+    ]
+    print(f"[minicom] {' '.join(cmd)}")
+    if dry_run:
+        return None
+    # minicom is a full-screen terminal app (ncurses), not a plain filter:
+    # given plain pipes/DEVNULL for its stdio it can't find a controlling
+    # terminal / valid TERM, and exits almost immediately (successfully,
+    # exit code 0, after printing its own startup banner) *without ever
+    # reaching the loop that captures serial data to -C* -- this looks
+    # nothing like the permission-error case (which fails loudly with a
+    # nonzero exit and an "許可がありません" message) but is just as
+    # silent-and-empty a failure for -C's log file. A real pty plus TERM
+    # set is what makes it actually run as a background capture process.
+    master_fd, slave_fd = pty.openpty()
+    env = {**os.environ, "TERM": "xterm"}
+    proc = subprocess.Popen(
+        cmd, stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+        env=env, start_new_session=True,
+    )
+    os.close(slave_fd)  # only the child needs its own dup of this now
+
+    stderr_path = log_path.with_suffix(log_path.suffix + ".minicom_stderr")
+    drain_thread = threading.Thread(target=_drain_pty, args=(master_fd, stderr_path), daemon=True)
+    drain_thread.start()
+
+    # minicom exits near-instantly on a permission/device/tty error rather
+    # than hanging -- catching that here means a whole trial doesn't
+    # silently burn its build+reboot+max-wait-secs budget capturing
+    # nothing. A real minicom session keeps running past this, so a short
+    # grace period is enough to tell the two apart without slowing every
+    # trial down noticeably.
+    time.sleep(0.5)
+    if proc.poll() is not None:
+        drain_thread.join(timeout=2)
+        output = stderr_path.read_text(errors="replace").strip() if stderr_path.exists() else ""
+        os.close(master_fd)
+        raise RuntimeError(
+            f"minicom exited immediately (code {proc.returncode}): {output!r} -- "
+            "if this is a permission error, either `sudo usermod -aG dialout $USER` "
+            "and start a new login session, or pass --sudo-minicom; otherwise see "
+            "start_minicom's own doc comment (pty/TERM requirement)"
+        )
+    return MinicomHandle(proc, master_fd, drain_thread)
+
+
+def stop_minicom(handle):
+    if handle is None:
+        return
+    proc = handle.proc
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+    try:
+        os.close(handle.master_fd)
+    except OSError:
+        pass
+    handle.drain_thread.join(timeout=2)
 
 
 def wait_for_marker_or_timeout(log_path, marker, max_wait_secs, poll_interval=2):
@@ -350,12 +443,9 @@ def run_trial(args, state, boot_cache_path, trials_jsonl):
 
     run_build(args.awkernel_dir, args.staging_dir, args.dry_run)
 
-    # Serial capture is out of this script's scope -- run your own
-    # `minicom -D <device> -b <baud> -C <log_path>` (or any other tool)
-    # against this exact path before/while this trial's reboot happens;
-    # this script only polls the file's contents for the marker below.
     log_path = args.log_dir / f"{args.log_prefix}{trial_id}.log"
-    print(f"[serial] point your own capture at: {log_path}")
+    minicom_handle = start_minicom(args.serial_device, args.baud, log_path, args.sudo_minicom, args.dry_run)
+    time.sleep(2)  # let minicom attach to the port before we trigger the reboot
 
     if args.dry_run:
         boot_entry = "DRY-RUN"
@@ -366,6 +456,7 @@ def run_trial(args, state, boot_cache_path, trials_jsonl):
         )
         trigger_reboot_to_pxe(args.host, args.user, args.target_os, boot_entry)
         marker_found = wait_for_marker_or_timeout(log_path, args.marker, args.max_wait_secs)
+        stop_minicom(minicom_handle)
 
     record = {
         "trial": trial_id,
@@ -411,13 +502,16 @@ def parse_args():
                          "own AUTO_REBOOT_SECS has time to actually fire before the next "
                          "bootsequence is set -- too short a gap can race this trial's "
                          "reboot against the previous one's")
+    p.add_argument("--serial-device", default="/dev/ttyUSB0")
+    p.add_argument("--baud", type=int, default=115200)
+    p.add_argument("--sudo-minicom", action="store_true", help="run minicom under sudo (default: off; relies on dialout group membership)")
     p.add_argument("--log-dir", type=Path, default=None, help="default: <awkernel-dir>/log")
     p.add_argument("--log-prefix", default="trace_")
     p.add_argument("--marker", default="TRACE_END", help="string that marks trace completion in the growing log")
     p.add_argument("--max-wait-secs", type=int, default=90, help="hard cap per trial while waiting for the marker")
     p.add_argument("--ssh-wait-secs", type=int, default=180, help="how long to wait for the target to come back up before a trial")
     p.add_argument("--rediscover-boot-entry", action="store_true", help="force re-querying bcdedit instead of using the cached GUID")
-    p.add_argument("--dry-run", action="store_true", help="print planned actions without touching the network/build")
+    p.add_argument("--dry-run", action="store_true", help="print planned actions without touching the network/build/serial port")
     args = p.parse_args()
     if args.log_dir is None:
         args.log_dir = args.awkernel_dir / "log"
