@@ -122,7 +122,7 @@ def wait_for_ssh(host, user, timeout_secs, poll_interval=5):
     raise RuntimeError(f"{user}@{host} did not become SSH-reachable within {timeout_secs}s")
 
 
-def discover_boot_guid(host, user):
+def discover_boot_entry_windows(host, user):
     result = ssh_run(host, user, "bcdedit /enum firmware", timeout=15)
     # Entries are separated by a blank line; the GUID and the hint words we
     # look for can be anywhere within an entry's block regardless of which
@@ -143,22 +143,50 @@ def discover_boot_guid(host, user):
     )
 
 
-def get_boot_guid(host, user, cache_path, force_rediscover):
+def discover_boot_entry_linux(host, user, target_mac):
+    # `efibootmgr -v` lines look like "Boot0003  Intel I226-LM  (igc, MAC:
+    # a0:ad:9f:c8:c3:af)" -- matching on the NIC's own MAC (which we already
+    # know, unlike on Windows) is more reliable than guessing at hint words
+    # in a driver/NIC name that varies per machine.
+    result = ssh_run(host, user, "sudo efibootmgr -v", timeout=15)
+    mac_needle = target_mac.lower().replace("-", ":")
+    for line in result.stdout.splitlines():
+        if mac_needle in line.lower():
+            m = re.match(r"Boot([0-9A-Fa-f]{4})", line.strip())
+            if m:
+                return m.group(1), line.strip()
+    raise RuntimeError(
+        f"no `efibootmgr -v` entry found whose MAC matches {target_mac}\n"
+        "raw output:\n" + result.stdout
+    )
+
+
+def get_boot_entry(host, user, cache_path, force_rediscover, target_os, target_mac):
     cache = load_json(cache_path, {})
-    if not force_rediscover and "guid" in cache:
-        return cache["guid"]
-    guid, description = discover_boot_guid(host, user)
-    save_json(cache_path, {"guid": guid, "description": description, "discovered_at": now_iso()})
-    print(f"[boot-entry] discovered {guid} ({description}), cached at {cache_path}")
-    return guid
+    if not force_rediscover and cache.get("target_os") == target_os and "value" in cache:
+        return cache["value"]
+    if target_os == "windows":
+        value, description = discover_boot_entry_windows(host, user)
+    else:
+        value, description = discover_boot_entry_linux(host, user, target_mac)
+    save_json(cache_path, {
+        "target_os": target_os, "value": value, "description": description, "discovered_at": now_iso(),
+    })
+    print(f"[boot-entry] discovered {value} ({description}), cached at {cache_path}")
+    return value
 
 
-def trigger_reboot_to_pxe(host, user, guid):
-    ssh_run(host, user, f"bcdedit /set {{fwbootmgr}} bootsequence {{{guid}}}", timeout=15)
+def trigger_reboot_to_pxe(host, user, target_os, value):
+    if target_os == "windows":
+        ssh_run(host, user, f"bcdedit /set {{fwbootmgr}} bootsequence {{{value}}}", timeout=15)
+        reboot_cmd = "shutdown /r /t 0"
+    else:
+        ssh_run(host, user, f"sudo efibootmgr --bootnext {value}", timeout=15)
+        reboot_cmd = "sudo reboot"
     # The target reboots as soon as this runs, so the ssh session itself may
     # be torn down mid-flight -- that is expected, not a failure.
     try:
-        ssh_run(host, user, "shutdown /r /t 0", timeout=10)
+        ssh_run(host, user, reboot_cmd, timeout=10)
     except subprocess.SubprocessError:
         pass
 
@@ -301,18 +329,20 @@ def run_trial(args, state, boot_cache_path, trials_jsonl):
     print(f"[serial] point your own capture at: {log_path}")
 
     if args.dry_run:
-        guid = "DRY-RUN"
+        boot_entry = "DRY-RUN"
         marker_found = False
     else:
-        guid = get_boot_guid(args.host, args.user, boot_cache_path, args.rediscover_boot_entry)
-        trigger_reboot_to_pxe(args.host, args.user, guid)
+        boot_entry = get_boot_entry(
+            args.host, args.user, boot_cache_path, args.rediscover_boot_entry, args.target_os, args.target_mac,
+        )
+        trigger_reboot_to_pxe(args.host, args.user, args.target_os, boot_entry)
         marker_found = wait_for_marker_or_timeout(log_path, args.marker, args.max_wait_secs)
 
     record = {
         "trial": trial_id,
         **selection_info,
         "log_file": str(log_path),
-        "boot_entry_guid": guid,
+        "boot_entry": boot_entry,
         "marker_found": marker_found,
         "timestamp": now_iso(),
     }
@@ -338,11 +368,15 @@ def parse_args():
                    help="group-of-8 mode: consume acceptance_ratio.rs's per-trial JSONL top to "
                         "bottom instead of picking single DAGs from --pool-dir (see module docstring)")
     p.add_argument("--host", default="192.168.10.10")
-    p.add_argument("--user", default="awkernel")
+    p.add_argument("--user", default="azumikenadmin")
+    p.add_argument("--target-os", choices=["windows", "linux"], default="linux",
+                    help="which one-shot-PXE-boot mechanism to drive over ssh: bcdedit+shutdown "
+                         "(windows) or efibootmgr+reboot (linux)")
     p.add_argument("--target-mac", default="80:fa:5b:79:11:e1",
-                    help="target's PXE NIC MAC; a `wakeonlan` safety net sent before each "
-                         "trial in case the target is ever left fully powered off (a no-op "
-                         "when it's already up, which is the normal case with AUTO_REBOOT)")
+                    help="target's PXE NIC MAC: identifies the right `efibootmgr -v` entry on "
+                         "--target-os linux, and is also a `wakeonlan` safety net sent before "
+                         "each trial in case the target is ever left fully powered off (a "
+                         "no-op when it's already up, the normal case with AUTO_REBOOT)")
     p.add_argument("--trial-interval-secs", type=int, default=30,
                     help="pause between trials, on top of --ssh-wait-secs, so the target's "
                          "own AUTO_REBOOT_SECS has time to actually fire before the next "
