@@ -77,9 +77,9 @@ fn main<Info: Debug>(kernel_info: KernelInfo<Info>) {
         #[cfg(feature = "perf")]
         spawn_auto_trace();
 
-        // Auto-shutdown for real hardware (see config::AUTO_SHUTDOWN_* doc).
+        // Auto-reboot for real hardware (see config::AUTO_REBOOT_* doc).
         #[cfg(all(target_arch = "x86_64", target_os = "none"))]
-        spawn_auto_shutdown();
+        spawn_auto_reboot();
 
         PRIMARY_READY.store(true, Ordering::SeqCst);
 
@@ -209,23 +209,23 @@ fn spawn_auto_trace() {
     );
 }
 
-/// Powers the machine off (ACPI S5) a fixed time after boot, with no shell
-/// input needed (see `config::AUTO_SHUTDOWN_*`'s own doc for why).
+/// Reboots the machine a fixed time after boot, with no shell input needed
+/// (see `config::AUTO_REBOOT_*`'s own doc for why).
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
-fn spawn_auto_shutdown() {
+fn spawn_auto_reboot() {
     use core::time::Duration;
 
-    if !config::AUTO_SHUTDOWN_ENABLED {
+    if !config::AUTO_REBOOT_ENABLED {
         return;
     }
 
     task::spawn(
-        "[Awkernel] auto shutdown".into(),
+        "[Awkernel] auto reboot".into(),
         async {
-            awkernel_async_lib::sleep(Duration::from_secs(config::AUTO_SHUTDOWN_SECS)).await;
+            awkernel_async_lib::sleep(Duration::from_secs(config::AUTO_REBOOT_SECS)).await;
 
-            log::info!("auto shutdown: powering off now.");
-            awkernel_lib::arch::x86_64::power::shutdown();
+            log::info!("auto reboot: rebooting now.");
+            awkernel_lib::arch::x86_64::power::reboot();
         },
         SchedulerType::PrioritizedFIFO(31),
     );

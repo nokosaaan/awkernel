@@ -301,10 +301,13 @@ def run_trial(args, state, boot_cache_path, trials_jsonl):
     print(f"=== trial {trial_id} ===")
 
     if not args.dry_run:
-        # The previous trial's own auto-shutdown (see kernel/src/config.rs's
-        # AUTO_SHUTDOWN_*) leaves the target fully powered off rather than
-        # back in an OS, so it needs waking up before it can be reachable
-        # over ssh again. Harmless to send even if the target is already up.
+        # The previous trial's own auto-reboot (see kernel/src/config.rs's
+        # AUTO_REBOOT_*) already brings the target back up on its own (its
+        # one-shot PXE bootsequence is consumed, so it falls through to the
+        # normal boot order) -- this WoL is only a safety net for the case
+        # where the target was left fully powered off some other way, and a
+        # no-op (silently ignored) if it's already up, so keeping it here
+        # costs nothing even though AUTO_REBOOT no longer requires it.
         wake_on_lan(args.target_mac, args.dry_run)
         wait_for_ssh(args.host, args.user, args.ssh_wait_secs)
 
@@ -375,14 +378,14 @@ def parse_args():
     p.add_argument("--host", default="192.168.10.10")
     p.add_argument("--user", default="awkernel")
     p.add_argument("--target-mac", default="40:c2:ba:a8:5f:f9",
-                    help="target's PXE NIC MAC, woken via `wakeonlan` before each trial "
-                         "(needed once the target's own auto-shutdown, not just PXE's "
-                         "one-shot bootsequence, is what ends the previous trial)")
+                    help="target's PXE NIC MAC; a `wakeonlan` safety net sent before each "
+                         "trial in case the target is ever left fully powered off (a no-op "
+                         "when it's already up, which is the normal case with AUTO_REBOOT)")
     p.add_argument("--trial-interval-secs", type=int, default=30,
                     help="pause between trials, on top of --ssh-wait-secs, so the target's "
-                         "own AUTO_SHUTDOWN_SECS has time to actually fire before the next "
-                         "wake/reboot -- too short a gap can catch it mid-shutdown or race "
-                         "the reboot that immediately follows against the fresh bootsequence")
+                         "own AUTO_REBOOT_SECS has time to actually fire before the next "
+                         "bootsequence is set -- too short a gap can race this trial's "
+                         "reboot against the previous one's")
     p.add_argument("--serial-device", default="/dev/ttyUSB0")
     p.add_argument("--baud", type=int, default=115200)
     p.add_argument("--sudo-minicom", action="store_true", help="run minicom under sudo (default: off; relies on dialout group membership)")
