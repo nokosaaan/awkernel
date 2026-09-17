@@ -51,8 +51,23 @@
 //! resampled trials run safely in one process with no reset/rollback
 //! machinery needed.
 //!
-//! Usage: `acceptance_ratio <pool_dir> <u_norm_min> <u_norm_max> <u_norm_step>`,
-//! prints `u_norm,federated_ratio,vfed_ratio,dag_fluid_ratio` CSV to stdout.
+//! Usage: `acceptance_ratio <pool_dir> <u_norm_min> <u_norm_max> <u_norm_step>
+//! [trials_jsonl_path]`, prints `u_norm,federated_ratio,vfed_ratio,
+//! dag_fluid_ratio` CSV to stdout.
+//!
+//! # Recording individual trials (`trials_jsonl_path`)
+//! The ratios above are an aggregate over resampled task sets that are
+//! otherwise generated and discarded. When a real-machine trial needs to
+//! reproduce *one specific* resampled task set (to compare this file's own
+//! admission prediction against actual real-machine boot/spawn behavior on
+//! the identical 8 DAGs -- see `scripts/real_machine_trial.py` and the
+//! Notion "実機ホスト環境移行の引き継ぎ" page's design), that draw must be
+//! recoverable after the fact. Passing `trials_jsonl_path` appends one JSON
+//! object per trial (JSON Lines, so a run can be interrupted/resumed by
+//! just appending), e.g.:
+//! `{"u_norm":0.5000,"trial":37,"dags":["dag_1819.yaml","dag_2643.yaml",...],"federated_accepted":true,"vfed_accepted":true,"dag_fluid_accepted":false}`
+//! A specific reproducible group is then just a `jq` filter away, e.g.
+//! `jq 'select(.federated_accepted and .vfed_accepted)' trials.jsonl | head -1`.
 //!
 //! # DAG-Fluid's third column
 //! DAG-Fluid (Guan, Qiao, Han, IEEE TC 2020/2021) is included here as a
@@ -66,7 +81,12 @@
 //! pool-load time and carried alongside each `DagMetrics` through every
 //! later resample.
 
-use std::{env, fs, path::Path, process::ExitCode};
+use std::{
+    env, fs,
+    io::Write,
+    path::Path,
+    process::ExitCode,
+};
 
 use awkernel_async_lib::dag_sched::{
     metrics::DagMetrics,
@@ -91,9 +111,20 @@ const ALPHA: f64 = 0.3;
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
-    let [_, pool_dir, u_norm_min, u_norm_max, u_norm_step] = args.as_slice() else {
-        eprintln!("usage: acceptance_ratio <pool_dir> <u_norm_min> <u_norm_max> <u_norm_step>");
-        return ExitCode::from(2);
+    let (pool_dir, u_norm_min, u_norm_max, u_norm_step, trials_jsonl_path) = match args.as_slice()
+    {
+        [_, pool_dir, u_norm_min, u_norm_max, u_norm_step] => {
+            (pool_dir, u_norm_min, u_norm_max, u_norm_step, None)
+        }
+        [_, pool_dir, u_norm_min, u_norm_max, u_norm_step, trials_jsonl_path] => {
+            (pool_dir, u_norm_min, u_norm_max, u_norm_step, Some(trials_jsonl_path))
+        }
+        _ => {
+            eprintln!(
+                "usage: acceptance_ratio <pool_dir> <u_norm_min> <u_norm_max> <u_norm_step> [trials_jsonl_path]"
+            );
+            return ExitCode::from(2);
+        }
     };
     let (u_norm_min, u_norm_max, u_norm_step) =
         match (parse_positive_f64(u_norm_min), parse_positive_f64(u_norm_max), parse_positive_f64(u_norm_step)) {
@@ -121,6 +152,14 @@ fn main() -> ExitCode {
 
     let mut rng = rand::rng();
 
+    let mut trials_jsonl = trials_jsonl_path.map(|path| {
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap_or_else(|e| panic!("cannot open '{path}' for appending: {e}"))
+    });
+
     println!("u_norm,federated_ratio,vfed_ratio,dag_fluid_ratio");
 
     let mut u_norm = u_norm_min;
@@ -129,11 +168,11 @@ fn main() -> ExitCode {
         let mut vfed_accepted = 0usize;
         let mut dag_fluid_accepted = 0usize;
 
-        for _ in 0..TRIALS_PER_LEVEL {
-            let set: Vec<&(DagMetrics, Vec<Segment>)> = (0..DAGS_PER_SET)
+        for trial in 0..TRIALS_PER_LEVEL {
+            let set: Vec<&(String, DagMetrics, Vec<Segment>)> = (0..DAGS_PER_SET)
                 .map(|_| pool.choose(&mut rng).expect("pool checked non-empty above"))
                 .collect();
-            let metrics: Vec<DagMetrics> = set.iter().map(|(m, _)| *m).collect();
+            let metrics: Vec<DagMetrics> = set.iter().map(|(_, m, _)| *m).collect();
 
             let u_sigma: f64 = metrics.iter().map(|d| d.volume as f64 / d.period as f64).sum();
             // u_sigma > 0 always (every WCET is >= 1), so this is never 0/0;
@@ -142,15 +181,17 @@ fn main() -> ExitCode {
             // since M=0 cores can admit nothing.
             let m = ((u_sigma / u_norm).ceil() as u16).max(1);
 
-            if federated_batch_feasible(&metrics, m) {
+            let fed_ok = federated_batch_feasible(&metrics, m);
+            if fed_ok {
                 fed_accepted += 1;
             }
-            if vfed::is_batch_feasible(&metrics, m, PackingStrategy::BestFit) {
+            let vfed_ok = vfed::is_batch_feasible(&metrics, m, PackingStrategy::BestFit);
+            if vfed_ok {
                 vfed_accepted += 1;
             }
             let dag_fluid_entries: Vec<(u64, u64, u64, u64, &[Segment])> = set
                 .iter()
-                .map(|(metrics, segments)| {
+                .map(|(_, metrics, segments)| {
                     (
                         metrics.volume,
                         metrics.period,
@@ -160,8 +201,13 @@ fn main() -> ExitCode {
                     )
                 })
                 .collect();
-            if dag_fluid::is_batch_feasible(&dag_fluid_entries, m) {
+            let dag_fluid_ok = dag_fluid::is_batch_feasible(&dag_fluid_entries, m);
+            if dag_fluid_ok {
                 dag_fluid_accepted += 1;
+            }
+
+            if let Some(f) = trials_jsonl.as_mut() {
+                write_trial_record(f, u_norm, trial, &set, fed_ok, vfed_ok, dag_fluid_ok);
             }
         }
 
@@ -188,7 +234,7 @@ fn parse_positive_f64(s: &str) -> Option<f64> {
 /// per [`override_deadline`], and pairing each resulting [`DagMetrics`] with
 /// its DAG-Fluid [`Segment`] decomposition (structure-derived, so computed
 /// once here and left untouched by the later per-`DagMetrics` overrides).
-fn load_pool(pool_dir: &Path) -> Result<Vec<(DagMetrics, Vec<Segment>)>, String> {
+fn load_pool(pool_dir: &Path) -> Result<Vec<(String, DagMetrics, Vec<Segment>)>, String> {
     let mut yaml_paths: Vec<_> = fs::read_dir(pool_dir)
         .map_err(|e| format!("cannot read directory '{}': {e}", pool_dir.display()))?
         .filter_map(|entry| entry.ok().map(|e| e.path()))
@@ -201,6 +247,10 @@ fn load_pool(pool_dir: &Path) -> Result<Vec<(DagMetrics, Vec<Segment>)>, String>
         .collect();
     yaml_paths.sort();
 
+    let names: Vec<String> = yaml_paths
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
     let yaml_contents: Vec<String> = yaml_paths
         .iter()
         .map(|p| fs::read_to_string(p).map_err(|e| format!("cannot read {}: {e}", p.display())))
@@ -211,15 +261,46 @@ fn load_pool(pool_dir: &Path) -> Result<Vec<(DagMetrics, Vec<Segment>)>, String>
         .map_err(|e| format!("failed to parse DAG pool in '{}': {e}", pool_dir.display()))?;
 
     let mut rng = rand::rng();
-    Ok(all
+    Ok(names
         .into_iter()
-        .map(|(config, segments)| {
+        .zip(all)
+        .map(|(name, (config, segments))| {
             let config = override_deadline(config, &mut rng);
             let config = override_period(config, &mut rng);
             let config = assign_max_parallelism(config, &mut rng);
-            (config, segments)
+            (name, config, segments)
         })
         .collect())
+}
+
+/// Appends one JSON-Lines record for a single resampled trial: which 8
+/// pool entries (by filename, in draw order -- duplicates possible, since
+/// resampling is with replacement) were drawn, and whether each admission
+/// policy accepted that exact set. See the module doc's "Recording
+/// individual trials" section for why this exists and how to filter it.
+fn write_trial_record(
+    out: &mut fs::File,
+    u_norm: f64,
+    trial: usize,
+    set: &[&(String, DagMetrics, Vec<Segment>)],
+    federated_accepted: bool,
+    vfed_accepted: bool,
+    dag_fluid_accepted: bool,
+) {
+    let dags = set
+        .iter()
+        .map(|(name, _, _)| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let line = format!(
+        "{{\"u_norm\":{u_norm:.4},\"trial\":{trial},\"dags\":[{dags}],\
+         \"federated_accepted\":{federated_accepted},\"vfed_accepted\":{vfed_accepted},\
+         \"dag_fluid_accepted\":{dag_fluid_accepted}}}\n"
+    );
+    // A single trial record failing to write isn't worth aborting a
+    // long-running sweep over -- the aggregate ratios (this file's main
+    // output) are unaffected either way.
+    let _ = out.write_all(line.as_bytes());
 }
 
 /// Replace `config.relative_deadline` with the paper's own
