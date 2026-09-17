@@ -77,9 +77,13 @@ pub enum TaskClass {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VFedError {
-    /// `relative_deadline <= critical_path`: no core count can meet this
-    /// deadline, since traversing the critical path alone already takes at
-    /// least `critical_path`.
+    /// `relative_deadline < critical_path` (traversing the critical path
+    /// alone already exceeds the deadline, so no core count can help), or
+    /// `relative_deadline == critical_path` with exploitable parallelism
+    /// (`volume > critical_path`, i.e. Heavy): see
+    /// [`super::federated::FederatedError::Infeasible`]'s doc for why the
+    /// implicit-deadline boundary `D == L` is only feasible when
+    /// `volume == critical_path` (Light).
     Infeasible {
         critical_path: u64,
         relative_deadline: u64,
@@ -298,7 +302,7 @@ pub fn classify(config: &DagMetrics) -> Result<TaskClass, VFedError> {
             period: config.period,
         });
     }
-    if config.relative_deadline <= config.critical_path {
+    if config.relative_deadline < config.critical_path {
         return Err(VFedError::Infeasible {
             critical_path: config.critical_path,
             relative_deadline: config.relative_deadline,
@@ -1105,8 +1109,34 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_infeasible_regardless_of_heaviness() {
-        let config = DagMetrics::from_static(10, 50, 1000, 50);
+    fn test_classify_infeasible_when_strictly_past_deadline() {
+        // relative_deadline(40) < critical_path(50): infeasible regardless
+        // of heaviness, since even the critical path alone can't finish.
+        let config = DagMetrics::from_static(10, 50, 1000, 40);
+        assert_eq!(
+            classify(&config),
+            Err(VFedError::Infeasible {
+                critical_path: 50,
+                relative_deadline: 40,
+            })
+        );
+    }
+
+    #[test]
+    fn test_classify_deadline_equals_critical_path_light_ok() {
+        // relative_deadline == critical_path == volume: a purely sequential
+        // DAG fits its own critical path in exactly D == L time on a single
+        // core -- feasible, not the unconditional Infeasible case.
+        let config = DagMetrics::from_static(50, 50, 1000, 50);
+        assert_eq!(classify(&config), Ok(TaskClass::Light));
+    }
+
+    #[test]
+    fn test_classify_deadline_equals_critical_path_heavy_infeasible() {
+        // relative_deadline == critical_path but volume > critical_path:
+        // there's parallel-only work left to fit in a now-zero slack
+        // window, which no core count can do.
+        let config = DagMetrics::from_static(100, 50, 1000, 50);
         assert_eq!(
             classify(&config),
             Err(VFedError::Infeasible {
