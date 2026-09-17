@@ -508,8 +508,17 @@ def parse_args():
     p.add_argument("--log-dir", type=Path, default=None, help="default: <awkernel-dir>/log")
     p.add_argument("--log-prefix", default="trace_")
     p.add_argument("--marker", default="TRACE_END", help="string that marks trace completion in the growing log")
-    p.add_argument("--max-wait-secs", type=int, default=90, help="hard cap per trial while waiting for the marker")
-    p.add_argument("--ssh-wait-secs", type=int, default=180, help="how long to wait for the target to come back up before a trial")
+    p.add_argument("--max-wait-secs", type=int, default=330,
+                    help="hard cap per trial while waiting for the marker -- keep above "
+                         "kernel/src/config.rs's AUTO_REBOOT_SECS (currently 300s) plus some "
+                         "PXE-boot overhead, since a cap shorter than that can move on to the "
+                         "next trial before a large trace's dump_to_console() finishes writing, "
+                         "truncating it")
+    p.add_argument("--ssh-wait-secs", type=int, default=360,
+                    help="how long to wait for the target to come back up before a trial -- "
+                         "if a trial's trace finished well before AUTO_REBOOT_SECS fires, this "
+                         "is what actually absorbs the wait until the target reboots back to "
+                         "its normal OS on its own, so keep it above AUTO_REBOOT_SECS too")
     p.add_argument("--rediscover-boot-entry", action="store_true", help="force re-querying bcdedit instead of using the cached GUID")
     p.add_argument("--dry-run", action="store_true", help="print planned actions without touching the network/build/serial port")
     args = p.parse_args()

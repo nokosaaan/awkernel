@@ -56,12 +56,27 @@ pub const AUTO_TRACE_DURATION_SECS: u64 = 30;
 #[allow(dead_code)]
 pub const AUTO_REBOOT_ENABLED: bool = true;
 
-/// Seconds after boot before auto-reboot fires. Keep comfortably longer
-/// than `AUTO_TRACE_START_DELAY_SECS + AUTO_TRACE_DURATION_SECS` (currently
-/// 32s) so the trace dump (and any other real-machine-trial work) always
-/// finishes and reaches the host's serial capture before reboot.
+/// Upper-bound safety net, in seconds after boot, for auto-reboot.
+///
+/// `main.rs`'s `spawn_auto_reboot` no longer just sleeps this long and
+/// reboots: it polls `AUTO_TRACE_DONE` (set once `trace::dump_to_console()`
+/// actually returns) and reboots as soon as that's true, so a quick trace
+/// doesn't sit idle for the rest of this window and a slow one doesn't get
+/// cut off mid-dump. This constant only matters as the fallback cap for
+/// when that signal never arrives -- auto-trace disabled, its feature
+/// (`perf`) not compiled in, or its task panicking -- so the machine still
+/// reboots eventually instead of idling forever.
+///
+/// Previously (before the poll-based wait existed) this *was* the sole
+/// trigger, sleeping unconditionally: a 60s value only left ~28s of margin
+/// after `AUTO_TRACE_START_DELAY_SECS + AUTO_TRACE_DURATION_SECS` (32s),
+/// and a real-machine trial with a large enough DAG batch (more
+/// tasks/events -> a bigger dump, sent out over a 115200-baud serial line
+/// with no size cap) got its trace cut off mid-write when the fixed timer
+/// fired before the dump finished. Kept generous here anyway since it's
+/// now just a safety net, not the thing every trial waits out.
 #[allow(dead_code)]
-pub const AUTO_REBOOT_SECS: u64 = 60;
+pub const AUTO_REBOOT_SECS: u64 = 300;
 
 #[cfg(test)]
 #[allow(dead_code)]

@@ -172,7 +172,19 @@ fn make_stdin_nonblocking() -> std::io::Result<()> {
 }
 
 /// Spawn a task that records a task execution trace automatically after boot
-/// and dumps it to the serial console (see `config::AUTO_TRACE_*`).
+/// Set by `spawn_auto_trace` right after `trace::dump_to_console()`
+/// returns, so `spawn_auto_reboot` can reboot as soon as the dump is
+/// actually done instead of guessing at a fixed wall-clock delay. Defined
+/// unconditionally (not under `#[cfg(feature = "perf")]`) because
+/// `spawn_auto_reboot` reads it regardless of whether that feature -- and
+/// thus `spawn_auto_trace` itself -- is compiled in at all; if it never
+/// gets set (auto-trace disabled, `perf` off, or the trace task panics),
+/// `spawn_auto_reboot`'s own `AUTO_REBOOT_SECS` cap is what keeps the
+/// machine from waiting forever.
+static AUTO_TRACE_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Records a task execution trace automatically after boot (see
+/// `config::AUTO_TRACE_*`), and dumps it to the serial console.
 ///
 /// This replaces the shell commands on real hardware, where the serial
 /// console is output-only (viewed with minicom on the host).
@@ -202,6 +214,7 @@ fn spawn_auto_trace() {
             trace::stop();
             log::info!("auto trace: recording finished; dumping.");
             trace::dump_to_console();
+            AUTO_TRACE_DONE.store(true, Ordering::SeqCst);
 
             Ok(())
         },
@@ -209,8 +222,11 @@ fn spawn_auto_trace() {
     );
 }
 
-/// Reboots the machine a fixed time after boot, with no shell input needed
-/// (see `config::AUTO_REBOOT_*`'s own doc for why).
+/// Reboots the machine once the auto-trace dump is confirmed done (see
+/// `AUTO_TRACE_DONE`), or after `AUTO_REBOOT_SECS` regardless as a safety
+/// net (auto-trace disabled/not compiled in, or its task never finishes)
+/// -- see `config::AUTO_REBOOT_*`'s own doc for why a reboot is needed at
+/// all here.
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 fn spawn_auto_reboot() {
     use core::time::Duration;
@@ -219,12 +235,26 @@ fn spawn_auto_reboot() {
         return;
     }
 
+    const POLL_INTERVAL_SECS: u64 = 2;
+
     task::spawn(
         "[Awkernel] auto reboot".into(),
         async {
-            awkernel_async_lib::sleep(Duration::from_secs(config::AUTO_REBOOT_SECS)).await;
+            let max_polls = config::AUTO_REBOOT_SECS / POLL_INTERVAL_SECS;
+            let mut polls = 0;
+            while !AUTO_TRACE_DONE.load(Ordering::SeqCst) && polls < max_polls {
+                awkernel_async_lib::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+                polls += 1;
+            }
 
-            log::info!("auto reboot: rebooting now.");
+            if AUTO_TRACE_DONE.load(Ordering::SeqCst) {
+                log::info!("auto reboot: trace dump confirmed done, rebooting now.");
+            } else {
+                log::warn!(
+                    "auto reboot: trace dump never signalled done within {}s, rebooting anyway.",
+                    config::AUTO_REBOOT_SECS
+                );
+            }
             awkernel_lib::arch::x86_64::power::reboot();
         },
         SchedulerType::PrioritizedFIFO(31),
