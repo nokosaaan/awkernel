@@ -335,41 +335,74 @@ async fn register_intermediate_node(
         (1, 2) => register_intermediate!(dag, node_data, sched_type, u64; u64, u64),
         (1, 3) => register_intermediate!(dag, node_data, sched_type, u64; u64, u64, u64),
         (1, 4) => register_intermediate!(dag, node_data, sched_type, u64; u64, u64, u64, u64),
-        (1, 5) => register_intermediate!(dag, node_data, sched_type, u64;
-            u64, u64, u64, u64, u64),
-        (1, 6) => register_intermediate!(dag, node_data, sched_type, u64;
-            u64, u64, u64, u64, u64, u64),
-        (1, 7) => register_intermediate!(dag, node_data, sched_type, u64;
-            u64, u64, u64, u64, u64, u64, u64),
-        (1, 8) => register_intermediate!(dag, node_data, sched_type, u64;
-            u64, u64, u64, u64, u64, u64, u64, u64),
+        (1, 5) => register_intermediate!(dag, node_data, sched_type, u64; u64, u64, u64, u64, u64),
+        (1, 6) => register_intermediate!(dag, node_data, sched_type, u64; u64, u64, u64, u64, u64, u64),
+        (1, 7) => register_intermediate!(dag, node_data, sched_type, u64; u64, u64, u64, u64, u64, u64, u64),
+        (1, 8) => register_intermediate!(dag, node_data, sched_type, u64; u64, u64, u64, u64, u64, u64, u64, u64),
         (2, 1) => register_intermediate!(dag, node_data, sched_type, u64, u64; u64),
         (2, 2) => register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64),
         (2, 3) => register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64),
+        (2, 4) => register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64, u64),
+        (2, 5) => register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64, u64, u64),
+        (2, 6) => register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64, u64, u64, u64),
+        (2, 7) => register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64, u64, u64, u64, u64),
+        (2, 8) => register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64),
         (3, 1) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64),
         (3, 2) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64),
         (3, 3) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64),
+        (3, 4) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64, u64),
+        (3, 5) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64, u64, u64),
+        (3, 6) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64, u64, u64, u64),
+        (3, 7) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64),
+        (3, 8) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64),
         (4, 1) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64),
-        (5, 1) => register_intermediate!(dag, node_data, sched_type,
-            u64, u64, u64, u64, u64; u64),
-        (6, 1) => register_intermediate!(dag, node_data, sched_type,
-            u64, u64, u64, u64, u64, u64; u64),
-        (7, 1) => register_intermediate!(dag, node_data, sched_type,
-            u64, u64, u64, u64, u64, u64, u64; u64),
-        (8, 1) => register_intermediate!(dag, node_data, sched_type,
-            u64, u64, u64, u64, u64, u64, u64, u64; u64),
+        (4, 2) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64),
+        (4, 3) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64),
+        (4, 4) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64, u64),
+        (4, 5) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64, u64, u64),
+        (4, 6) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64),
+        (4, 7) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64),
+        (4, 8) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64),
+        (5, 1) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64),
+        (5, 2) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64),
+        (5, 3) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64),
+        (5, 4) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64, u64),
+        (5, 5) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64),
+        (5, 6) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64),
+        (5, 7) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64),
+        (5, 8) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64),
+        (6, 1) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64),
+        (6, 2) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64),
+        (6, 3) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64),
+        (6, 4) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64),
+        (6, 5) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64),
+        (6, 6) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64),
+        (6, 7) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64),
+        (6, 8) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64),
+        (7, 1) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64),
+        (7, 2) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64),
+        (7, 3) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64),
+        (7, 4) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64),
+        (7, 5) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64),
+        (7, 6) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64),
+        (7, 7) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64),
+        (7, 8) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64),
+        (8, 1) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64),
+        (8, 2) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64),
+        (8, 3) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64),
+        (8, 4) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64),
+        (8, 5) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64),
+        (8, 6) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64),
+        (8, 7) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64),
+        (8, 8) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64),
         (i, o) if i > 8 && o > 8 => Err(LinkNumError::InOut(dag_id, node_id)),
         (i, _) if i > 8 => Err(LinkNumError::Input(dag_id, node_id)),
         (_, o) if o > 8 => Err(LinkNumError::Output(dag_id, node_id)),
-        // Every (in, out) pair with both sides in 1..=8 is *reachable* --
-        // this only covers the "one side is 1, the other spans 1..=8" and
-        // "both sides <= 3" shapes actually seen in practice (branching's
-        // own merge/split nodes are one-to-many or many-to-one; a plain
-        // G(n,p) edge keeps both sides <= 3). A node with e.g. (2, 5) is a
-        // real, if rarer, possibility this crate doesn't have a
-        // register_intermediate! call for -- failing that DAG gracefully
-        // beats an `unreachable!()` panic taking the whole kernel down
-        // over one oddly-shaped node in one DAG out of a pool of many.
+        // Every (in, out) pair with both sides in 1..=8 is handled above; this
+        // is a defensive fallback only (e.g. if a future generator config ever
+        // pushes degree past 8 in a way the guards above don't catch), so a
+        // truly unexpected shape fails this one DAG gracefully rather than
+        // panicking the whole kernel via `unreachable!()`.
         _ => Err(LinkNumError::InOut(dag_id, node_id)),
     }
 }
