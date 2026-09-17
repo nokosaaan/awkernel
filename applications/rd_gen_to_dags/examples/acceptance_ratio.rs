@@ -26,10 +26,18 @@
 //! leftover capacity for V-Fed's passive-VP mechanism to draw on, so that
 //! methodology can never show any difference between the two policies,
 //! correctness aside. Instead, for each `U_norm` level this resamples
-//! [`TRIALS_PER_LEVEL`] task sets of [`DAGS_PER_SET`] DAGs each (drawn with
-//! replacement — matching the paper's own N=8 DAGs/task-set), and checks
-//! whether the *whole set* is jointly admittable (all-or-nothing) under each
-//! policy at that set's own computed `M`.
+//! [`TRIALS_PER_LEVEL`] task sets of [`DAGS_PER_SET`] *distinct* DAGs each
+//! (without replacement *within* a trial, though of course the same pool
+//! entry can and does recur *across* different trials), and checks whether
+//! the *whole set* is jointly admittable (all-or-nothing) under each policy
+//! at that set's own computed `M`. The paper's own methodology draws with
+//! replacement (so one draw's 8 DAGs need not be distinct); this file
+//! deviates from strict reproduction here because a distinct-per-trial set
+//! is also the input to a real-machine trial (see `write_trial_record`'s
+//! own doc), which stages each drawn DAG as a same-named `dag_<N>.yaml`
+//! file -- a repeated draw would silently collapse to one file, embedding
+//! fewer than `DAGS_PER_SET` distinct DAGs while this file's own admission
+//! check still (correctly) counted it twice.
 //!
 //! # Deadline: overridden post-parse, not RD-Gen's own generated value
 //! The paper draws `D_i` uniform in `[L_i, L_i / ALPHA]` (`ALPHA = 0.3` for
@@ -169,9 +177,8 @@ fn main() -> ExitCode {
         let mut dag_fluid_accepted = 0usize;
 
         for trial in 0..TRIALS_PER_LEVEL {
-            let set: Vec<&(String, DagMetrics, Vec<Segment>)> = (0..DAGS_PER_SET)
-                .map(|_| pool.choose(&mut rng).expect("pool checked non-empty above"))
-                .collect();
+            let set: Vec<&(String, DagMetrics, Vec<Segment>)> =
+                pool.choose_multiple(&mut rng, DAGS_PER_SET).collect();
             let metrics: Vec<DagMetrics> = set.iter().map(|(_, m, _)| *m).collect();
 
             let u_sigma: f64 = metrics.iter().map(|d| d.volume as f64 / d.period as f64).sum();
@@ -274,10 +281,12 @@ fn load_pool(pool_dir: &Path) -> Result<Vec<(String, DagMetrics, Vec<Segment>)>,
 }
 
 /// Appends one JSON-Lines record for a single resampled trial: which 8
-/// pool entries (by filename, in draw order -- duplicates possible, since
-/// resampling is with replacement) were drawn, and whether each admission
-/// policy accepted that exact set. See the module doc's "Recording
-/// individual trials" section for why this exists and how to filter it.
+/// *distinct* pool entries (by filename, in draw order) were drawn, and
+/// whether each admission policy accepted that exact set. See the module
+/// doc's "Why resampling task sets" section for why a trial's own 8 draws
+/// are distinct (unlike the paper's own with-replacement methodology), and
+/// its "Recording individual trials" section for why this exists and how
+/// to filter it.
 fn write_trial_record(
     out: &mut fs::File,
     u_norm: f64,
