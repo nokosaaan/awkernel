@@ -164,7 +164,11 @@ endif
 QEMU_X86_ARGS+= -drive if=pflash,format=raw,file=${OVMF_PATH}/vars_qemu.fd
 QEMU_X86_ARGS+= -drive format=raw,file=x86_64_uefi.img
 QEMU_X86_ARGS+= -machine q35
-QEMU_X86_ARGS+= -serial stdio -smp 4 -monitor telnet::5556,server,nowait
+# QEMU maps successive -serial flags to COM1/COM2/COM3/COM4 in order; stdio
+# is 3rd here (COM3) to match kernel/src/arch/x86_64/config.rs's
+# SERIAL_PORT_BASE, which targets COM3 rather than the PC/AT-default COM1 --
+# see that constant's own doc for why.
+QEMU_X86_ARGS+= -serial null -serial null -serial stdio -smp 4 -monitor telnet::5556,server,nowait
 QEMU_X86_ARGS+= -m 4G -smp cpus=16
 QEMU_X86_ARGS+= -object memory-backend-ram,size=1G,id=m0
 QEMU_X86_ARGS+= -object memory-backend-ram,size=1G,id=m1
