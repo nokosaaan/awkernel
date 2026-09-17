@@ -94,6 +94,17 @@ def ssh_run(host, user, remote_cmd, timeout=15, check=True):
     return result
 
 
+def wake_on_lan(mac, dry_run):
+    print(f"[wol] wakeonlan {mac}")
+    if dry_run:
+        return
+    # A missed/ignored magic packet isn't fatal here -- wait_for_ssh right
+    # after this will just keep polling until ssh_wait_secs elapses, so a
+    # transient failure to send surfaces as that timeout's own error rather
+    # than needing its own handling.
+    subprocess.run(["wakeonlan", mac], check=False, capture_output=True)
+
+
 def wait_for_ssh(host, user, timeout_secs, poll_interval=5):
     deadline = time.monotonic() + timeout_secs
     while time.monotonic() < deadline:
@@ -236,7 +247,29 @@ def start_minicom(serial_device, baud, log_path, use_sudo, dry_run):
     print(f"[minicom] {' '.join(cmd)}")
     if dry_run:
         return None
-    return subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # A pipe here (instead of a discarded file) risks minicom blocking on a
+    # full pipe buffer over a whole trial if it ever writes more than we
+    # read (we only read the immediate-exit case below) -- a file has no
+    # such limit and needs no draining.
+    stderr_path = log_path.with_suffix(log_path.suffix + ".minicom_stderr")
+    with stderr_path.open("wb") as stderr_file:
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=stderr_file, stderr=subprocess.STDOUT)
+    # minicom exits near-instantly on a permission/device error (e.g. the
+    # invoking user isn't in the `dialout` group and --sudo-minicom wasn't
+    # passed) rather than hanging -- catching that here means a whole trial
+    # doesn't silently burn its build+reboot+max-wait-secs budget capturing
+    # nothing. A real minicom session keeps running past this, so a short
+    # grace period is enough to tell the two apart without slowing every
+    # trial down noticeably.
+    time.sleep(0.5)
+    if proc.poll() is not None:
+        output = stderr_path.read_text(errors="replace").strip()
+        raise RuntimeError(
+            f"minicom exited immediately (code {proc.returncode}): {output!r} -- "
+            "if this is a permission error, either `sudo usermod -aG dialout $USER` "
+            "and start a new login session, or pass --sudo-minicom"
+        )
+    return proc
 
 
 def stop_minicom(proc):
@@ -268,6 +301,11 @@ def run_trial(args, state, boot_cache_path, trials_jsonl):
     print(f"=== trial {trial_id} ===")
 
     if not args.dry_run:
+        # The previous trial's own auto-shutdown (see kernel/src/config.rs's
+        # AUTO_SHUTDOWN_*) leaves the target fully powered off rather than
+        # back in an OS, so it needs waking up before it can be reachable
+        # over ssh again. Harmless to send even if the target is already up.
+        wake_on_lan(args.target_mac, args.dry_run)
         wait_for_ssh(args.host, args.user, args.ssh_wait_secs)
 
     if trials_jsonl is not None:
@@ -336,6 +374,15 @@ def parse_args():
                         "bottom instead of picking single DAGs from --pool-dir (see module docstring)")
     p.add_argument("--host", default="192.168.10.10")
     p.add_argument("--user", default="awkernel")
+    p.add_argument("--target-mac", default="40:c2:ba:a8:5f:f9",
+                    help="target's PXE NIC MAC, woken via `wakeonlan` before each trial "
+                         "(needed once the target's own auto-shutdown, not just PXE's "
+                         "one-shot bootsequence, is what ends the previous trial)")
+    p.add_argument("--trial-interval-secs", type=int, default=30,
+                    help="pause between trials, on top of --ssh-wait-secs, so the target's "
+                         "own AUTO_SHUTDOWN_SECS has time to actually fire before the next "
+                         "wake/reboot -- too short a gap can catch it mid-shutdown or race "
+                         "the reboot that immediately follows against the fresh bootsequence")
     p.add_argument("--serial-device", default="/dev/ttyUSB0")
     p.add_argument("--baud", type=int, default=115200)
     p.add_argument("--sudo-minicom", action="store_true", help="run minicom under sudo (default: off; relies on dialout group membership)")
@@ -359,12 +406,15 @@ def main():
     state = load_json(state_path, [])
     trials_jsonl = load_trials_jsonl(args.trials_jsonl) if args.trials_jsonl is not None else None
 
-    for _ in range(args.trials):
+    for i in range(args.trials):
         try:
             run_trial(args, state, boot_cache_path, trials_jsonl)
         except Exception as e:  # noqa: BLE001 -- surface any failure and stop the loop rather than burn through trials blind
             print(f"[abort] {e}", file=sys.stderr)
             sys.exit(1)
+        if not args.dry_run and i < args.trials - 1 and args.trial_interval_secs > 0:
+            print(f"[wait] pausing {args.trial_interval_secs}s before the next trial")
+            time.sleep(args.trial_interval_secs)
 
 
 if __name__ == "__main__":

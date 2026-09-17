@@ -77,6 +77,10 @@ fn main<Info: Debug>(kernel_info: KernelInfo<Info>) {
         #[cfg(feature = "perf")]
         spawn_auto_trace();
 
+        // Auto-shutdown for real hardware (see config::AUTO_SHUTDOWN_* doc).
+        #[cfg(all(target_arch = "x86_64", target_os = "none"))]
+        spawn_auto_shutdown();
+
         PRIMARY_READY.store(true, Ordering::SeqCst);
 
         // Wait until all other CPUs have incremented NUM_CPU
@@ -200,6 +204,28 @@ fn spawn_auto_trace() {
             trace::dump_to_console();
 
             Ok(())
+        },
+        SchedulerType::PrioritizedFIFO(31),
+    );
+}
+
+/// Powers the machine off (ACPI S5) a fixed time after boot, with no shell
+/// input needed (see `config::AUTO_SHUTDOWN_*`'s own doc for why).
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+fn spawn_auto_shutdown() {
+    use core::time::Duration;
+
+    if !config::AUTO_SHUTDOWN_ENABLED {
+        return;
+    }
+
+    task::spawn(
+        "[Awkernel] auto shutdown".into(),
+        async {
+            awkernel_async_lib::sleep(Duration::from_secs(config::AUTO_SHUTDOWN_SECS)).await;
+
+            log::info!("auto shutdown: powering off now.");
+            awkernel_lib::arch::x86_64::power::shutdown();
         },
         SchedulerType::PrioritizedFIFO(31),
     );

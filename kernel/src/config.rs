@@ -29,6 +29,38 @@ pub const AUTO_TRACE_START_DELAY_SECS: u64 = 2;
 #[allow(dead_code)]
 pub const AUTO_TRACE_DURATION_SECS: u64 = 30;
 
+/// Auto-shutdown: power the machine off (ACPI S5, see
+/// `awkernel_lib::arch::x86_64::power::shutdown`) a fixed time after boot,
+/// with no shell/network trigger needed.
+///
+/// Intended for the same no-shell-input real hardware as auto-trace, but
+/// for a different problem: this crate's own one-shot PXE boot (Windows
+/// `bcdedit /set {fwbootmgr} bootsequence`, or Linux `efibootmgr
+/// --bootnext`) is consumed by the *next* boot regardless of which OS that
+/// boot loads, so once the real machine finishes whatever this trial
+/// needed (auto-trace's dump, DAG admission, etc.) there is nothing further
+/// for it to do -- but it has no way to know that and would otherwise just
+/// idle indefinitely. A real shutdown (not `power::reboot`) leaves the
+/// machine in a single well-defined state an external orchestrator (see
+/// `scripts/real_machine_trial.py`) can always distinguish from "still
+/// running": powered off, needing a Wake-on-LAN to start the next trial --
+/// instead of "back in the normal OS", which an SSH-based poll can observe
+/// far sooner than a slow BIOS/OS boot actually completes, making trials
+/// run back-to-back with no real gap between them.
+///
+/// Set `AUTO_SHUTDOWN_ENABLED` to `false` to disable (e.g. interactive
+/// QEMU/shell-input development, where an unattended power-off would just
+/// get in the way).
+#[allow(dead_code)]
+pub const AUTO_SHUTDOWN_ENABLED: bool = true;
+
+/// Seconds after boot before auto-shutdown fires. Keep comfortably longer
+/// than `AUTO_TRACE_START_DELAY_SECS + AUTO_TRACE_DURATION_SECS` (currently
+/// 32s) so the trace dump (and any other real-machine-trial work) always
+/// finishes and reaches the host's serial capture before power-off.
+#[allow(dead_code)]
+pub const AUTO_SHUTDOWN_SECS: u64 = 60;
+
 #[cfg(test)]
 #[allow(dead_code)]
 pub const HEAP_START: usize = 0;
