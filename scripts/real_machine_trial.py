@@ -435,7 +435,13 @@ def main():
         try:
             run_trial(args, state, boot_cache_path, trials_jsonl)
         except Exception as e:  # noqa: BLE001 -- surface any failure and stop the loop rather than burn through trials blind
-            print(f"[abort] {e}", file=sys.stderr)
+            # str(CalledProcessError) is just "Command '[...]' returned
+            # non-zero exit status N" -- the actual reason (e.g. sudo's own
+            # stderr) is a separate attribute and gets silently dropped
+            # unless printed explicitly, which then requires reproducing
+            # the failing command by hand just to see it.
+            detail = getattr(e, "stderr", None)
+            print(f"[abort] {e}" + (f"\n{detail.strip()}" if detail else ""), file=sys.stderr)
             sys.exit(1)
         if not args.dry_run and i < args.trials - 1 and args.trial_interval_secs > 0:
             print(f"[wait] pausing {args.trial_interval_secs}s before the next trial")
