@@ -25,10 +25,13 @@ Two selection modes (mutually exclusive):
 
 import argparse
 import json
+import os
+import pty
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -237,6 +240,33 @@ def run_build(awkernel_dir, staging_dir, dry_run):
     )
 
 
+class MinicomHandle:
+    def __init__(self, proc, master_fd, drain_thread):
+        self.proc = proc
+        self.master_fd = master_fd
+        self.drain_thread = drain_thread
+
+
+def _drain_pty(master_fd, sink_path):
+    """Continuously reads the pty master side and discards it (to a file,
+    for post-mortem debugging) for as long as minicom is alive. minicom is a
+    full-screen terminal app: it redraws its own status line/screen
+    periodically even while otherwise idle, and an unread pty has a small
+    kernel buffer (same order as a pipe's) -- without something draining it
+    for the whole trial, minicom would eventually block trying to write to
+    it, same failure mode a pipe would have here."""
+    with sink_path.open("wb") as f:
+        while True:
+            try:
+                data = os.read(master_fd, 4096)
+            except OSError:
+                return
+            if not data:
+                return
+            f.write(data)
+            f.flush()
+
+
 def start_minicom(serial_device, baud, log_path, use_sudo, dry_run):
     log_path.parent.mkdir(parents=True, exist_ok=True)
     if log_path.exists():
@@ -247,40 +277,62 @@ def start_minicom(serial_device, baud, log_path, use_sudo, dry_run):
     print(f"[minicom] {' '.join(cmd)}")
     if dry_run:
         return None
-    # A pipe here (instead of a discarded file) risks minicom blocking on a
-    # full pipe buffer over a whole trial if it ever writes more than we
-    # read (we only read the immediate-exit case below) -- a file has no
-    # such limit and needs no draining.
+    # minicom is a full-screen terminal app (ncurses), not a plain filter:
+    # given plain pipes/DEVNULL for its stdio it can't find a controlling
+    # terminal / valid TERM, and exits almost immediately (successfully,
+    # exit code 0, after printing its own startup banner) *without ever
+    # reaching the loop that captures serial data to -C* -- this looks
+    # nothing like the permission-error case (which fails loudly with a
+    # nonzero exit and an "許可がありません" message) but is just as
+    # silent-and-empty a failure for -C's log file. A real pty plus TERM
+    # set is what makes it actually run as a background capture process.
+    master_fd, slave_fd = pty.openpty()
+    env = {**os.environ, "TERM": "xterm"}
+    proc = subprocess.Popen(
+        cmd, stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+        env=env, start_new_session=True,
+    )
+    os.close(slave_fd)  # only the child needs its own dup of this now
+
     stderr_path = log_path.with_suffix(log_path.suffix + ".minicom_stderr")
-    with stderr_path.open("wb") as stderr_file:
-        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=stderr_file, stderr=subprocess.STDOUT)
-    # minicom exits near-instantly on a permission/device error (e.g. the
-    # invoking user isn't in the `dialout` group and --sudo-minicom wasn't
-    # passed) rather than hanging -- catching that here means a whole trial
-    # doesn't silently burn its build+reboot+max-wait-secs budget capturing
+    drain_thread = threading.Thread(target=_drain_pty, args=(master_fd, stderr_path), daemon=True)
+    drain_thread.start()
+
+    # minicom exits near-instantly on a permission/device/tty error rather
+    # than hanging -- catching that here means a whole trial doesn't
+    # silently burn its build+reboot+max-wait-secs budget capturing
     # nothing. A real minicom session keeps running past this, so a short
     # grace period is enough to tell the two apart without slowing every
     # trial down noticeably.
     time.sleep(0.5)
     if proc.poll() is not None:
-        output = stderr_path.read_text(errors="replace").strip()
+        drain_thread.join(timeout=2)
+        output = stderr_path.read_text(errors="replace").strip() if stderr_path.exists() else ""
+        os.close(master_fd)
         raise RuntimeError(
             f"minicom exited immediately (code {proc.returncode}): {output!r} -- "
             "if this is a permission error, either `sudo usermod -aG dialout $USER` "
-            "and start a new login session, or pass --sudo-minicom"
+            "and start a new login session, or pass --sudo-minicom; otherwise see "
+            "start_minicom's own doc comment (pty/TERM requirement)"
         )
-    return proc
+    return MinicomHandle(proc, master_fd, drain_thread)
 
 
-def stop_minicom(proc):
-    if proc is None:
+def stop_minicom(handle):
+    if handle is None:
         return
+    proc = handle.proc
     proc.terminate()
     try:
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait(timeout=5)
+    try:
+        os.close(handle.master_fd)
+    except OSError:
+        pass
+    handle.drain_thread.join(timeout=2)
 
 
 def wait_for_marker_or_timeout(log_path, marker, max_wait_secs, poll_interval=2):
