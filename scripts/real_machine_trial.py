@@ -339,7 +339,7 @@ def parse_args():
                         "bottom instead of picking single DAGs from --pool-dir (see module docstring)")
     p.add_argument("--host", default="192.168.10.10")
     p.add_argument("--user", default="awkernel")
-    p.add_argument("--target-mac", default="40:c2:ba:a8:5f:f9",
+    p.add_argument("--target-mac", default="80:fa:5b:79:11:e1",
                     help="target's PXE NIC MAC; a `wakeonlan` safety net sent before each "
                          "trial in case the target is ever left fully powered off (a no-op "
                          "when it's already up, which is the normal case with AUTO_REBOOT)")
