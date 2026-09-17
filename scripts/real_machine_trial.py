@@ -2,14 +2,25 @@
 """Automates one or more real-machine trial cycles:
 
   wait for target (Windows) reachable over SSH
-  -> pick next unused DAG from an RD-Gen pool and stage it
-  -> build awkernel with that DAG embedded (RD_GEN_DAGS_DIR)
+  -> pick DAG(s) to stage and stage them (see "Two selection modes" below)
+  -> build awkernel with them embedded (RD_GEN_DAGS_DIR)
   -> start minicom logging to log/trace_<n>.log
   -> bcdedit bootnext=PXE + shutdown /r /t 0 on the target
   -> wait for the trace to finish (marker in the log, or a timeout)
   -> stop minicom, record the trial in log/dag_selection.json
 
 Run repeatedly with --trials N to fire off N trials unattended.
+
+Two selection modes (mutually exclusive):
+  - Default (single-DAG): picks the next not-yet-used dag_<N>.yaml from
+    --pool-dir (ascending N), one DAG per trial.
+  - --trials-jsonl PATH (group-of-8): reads the JSON-Lines file
+    rd_gen_to_dags's acceptance_ratio.rs (via --trials-jsonl on
+    run_schedulability_evaluation.py) writes one record per resampled
+    trial to, and consumes it top to bottom -- trial 1 uses the file's own
+    line 1's 8 drawn dag_<N>.yaml names, trial 2 uses line 2, etc. -- so
+    the exact task set an offline trial predicted as (in)admissible is the
+    one actually staged and booted for real, not a fresh independent draw.
 """
 
 import argparse
@@ -22,9 +33,9 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-DEFAULT_AWKERNEL_DIR = Path("/home/nokosan/azumi-lab/awkernel")
-DEFAULT_POOL_DIR = Path("/home/nokosan/azumi-lab/RD-Gen/test/awkernel_theory_pool_branching/DAGs")
-DEFAULT_STAGING_DIR = Path("/home/nokosan/azumi-lab/RD-Gen/test/awkernel_staged")
+DEFAULT_AWKERNEL_DIR = Path("/home/nokosan/ws/awkernel")
+DEFAULT_POOL_DIR = Path("/home/nokosan/ws/RD-Gen/test/awkernel_theory_pool_branching/DAGs")
+DEFAULT_STAGING_DIR = Path("/home/nokosan/ws/RD-Gen/test/awkernel_staged")
 
 # bcdedit's own field labels ("identifier"/"description") are localized to the
 # target's Windows display language, so we don't match on them -- only on the
@@ -154,6 +165,55 @@ def stage_dag(src, staging_dir):
     return dst
 
 
+def load_trials_jsonl(path):
+    """Every record, in file order -- acceptance_ratio.rs appends one line
+    per resampled trial (see its own doc comment for the schema), so line
+    order is trial order across however many u_norm levels it swept."""
+    trials = []
+    with path.open() as f:
+        for line_no, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                trials.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                raise RuntimeError(f"{path}:{line_no}: not valid JSON: {e}") from e
+    if not trials:
+        raise RuntimeError(f"{path} has no trial records")
+    return trials
+
+
+def select_next_group(trials, consumed_count):
+    """The next not-yet-consumed record, top to bottom -- consumed_count is
+    how many of `trials`' leading records earlier invocations already used
+    (tracked via each state record's own "trials_jsonl_line", not just
+    len(state), since state may also hold single-DAG-mode records)."""
+    if consumed_count >= len(trials):
+        raise RuntimeError(
+            f"no more trial records left: {len(trials)} available, {consumed_count} already used"
+        )
+    return consumed_count, trials[consumed_count]
+
+
+def stage_group(pool_dir, dag_names, staging_dir):
+    if staging_dir.exists():
+        shutil.rmtree(staging_dir)
+    staging_dir.mkdir(parents=True)
+    staged = []
+    for name in dag_names:
+        src = pool_dir / name
+        if not src.exists():
+            raise RuntimeError(
+                f"'{name}' (from trials.jsonl) not found under {pool_dir} -- "
+                "is --pool-dir the same RD-Gen pool the JSONL was generated from?"
+            )
+        dst = staging_dir / name
+        shutil.copyfile(src, dst)
+        staged.append(dst)
+    return staged
+
+
 def run_build(awkernel_dir, staging_dir, dry_run):
     print(f"[build] RD_GEN_DAGS_DIR={staging_dir} make x86_64 RELEASE=1")
     if dry_run:
@@ -203,16 +263,32 @@ def next_trial_id(state):
     return max((r["trial"] for r in state), default=0) + 1
 
 
-def run_trial(args, state, boot_cache_path):
+def run_trial(args, state, boot_cache_path, trials_jsonl):
     trial_id = next_trial_id(state)
     print(f"=== trial {trial_id} ===")
 
     if not args.dry_run:
         wait_for_ssh(args.host, args.user, args.ssh_wait_secs)
 
-    dag_src = select_next_dag(args.pool_dir, {r["dag_file"] for r in state})
-    dag_staged = stage_dag(dag_src, args.staging_dir)
-    print(f"[dag] selected {dag_src.name}")
+    if trials_jsonl is not None:
+        consumed = sum(1 for r in state if "trials_jsonl_line" in r)
+        line_idx, trial_record = select_next_group(trials_jsonl, consumed)
+        dag_names = trial_record["dags"]
+        stage_group(args.pool_dir, dag_names, args.staging_dir)
+        print(f"[dag] staged group from trials.jsonl line {line_idx + 1}: {', '.join(dag_names)}")
+        selection_info = {
+            "trials_jsonl_line": line_idx,
+            "dag_files": dag_names,
+            "u_norm": trial_record.get("u_norm"),
+            "offline_trial": trial_record.get("trial"),
+            "offline_federated_accepted": trial_record.get("federated_accepted"),
+            "offline_vfed_accepted": trial_record.get("vfed_accepted"),
+        }
+    else:
+        dag_src = select_next_dag(args.pool_dir, {r["dag_file"] for r in state if "dag_file" in r})
+        stage_dag(dag_src, args.staging_dir)
+        print(f"[dag] selected {dag_src.name}")
+        selection_info = {"dag_file": dag_src.name, "dag_pool_path": str(dag_src)}
 
     run_build(args.awkernel_dir, args.staging_dir, args.dry_run)
 
@@ -231,8 +307,7 @@ def run_trial(args, state, boot_cache_path):
 
     record = {
         "trial": trial_id,
-        "dag_file": dag_src.name,
-        "dag_pool_path": str(dag_src),
+        **selection_info,
         "log_file": str(log_path),
         "boot_entry_guid": guid,
         "marker_found": marker_found,
@@ -255,7 +330,10 @@ def parse_args():
     p.add_argument("--awkernel-dir", type=Path, default=DEFAULT_AWKERNEL_DIR)
     p.add_argument("--pool-dir", type=Path, default=DEFAULT_POOL_DIR, help="RD-Gen DAG pool to draw from")
     p.add_argument("--staging-dir", type=Path, default=DEFAULT_STAGING_DIR,
-                   help="scratch dir the selected DAG is copied into; pointed at via RD_GEN_DAGS_DIR")
+                   help="scratch dir the selected DAG(s) are copied into; pointed at via RD_GEN_DAGS_DIR")
+    p.add_argument("--trials-jsonl", type=Path, default=None,
+                   help="group-of-8 mode: consume acceptance_ratio.rs's per-trial JSONL top to "
+                        "bottom instead of picking single DAGs from --pool-dir (see module docstring)")
     p.add_argument("--host", default="192.168.10.10")
     p.add_argument("--user", default="awkernel")
     p.add_argument("--serial-device", default="/dev/ttyUSB0")
@@ -279,10 +357,11 @@ def main():
     state_path = args.log_dir / "dag_selection.json"
     boot_cache_path = args.log_dir / "real_machine_boot_entry.json"
     state = load_json(state_path, [])
+    trials_jsonl = load_trials_jsonl(args.trials_jsonl) if args.trials_jsonl is not None else None
 
     for _ in range(args.trials):
         try:
-            run_trial(args, state, boot_cache_path)
+            run_trial(args, state, boot_cache_path, trials_jsonl)
         except Exception as e:  # noqa: BLE001 -- surface any failure and stop the loop rather than burn through trials blind
             print(f"[abort] {e}", file=sys.stderr)
             sys.exit(1)
