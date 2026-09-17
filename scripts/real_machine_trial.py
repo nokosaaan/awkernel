@@ -113,11 +113,30 @@ def wake_on_lan(mac, dry_run):
 
 def wait_for_ssh(host, user, timeout_secs, poll_interval=5):
     deadline = time.monotonic() + timeout_secs
+    warned_auth_failure = False
     while time.monotonic() < deadline:
         try:
             ssh_run(host, user, "echo ok", timeout=5)
             return
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        except subprocess.CalledProcessError as e:
+            # "Permission denied" (no key registered / password auth needed)
+            # won't ever resolve itself by retrying, unlike "connection
+            # refused"/timeout while the target is mid-reboot -- silently
+            # retrying it for the full timeout looks indistinguishable from
+            # a genuine hang. Warn once, loudly, but keep polling anyway (in
+            # case someone fixes it -- e.g. `ssh-copy-id` -- in another
+            # terminal while this waits).
+            if not warned_auth_failure and "permission denied" in (e.stderr or "").lower():
+                warned_auth_failure = True
+                print(
+                    f"[ssh] WARNING: {user}@{host} rejected authentication "
+                    f"(not just 'still booting') -- {e.stderr.strip()!r}. "
+                    "Will keep polling, but this needs fixing on its own "
+                    "(e.g. `ssh-copy-id`), not more waiting.",
+                    file=sys.stderr,
+                )
+            time.sleep(poll_interval)
+        except subprocess.TimeoutExpired:
             time.sleep(poll_interval)
     raise RuntimeError(f"{user}@{host} did not become SSH-reachable within {timeout_secs}s")
 
