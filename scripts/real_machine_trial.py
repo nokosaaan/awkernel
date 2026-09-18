@@ -44,6 +44,12 @@ DEFAULT_AWKERNEL_DIR = Path("/home/nokosan/ws/awkernel")
 DEFAULT_POOL_DIR = Path("/home/nokosan/ws/RD-Gen/test/awkernel_theory_pool_branching/DAGs")
 DEFAULT_STAGING_DIR = Path("/home/nokosan/ws/RD-Gen/test/awkernel_staged")
 
+# rd_gen_to_dags's admission policy (see build_dag.rs) is picked at kernel
+# build time via cargo feature, not at runtime -- None means Federated, the
+# default that needs no extra feature. Threaded into the build via the
+# Makefile's EXTRA_FEATURES (see run_build).
+ALGO_FEATURES = {"federated": None, "vfed": "rd_gen_vfed", "laxity": "rd_gen_laxity"}
+
 # bcdedit's own field labels ("identifier"/"description") are localized to the
 # target's Windows display language, so we don't match on them -- only on the
 # GUID shape and on hint words that tend to survive localization (device/
@@ -301,12 +307,16 @@ def stage_group(pool_dir, dag_names, staging_dir):
     return staged
 
 
-def run_build(awkernel_dir, staging_dir, dry_run):
-    print(f"[build] RD_GEN_DAGS_DIR={staging_dir} make x86_64 RELEASE=1")
+def run_build(awkernel_dir, staging_dir, dry_run, algorithm="federated"):
+    make_args = ["make", "x86_64", "RELEASE=1"]
+    extra_feature = ALGO_FEATURES[algorithm]
+    if extra_feature:
+        make_args.append(f"EXTRA_FEATURES=--features {extra_feature}")
+    print(f"[build] RD_GEN_DAGS_DIR={staging_dir} {' '.join(make_args)}")
     if dry_run:
         return
     subprocess.run(
-        ["make", "x86_64", "RELEASE=1"],
+        make_args,
         cwd=awkernel_dir,
         env={**os.environ, "RD_GEN_DAGS_DIR": str(staging_dir)},
         check=True,
@@ -421,20 +431,68 @@ def next_trial_id(state):
     return max((r["trial"] for r in state), default=0) + 1
 
 
-def run_trial(args, state, boot_cache_path, trials_jsonl):
+def run_trial_for_algorithm(args, state, boot_cache_path, batch_id, algorithm, selection_info):
+    """One build+boot+capture cycle against the already-staged DAG(s), under
+    one admission-policy algorithm. `selection_info` (the DAG selection, made
+    once per batch by `run_trial`) is copied into this trial's own state
+    record verbatim, alongside `batch_id`/`algorithm`, so every algorithm run
+    against the same DAG(s) shares a `dag_selection_batch` value."""
     trial_id = next_trial_id(state)
-    print(f"=== trial {trial_id} ===")
+    print(f"--- trial {trial_id} (algorithm={algorithm}) ---")
 
-    if not args.dry_run:
-        # The previous trial's own auto-reboot (see kernel/src/config.rs's
-        # AUTO_REBOOT_*) already brings the target back up on its own (its
-        # one-shot PXE bootsequence is consumed, so it falls through to the
-        # normal boot order) -- no WoL needed to wake it. Just wait for it
-        # to actually be reachable again before touching it.
+    run_build(args.awkernel_dir, args.staging_dir, args.dry_run, algorithm)
+
+    log_path = args.log_dir / f"{args.log_prefix}{trial_id}_{algorithm}.log"
+    minicom_handle = start_minicom(args.serial_device, args.baud, log_path, args.sudo_minicom, args.dry_run)
+    time.sleep(2)  # let minicom attach to the port before we trigger the reboot
+
+    if args.dry_run:
+        boot_entry = "DRY-RUN"
+        marker_found = False
+    else:
+        # The previous reboot (this batch's earlier algorithm, or the
+        # previous batch's last one) needs time to actually come back up
+        # on its own (see kernel/src/config.rs's AUTO_REBOOT_*) before the
+        # ssh commands below can reach it -- no WoL needed to wake it.
         wait_for_ssh(args.host, args.user, args.ssh_wait_secs)
+        boot_entry = get_boot_entry(
+            args.host, args.user, boot_cache_path, args.rediscover_boot_entry, args.target_os, args.target_mac,
+        )
+        trigger_reboot_to_pxe(args.host, args.user, args.target_os, boot_entry)
+        marker_found = wait_for_marker_or_timeout(log_path, args.marker, args.max_wait_secs)
+        stop_minicom(minicom_handle)
+
+    record = {
+        "trial": trial_id,
+        "dag_selection_batch": batch_id,
+        "algorithm": algorithm,
+        **selection_info,
+        "log_file": str(log_path),
+        "boot_entry": boot_entry,
+        "marker_found": marker_found,
+        "timestamp": now_iso(),
+    }
+    state.append(record)
+    save_json(args.log_dir / "dag_selection.json", state)
+    if args.dry_run:
+        status = "dry-run, no reboot/wait performed"
+    elif marker_found:
+        status = "marker found"
+    else:
+        status = f"timed out after {args.max_wait_secs}s"
+    print(f"[trial {trial_id}] done ({status}) -> {log_path}")
+
+
+def run_trial(args, state, boot_cache_path, trials_jsonl):
+    batch_id = max((r.get("dag_selection_batch", 0) for r in state), default=0) + 1
+    print(f"=== dag selection {batch_id} ===")
 
     if trials_jsonl is not None:
-        consumed = sum(1 for r in state if "trials_jsonl_line" in r)
+        # Distinct lines consumed, not len(matching records): every
+        # algorithm run against one line's DAG(s) shares that same
+        # "trials_jsonl_line" value now, so counting records would consume
+        # the file len(args.algorithms) times too fast.
+        consumed = len({r["trials_jsonl_line"] for r in state if "trials_jsonl_line" in r})
         line_idx, trial_record = select_next_group(trials_jsonl, consumed)
         dag_names = trial_record["dags"]
         stage_group(args.pool_dir, dag_names, args.staging_dir)
@@ -454,40 +512,12 @@ def run_trial(args, state, boot_cache_path, trials_jsonl):
         print(f"[dag] selected {dag_src.name}")
         selection_info = {"dag_file": dag_src.name, "dag_pool_path": str(dag_src)}
 
-    run_build(args.awkernel_dir, args.staging_dir, args.dry_run)
-
-    log_path = args.log_dir / f"{args.log_prefix}{trial_id}.log"
-    minicom_handle = start_minicom(args.serial_device, args.baud, log_path, args.sudo_minicom, args.dry_run)
-    time.sleep(2)  # let minicom attach to the port before we trigger the reboot
-
-    if args.dry_run:
-        boot_entry = "DRY-RUN"
-        marker_found = False
-    else:
-        boot_entry = get_boot_entry(
-            args.host, args.user, boot_cache_path, args.rediscover_boot_entry, args.target_os, args.target_mac,
-        )
-        trigger_reboot_to_pxe(args.host, args.user, args.target_os, boot_entry)
-        marker_found = wait_for_marker_or_timeout(log_path, args.marker, args.max_wait_secs)
-        stop_minicom(minicom_handle)
-
-    record = {
-        "trial": trial_id,
-        **selection_info,
-        "log_file": str(log_path),
-        "boot_entry": boot_entry,
-        "marker_found": marker_found,
-        "timestamp": now_iso(),
-    }
-    state.append(record)
-    save_json(args.log_dir / "dag_selection.json", state)
-    if args.dry_run:
-        status = "dry-run, no reboot/wait performed"
-    elif marker_found:
-        status = "marker found"
-    else:
-        status = f"timed out after {args.max_wait_secs}s"
-    print(f"[trial {trial_id}] done ({status}) -> {log_path}")
+    for i, algorithm in enumerate(args.algorithms):
+        run_trial_for_algorithm(args, state, boot_cache_path, batch_id, algorithm, selection_info)
+        is_last = i == len(args.algorithms) - 1
+        if not args.dry_run and not is_last and args.trial_interval_secs > 0:
+            print(f"[wait] pausing {args.trial_interval_secs}s before the next algorithm")
+            time.sleep(args.trial_interval_secs)
 
 
 def parse_args():
@@ -500,6 +530,13 @@ def parse_args():
     p.add_argument("--trials-jsonl", type=Path, default=None,
                    help="group-of-8 mode: consume acceptance_ratio.rs's per-trial JSONL top to "
                         "bottom instead of picking single DAGs from --pool-dir (see module docstring)")
+    p.add_argument("--algorithms", default="federated",
+                   help="comma-separated admission policies (rd_gen_to_dags's build-time cargo "
+                        f"feature, see build_dag.rs), choices: {', '.join(ALGO_FEATURES)} "
+                        "(default: federated). Each DAG selection is built and booted once per "
+                        "algorithm listed here, in order, before moving on to the next selection "
+                        "-- so --trials N means N DAG selections, not N real-machine runs; the "
+                        "actual run count is N * len(algorithms)")
     p.add_argument("--host", default="192.168.10.10")
     p.add_argument("--user", default="azumiken-admin")
     p.add_argument("--target-os", choices=["windows", "linux"], default="linux",
@@ -535,6 +572,12 @@ def parse_args():
     args = p.parse_args()
     if args.log_dir is None:
         args.log_dir = args.awkernel_dir / "log"
+    args.algorithms = [a.strip() for a in args.algorithms.split(",") if a.strip()]
+    unknown = [a for a in args.algorithms if a not in ALGO_FEATURES]
+    if unknown:
+        p.error(f"--algorithms: unknown algorithm(s) {unknown}; choices: {', '.join(ALGO_FEATURES)}")
+    if not args.algorithms:
+        p.error("--algorithms: must list at least one algorithm")
     return args
 
 
@@ -558,7 +601,7 @@ def main():
             print(f"[abort] {e}" + (f"\n{detail.strip()}" if detail else ""), file=sys.stderr)
             sys.exit(1)
         if not args.dry_run and i < args.trials - 1 and args.trial_interval_secs > 0:
-            print(f"[wait] pausing {args.trial_interval_secs}s before the next trial")
+            print(f"[wait] pausing {args.trial_interval_secs}s before the next dag selection")
             time.sleep(args.trial_interval_secs)
 
 

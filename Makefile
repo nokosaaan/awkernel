@@ -6,6 +6,13 @@ else
 	OPT = --features debug
 endif
 
+# Extra cargo flags appended after $(OPT) on the x86_64 kernel build (e.g.
+# `EXTRA_FEATURES="--features rd_gen_vfed"` to swap rd_gen_to_dags's
+# admission policy) -- see scripts/real_machine_trial.py's --algorithms.
+# Cargo unions repeated --features flags, so this is additive with the
+# --features x86 baked into the `x86` cargo alias, not a replacement for it.
+EXTRA_FEATURES ?=
+
 # 2MiB Stack
 STACKSIZE = 1024 * 1024 * 2
 
@@ -143,7 +150,7 @@ check_x86_64: $(X86ASM)
 	cargo +$(RUSTV) check_x86
 
 kernel-x86_64.elf: $(X86ASM) FORCE
-	RUSTFLAGS="$(RUSTC_MISC_ARGS)" cargo +$(RUSTV) x86 $(OPT)
+	RUSTFLAGS="$(RUSTC_MISC_ARGS)" cargo +$(RUSTV) x86 $(OPT) $(EXTRA_FEATURES)
 	python3 scripts/embed_debug_info.py $@
 
 x86_64_boot.img: kernel-x86_64.elf
