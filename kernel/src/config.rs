@@ -76,7 +76,7 @@ pub const AUTO_REBOOT_ENABLED: bool = true;
 /// fired before the dump finished. Kept generous here anyway since it's
 /// now just a safety net, not the thing every trial waits out.
 #[allow(dead_code)]
-pub const AUTO_REBOOT_SECS: u64 = 300;
+pub const AUTO_REBOOT_SECS: u64 = 50000;
 
 #[cfg(test)]
 #[allow(dead_code)]

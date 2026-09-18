@@ -558,7 +558,7 @@ def parse_args():
     p.add_argument("--marker", default="TRACE_END", help="string that marks trace completion in the growing log")
     p.add_argument("--max-wait-secs", type=int, default=50000,
                     help="hard cap per trial while waiting for the marker -- keep above "
-                         "kernel/src/config.rs's AUTO_REBOOT_SECS (currently 300s) plus some "
+                         "kernel/src/config.rs's AUTO_REBOOT_SECS (currently 50000s) plus some "
                          "PXE-boot overhead, since a cap shorter than that can move on to the "
                          "next trial before a large trace's dump_to_console() finishes writing, "
                          "truncating it")
