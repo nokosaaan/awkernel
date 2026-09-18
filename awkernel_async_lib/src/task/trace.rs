@@ -242,6 +242,17 @@ pub fn dump_to_console() {
         console::print(&format!("TRACE_DAG,{dag_id},{src},{dst}\r\n"));
     }
 
+    // TRACE_BUILD_MISS,<dag_id>,<reason> — a DAG that got a dag_id but
+    // failed to build (admission rejection, arity error, ...) and so was
+    // never spawned and never appears as a TRACE_TASK. Host-side tooling
+    // counts these as deadline misses too: the DAG never got a chance to
+    // run, which is a miss just as much as a spawned DAG overrunning its
+    // deadline. `reason` is free text (a `Display`ed error), so it may
+    // contain commas; readers should split on the first two commas only.
+    for (dag_id, reason) in crate::dag::take_build_failures() {
+        console::print(&format!("TRACE_BUILD_MISS,{dag_id},{reason}\r\n"));
+    }
+
     // TRACE_PUBSUB,<dag_id>,<node_id>,<period>,<publish_ns|->,<subscribe_ns|->
     // Pubsub latency for this same recording window; see
     // `perf::dump_pubsub_to_console` for the format and scoping rationale.

@@ -18,10 +18,13 @@ Two selection modes (mutually exclusive):
   - --trials-jsonl PATH (group-of-8): reads the JSON-Lines file
     rd_gen_to_dags's acceptance_ratio.rs (via --trials-jsonl on
     run_schedulability_evaluation.py) writes one record per resampled
-    trial to, and consumes it top to bottom -- trial 1 uses the file's own
-    line 1's 8 drawn dag_<N>.yaml names, trial 2 uses line 2, etc. -- so
-    the exact task set an offline trial predicted as (in)admissible is the
-    one actually staged and booted for real, not a fresh independent draw.
+    trial to, and consumes it round-robin across u_norm levels (one trial
+    from each level, then the next trial from each level, ...) rather than
+    the file's own order (every trial of one level before the next) -- see
+    load_trials_jsonl's own doc comment -- so a batch that's cut short
+    still covers every level. Whichever record is picked, the exact task
+    set an offline trial predicted as (in)admissible is the one actually
+    staged and booted for real, not a fresh independent draw.
 """
 
 import argparse
@@ -96,17 +99,6 @@ def ssh_run(host, user, remote_cmd, timeout=15, check=True):
     if check and raw.returncode != 0:
         raise subprocess.CalledProcessError(raw.returncode, cmd, result.stdout, result.stderr)
     return result
-
-
-def wake_on_lan(mac, dry_run):
-    print(f"[wol] wakeonlan {mac}")
-    if dry_run:
-        return
-    # A missed/ignored magic packet isn't fatal here -- wait_for_ssh right
-    # after this will just keep polling until ssh_wait_secs elapses, so a
-    # transient failure to send surfaces as that timeout's own error rather
-    # than needing its own handling.
-    subprocess.run(["wakeonlan", mac], check=False, capture_output=True)
 
 
 def wait_for_ssh(host, user, timeout_secs, poll_interval=5):
@@ -238,27 +230,50 @@ def stage_dag(src, staging_dir):
 
 
 def load_trials_jsonl(path):
-    """Every record, in file order -- acceptance_ratio.rs appends one line
-    per resampled trial (see its own doc comment for the schema), so line
-    order is trial order across however many u_norm levels it swept."""
-    trials = []
+    """Every record from acceptance_ratio.rs's --trials-jsonl output (one
+    per resampled trial; see its own doc comment for the schema), reordered
+    round-robin across u_norm levels -- one trial from the lowest level,
+    then one from the next, ... then back to the lowest level's next
+    trial, and so on -- instead of the file's own order (every trial of
+    one level before moving to the next). A batch of real-machine trials
+    that gets cut short this way still covers every u_norm level instead
+    of only ever reaching the lowest ones.
+
+    Each record's position in this reordering (0-based) is what
+    `select_next_group`/the state file's "trials_jsonl_line" index by --
+    it is processing order, not the record's actual line number in the
+    file."""
+    by_u_norm = {}
     with path.open() as f:
         for line_no, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
                 continue
             try:
-                trials.append(json.loads(line))
+                record = json.loads(line)
             except json.JSONDecodeError as e:
                 raise RuntimeError(f"{path}:{line_no}: not valid JSON: {e}") from e
-    if not trials:
+            by_u_norm.setdefault(record["u_norm"], []).append(record)
+
+    if not by_u_norm:
         raise RuntimeError(f"{path} has no trial records")
-    return trials
+
+    # Dict insertion order == ascending u_norm here, since
+    # acceptance_ratio.rs sweeps u_norm_min -> u_norm_max and appends each
+    # level's trials in that order as it goes.
+    levels = list(by_u_norm.values())
+    ordered = []
+    for col in range(max(len(level) for level in levels)):
+        for level in levels:
+            if col < len(level):
+                ordered.append(level[col])
+    return ordered
 
 
 def select_next_group(trials, consumed_count):
-    """The next not-yet-consumed record, top to bottom -- consumed_count is
-    how many of `trials`' leading records earlier invocations already used
+    """The next not-yet-consumed record from `trials` (see
+    `load_trials_jsonl` for its round-robin ordering) -- consumed_count is
+    how many of its leading records earlier invocations already used
     (tracked via each state record's own "trials_jsonl_line", not just
     len(state), since state may also hold single-DAG-mode records)."""
     if consumed_count >= len(trials):
@@ -414,11 +429,8 @@ def run_trial(args, state, boot_cache_path, trials_jsonl):
         # The previous trial's own auto-reboot (see kernel/src/config.rs's
         # AUTO_REBOOT_*) already brings the target back up on its own (its
         # one-shot PXE bootsequence is consumed, so it falls through to the
-        # normal boot order) -- this WoL is only a safety net for the case
-        # where the target was left fully powered off some other way, and a
-        # no-op (silently ignored) if it's already up, so keeping it here
-        # costs nothing even though AUTO_REBOOT no longer requires it.
-        wake_on_lan(args.target_mac, args.dry_run)
+        # normal boot order) -- no WoL needed to wake it. Just wait for it
+        # to actually be reachable again before touching it.
         wait_for_ssh(args.host, args.user, args.ssh_wait_secs)
 
     if trials_jsonl is not None:
@@ -426,7 +438,8 @@ def run_trial(args, state, boot_cache_path, trials_jsonl):
         line_idx, trial_record = select_next_group(trials_jsonl, consumed)
         dag_names = trial_record["dags"]
         stage_group(args.pool_dir, dag_names, args.staging_dir)
-        print(f"[dag] staged group from trials.jsonl line {line_idx + 1}: {', '.join(dag_names)}")
+        print(f"[dag] staged group #{line_idx + 1} (u_norm={trial_record.get('u_norm')}): "
+              f"{', '.join(dag_names)}")
         selection_info = {
             "trials_jsonl_line": line_idx,
             "dag_files": dag_names,
@@ -494,9 +507,7 @@ def parse_args():
                          "(windows) or efibootmgr+reboot (linux)")
     p.add_argument("--target-mac", default="80:fa:5b:79:11:e1",
                     help="target's PXE NIC MAC: identifies the right `efibootmgr -v` entry on "
-                         "--target-os linux, and is also a `wakeonlan` safety net sent before "
-                         "each trial in case the target is ever left fully powered off (a "
-                         "no-op when it's already up, the normal case with AUTO_REBOOT)")
+                         "--target-os linux")
     p.add_argument("--trial-interval-secs", type=int, default=30,
                     help="pause between trials, on top of --ssh-wait-secs, so the target's "
                          "own AUTO_REBOOT_SECS has time to actually fire before the next "
@@ -508,7 +519,7 @@ def parse_args():
     p.add_argument("--log-dir", type=Path, default=None, help="default: <awkernel-dir>/log")
     p.add_argument("--log-prefix", default="trace_")
     p.add_argument("--marker", default="TRACE_END", help="string that marks trace completion in the growing log")
-    p.add_argument("--max-wait-secs", type=int, default=330,
+    p.add_argument("--max-wait-secs", type=int, default=50000,
                     help="hard cap per trial while waiting for the marker -- keep above "
                          "kernel/src/config.rs's AUTO_REBOOT_SECS (currently 300s) plus some "
                          "PXE-boot overhead, since a cap shorter than that can move on to the "

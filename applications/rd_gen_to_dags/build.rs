@@ -16,7 +16,7 @@ use std::{
 /// output directory without editing this file; falls back to this fixed
 /// path — the small, hand-curated set this crate has always shipped with —
 /// when unset, so a plain `make x86_64` keeps working unchanged.
-const DEFAULT_DAGS_DIR: &str = "/home/nokosan/azumi-lab/RD-Gen/test/awkernel";
+const DEFAULT_DAGS_DIR: &str = "/home/nokosan/azumi-lab/RD-Gen/test/awkernel_theory_pool_branching/DAGs";
 
 /// True for `dag_<N>.yaml`/`.yml` files. RD-Gen writes sibling files in the
 /// same directory that are not DAG definitions (e.g. `combination_log.yaml`,

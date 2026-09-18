@@ -27,7 +27,7 @@ pub const AUTO_TRACE_START_DELAY_SECS: u64 = 2;
 
 /// Length of the auto-trace recording in seconds.
 #[allow(dead_code)]
-pub const AUTO_TRACE_DURATION_SECS: u64 = 30;
+pub const AUTO_TRACE_DURATION_SECS: u64 = 10;
 
 /// Auto-reboot: reboot the machine (see
 /// `awkernel_lib::arch::x86_64::power::reboot`) a fixed time after boot,

@@ -1,19 +1,19 @@
+use crate::dag_stats::compute_dag_stats;
 #[cfg(feature = "laxity")]
 use crate::dag_stats::compute_node_laxity;
-use crate::dag_stats::compute_dag_stats;
 use crate::parse_yaml::{DagData, NodeData};
 use crate::time_unit::{convert_duration, simulated_execution_time};
 
 use alloc::{borrow::Cow, format, sync::Arc, vec::Vec};
-use awkernel_async_lib::{
-    dag::{Dag, create_dag},
-    dag_sched::{metrics::DagMetrics, policy::federated::FederatedError},
-    scheduler::SchedulerType,
-};
 #[cfg(not(any(feature = "vfed", feature = "laxity")))]
 use awkernel_async_lib::dag_sched::policy::federated::admit_dag;
 #[cfg(feature = "vfed")]
 use awkernel_async_lib::dag_sched::policy::vfed::{self, PackingStrategy, VFedError};
+use awkernel_async_lib::{
+    dag::{create_dag, record_build_failure, Dag},
+    dag_sched::{metrics::DagMetrics, policy::federated::FederatedError},
+    scheduler::SchedulerType,
+};
 
 #[cfg(all(feature = "vfed", feature = "laxity"))]
 compile_error!("features \"vfed\" and \"laxity\" select mutually exclusive admission policies");
@@ -208,14 +208,34 @@ async fn register_source_node(
         6 => register_source!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64),
         7 => register_source!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64),
         8 => register_source!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64),
-        9 => register_source!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        10 => register_source!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        11 => register_source!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        12 => register_source!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        13 => register_source!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        14 => register_source!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        15 => register_source!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        16 => register_source!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
+        9 => register_source!(
+            dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64
+        ),
+        10 => register_source!(
+            dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64
+        ),
+        11 => register_source!(
+            dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64
+        ),
+        12 => register_source!(
+            dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64
+        ),
+        13 => register_source!(
+            dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
+            u64
+        ),
+        14 => register_source!(
+            dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
+            u64, u64
+        ),
+        15 => register_source!(
+            dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
+            u64, u64, u64
+        ),
+        16 => register_source!(
+            dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
+            u64, u64, u64, u64
+        ),
         _ => Err(LinkNumError::Output(dag_id, node_id)),
     }
 }
@@ -271,14 +291,34 @@ async fn register_sink_node(
         6 => register_sink!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64),
         7 => register_sink!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64),
         8 => register_sink!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64),
-        9 => register_sink!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        10 => register_sink!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        11 => register_sink!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        12 => register_sink!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        13 => register_sink!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        14 => register_sink!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        15 => register_sink!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        16 => register_sink!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
+        9 => {
+            register_sink!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        10 => register_sink!(
+            dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64
+        ),
+        11 => register_sink!(
+            dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64
+        ),
+        12 => register_sink!(
+            dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64
+        ),
+        13 => register_sink!(
+            dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
+            u64
+        ),
+        14 => register_sink!(
+            dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
+            u64, u64
+        ),
+        15 => register_sink!(
+            dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
+            u64, u64, u64
+        ),
+        16 => register_sink!(
+            dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64,
+            u64, u64, u64, u64
+        ),
         _ => Err(LinkNumError::Input(dag_id, node_id)),
     }
 }
@@ -344,257 +384,739 @@ async fn register_intermediate_node(
         (1, 3) => register_intermediate!(dag, node_data, sched_type, u64; u64, u64, u64),
         (1, 4) => register_intermediate!(dag, node_data, sched_type, u64; u64, u64, u64, u64),
         (1, 5) => register_intermediate!(dag, node_data, sched_type, u64; u64, u64, u64, u64, u64),
-        (1, 6) => register_intermediate!(dag, node_data, sched_type, u64; u64, u64, u64, u64, u64, u64),
-        (1, 7) => register_intermediate!(dag, node_data, sched_type, u64; u64, u64, u64, u64, u64, u64, u64),
-        (1, 8) => register_intermediate!(dag, node_data, sched_type, u64; u64, u64, u64, u64, u64, u64, u64, u64),
-        (1, 9) => register_intermediate!(dag, node_data, sched_type, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (1, 10) => register_intermediate!(dag, node_data, sched_type, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (1, 11) => register_intermediate!(dag, node_data, sched_type, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (1, 12) => register_intermediate!(dag, node_data, sched_type, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (1, 13) => register_intermediate!(dag, node_data, sched_type, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (1, 14) => register_intermediate!(dag, node_data, sched_type, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (1, 15) => register_intermediate!(dag, node_data, sched_type, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (1, 16) => register_intermediate!(dag, node_data, sched_type, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
+        (1, 6) => {
+            register_intermediate!(dag, node_data, sched_type, u64; u64, u64, u64, u64, u64, u64)
+        }
+        (1, 7) => {
+            register_intermediate!(dag, node_data, sched_type, u64; u64, u64, u64, u64, u64, u64, u64)
+        }
+        (1, 8) => {
+            register_intermediate!(dag, node_data, sched_type, u64; u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (1, 9) => {
+            register_intermediate!(dag, node_data, sched_type, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (1, 10) => {
+            register_intermediate!(dag, node_data, sched_type, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (1, 11) => {
+            register_intermediate!(dag, node_data, sched_type, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (1, 12) => {
+            register_intermediate!(dag, node_data, sched_type, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (1, 13) => {
+            register_intermediate!(dag, node_data, sched_type, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (1, 14) => {
+            register_intermediate!(dag, node_data, sched_type, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (1, 15) => {
+            register_intermediate!(dag, node_data, sched_type, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (1, 16) => {
+            register_intermediate!(dag, node_data, sched_type, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
         (2, 1) => register_intermediate!(dag, node_data, sched_type, u64, u64; u64),
         (2, 2) => register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64),
         (2, 3) => register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64),
         (2, 4) => register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64, u64),
-        (2, 5) => register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64, u64, u64),
-        (2, 6) => register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64, u64, u64, u64),
-        (2, 7) => register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64, u64, u64, u64, u64),
-        (2, 8) => register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64),
-        (2, 9) => register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (2, 10) => register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (2, 11) => register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (2, 12) => register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (2, 13) => register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (2, 14) => register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (2, 15) => register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (2, 16) => register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
+        (2, 5) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64, u64, u64)
+        }
+        (2, 6) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64, u64, u64, u64)
+        }
+        (2, 7) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64, u64, u64, u64, u64)
+        }
+        (2, 8) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (2, 9) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (2, 10) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (2, 11) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (2, 12) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (2, 13) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (2, 14) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (2, 15) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (2, 16) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
         (3, 1) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64),
         (3, 2) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64),
         (3, 3) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64),
-        (3, 4) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64, u64),
-        (3, 5) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64, u64, u64),
-        (3, 6) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64, u64, u64, u64),
-        (3, 7) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64),
-        (3, 8) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64),
-        (3, 9) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (3, 10) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (3, 11) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (3, 12) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (3, 13) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (3, 14) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (3, 15) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (3, 16) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
+        (3, 4) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64, u64)
+        }
+        (3, 5) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64, u64, u64)
+        }
+        (3, 6) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64, u64, u64, u64)
+        }
+        (3, 7) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64)
+        }
+        (3, 8) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (3, 9) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (3, 10) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (3, 11) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (3, 12) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (3, 13) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (3, 14) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (3, 15) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (3, 16) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
         (4, 1) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64),
         (4, 2) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64),
-        (4, 3) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64),
-        (4, 4) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64, u64),
-        (4, 5) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64, u64, u64),
-        (4, 6) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64),
-        (4, 7) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64),
-        (4, 8) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64),
-        (4, 9) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (4, 10) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (4, 11) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (4, 12) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (4, 13) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (4, 14) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (4, 15) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (4, 16) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
+        (4, 3) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64)
+        }
+        (4, 4) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64, u64)
+        }
+        (4, 5) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64, u64, u64)
+        }
+        (4, 6) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64)
+        }
+        (4, 7) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64)
+        }
+        (4, 8) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (4, 9) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (4, 10) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (4, 11) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (4, 12) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (4, 13) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (4, 14) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (4, 15) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (4, 16) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
         (5, 1) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64),
-        (5, 2) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64),
-        (5, 3) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64),
-        (5, 4) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64, u64),
-        (5, 5) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64),
-        (5, 6) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64),
-        (5, 7) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64),
-        (5, 8) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64),
-        (5, 9) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (5, 10) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (5, 11) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (5, 12) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (5, 13) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (5, 14) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (5, 15) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (5, 16) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (6, 1) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64),
-        (6, 2) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64),
-        (6, 3) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64),
-        (6, 4) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64),
-        (6, 5) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64),
-        (6, 6) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64),
-        (6, 7) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64),
-        (6, 8) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64),
-        (6, 9) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (6, 10) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (6, 11) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (6, 12) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (6, 13) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (6, 14) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (6, 15) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (6, 16) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (7, 1) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64),
-        (7, 2) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64),
-        (7, 3) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64),
-        (7, 4) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64),
-        (7, 5) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64),
-        (7, 6) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64),
-        (7, 7) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64),
-        (7, 8) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64),
-        (7, 9) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (7, 10) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (7, 11) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (7, 12) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (7, 13) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (7, 14) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (7, 15) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (7, 16) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (8, 1) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64),
-        (8, 2) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64),
-        (8, 3) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64),
-        (8, 4) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64),
-        (8, 5) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64),
-        (8, 6) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64),
-        (8, 7) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64),
-        (8, 8) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64),
-        (8, 9) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (8, 10) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (8, 11) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (8, 12) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (8, 13) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (8, 14) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (8, 15) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (8, 16) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (9, 1) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64),
-        (9, 2) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64),
-        (9, 3) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64),
-        (9, 4) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64),
-        (9, 5) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64),
-        (9, 6) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64),
-        (9, 7) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64),
-        (9, 8) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64),
-        (9, 9) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (9, 10) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (9, 11) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (9, 12) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (9, 13) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (9, 14) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (9, 15) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (9, 16) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (10, 1) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64),
-        (10, 2) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64),
-        (10, 3) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64),
-        (10, 4) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64),
-        (10, 5) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64),
-        (10, 6) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64),
-        (10, 7) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64),
-        (10, 8) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64),
-        (10, 9) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (10, 10) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (10, 11) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (10, 12) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (10, 13) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (10, 14) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (10, 15) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (10, 16) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (11, 1) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64),
-        (11, 2) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64),
-        (11, 3) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64),
-        (11, 4) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64),
-        (11, 5) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64),
-        (11, 6) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64),
-        (11, 7) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64),
-        (11, 8) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64),
-        (11, 9) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (11, 10) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (11, 11) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (11, 12) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (11, 13) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (11, 14) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (11, 15) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (11, 16) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (12, 1) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64),
-        (12, 2) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64),
-        (12, 3) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64),
-        (12, 4) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64),
-        (12, 5) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64),
-        (12, 6) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64),
-        (12, 7) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64),
-        (12, 8) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64),
-        (12, 9) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (12, 10) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (12, 11) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (12, 12) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (12, 13) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (12, 14) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (12, 15) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (12, 16) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (13, 1) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64),
-        (13, 2) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64),
-        (13, 3) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64),
-        (13, 4) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64),
-        (13, 5) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64),
-        (13, 6) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64),
-        (13, 7) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64),
-        (13, 8) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64),
-        (13, 9) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (13, 10) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (13, 11) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (13, 12) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (13, 13) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (13, 14) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (13, 15) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (13, 16) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (14, 1) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64),
-        (14, 2) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64),
-        (14, 3) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64),
-        (14, 4) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64),
-        (14, 5) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64),
-        (14, 6) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64),
-        (14, 7) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64),
-        (14, 8) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64),
-        (14, 9) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (14, 10) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (14, 11) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (14, 12) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (14, 13) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (14, 14) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (14, 15) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (14, 16) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (15, 1) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64),
-        (15, 2) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64),
-        (15, 3) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64),
-        (15, 4) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64),
-        (15, 5) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64),
-        (15, 6) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64),
-        (15, 7) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64),
-        (15, 8) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64),
-        (15, 9) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (15, 10) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (15, 11) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (15, 12) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (15, 13) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (15, 14) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (15, 15) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (15, 16) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (16, 1) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64),
-        (16, 2) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64),
-        (16, 3) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64),
-        (16, 4) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64),
-        (16, 5) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64),
-        (16, 6) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64),
-        (16, 7) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64),
-        (16, 8) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64),
-        (16, 9) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (16, 10) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (16, 11) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (16, 12) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (16, 13) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (16, 14) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (16, 15) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
-        (16, 16) => register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64),
+        (5, 2) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64)
+        }
+        (5, 3) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64)
+        }
+        (5, 4) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64, u64)
+        }
+        (5, 5) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64)
+        }
+        (5, 6) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64)
+        }
+        (5, 7) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64)
+        }
+        (5, 8) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (5, 9) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (5, 10) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (5, 11) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (5, 12) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (5, 13) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (5, 14) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (5, 15) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (5, 16) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (6, 1) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64)
+        }
+        (6, 2) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64)
+        }
+        (6, 3) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64)
+        }
+        (6, 4) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64)
+        }
+        (6, 5) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64)
+        }
+        (6, 6) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64)
+        }
+        (6, 7) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64)
+        }
+        (6, 8) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (6, 9) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (6, 10) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (6, 11) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (6, 12) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (6, 13) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (6, 14) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (6, 15) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (6, 16) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (7, 1) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64)
+        }
+        (7, 2) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64)
+        }
+        (7, 3) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64)
+        }
+        (7, 4) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64)
+        }
+        (7, 5) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64)
+        }
+        (7, 6) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64)
+        }
+        (7, 7) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64)
+        }
+        (7, 8) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (7, 9) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (7, 10) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (7, 11) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (7, 12) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (7, 13) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (7, 14) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (7, 15) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (7, 16) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (8, 1) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64)
+        }
+        (8, 2) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64)
+        }
+        (8, 3) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64)
+        }
+        (8, 4) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64)
+        }
+        (8, 5) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64)
+        }
+        (8, 6) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64)
+        }
+        (8, 7) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64)
+        }
+        (8, 8) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (8, 9) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (8, 10) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (8, 11) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (8, 12) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (8, 13) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (8, 14) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (8, 15) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (8, 16) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (9, 1) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64)
+        }
+        (9, 2) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64)
+        }
+        (9, 3) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64)
+        }
+        (9, 4) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64)
+        }
+        (9, 5) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64)
+        }
+        (9, 6) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64)
+        }
+        (9, 7) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64)
+        }
+        (9, 8) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (9, 9) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (9, 10) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (9, 11) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (9, 12) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (9, 13) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (9, 14) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (9, 15) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (9, 16) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (10, 1) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64)
+        }
+        (10, 2) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64)
+        }
+        (10, 3) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64)
+        }
+        (10, 4) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64)
+        }
+        (10, 5) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64)
+        }
+        (10, 6) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64)
+        }
+        (10, 7) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64)
+        }
+        (10, 8) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (10, 9) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (10, 10) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (10, 11) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (10, 12) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (10, 13) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (10, 14) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (10, 15) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (10, 16) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (11, 1) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64)
+        }
+        (11, 2) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64)
+        }
+        (11, 3) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64)
+        }
+        (11, 4) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64)
+        }
+        (11, 5) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64)
+        }
+        (11, 6) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64)
+        }
+        (11, 7) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64)
+        }
+        (11, 8) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (11, 9) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (11, 10) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (11, 11) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (11, 12) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (11, 13) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (11, 14) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (11, 15) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (11, 16) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (12, 1) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64)
+        }
+        (12, 2) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64)
+        }
+        (12, 3) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64)
+        }
+        (12, 4) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64)
+        }
+        (12, 5) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64)
+        }
+        (12, 6) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64)
+        }
+        (12, 7) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64)
+        }
+        (12, 8) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (12, 9) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (12, 10) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (12, 11) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (12, 12) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (12, 13) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (12, 14) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (12, 15) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (12, 16) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (13, 1) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64)
+        }
+        (13, 2) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64)
+        }
+        (13, 3) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64)
+        }
+        (13, 4) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64)
+        }
+        (13, 5) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64)
+        }
+        (13, 6) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64)
+        }
+        (13, 7) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64)
+        }
+        (13, 8) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (13, 9) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (13, 10) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (13, 11) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (13, 12) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (13, 13) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (13, 14) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (13, 15) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (13, 16) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (14, 1) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64)
+        }
+        (14, 2) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64)
+        }
+        (14, 3) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64)
+        }
+        (14, 4) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64)
+        }
+        (14, 5) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64)
+        }
+        (14, 6) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64)
+        }
+        (14, 7) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64)
+        }
+        (14, 8) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (14, 9) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (14, 10) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (14, 11) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (14, 12) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (14, 13) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (14, 14) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (14, 15) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (14, 16) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (15, 1) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64)
+        }
+        (15, 2) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64)
+        }
+        (15, 3) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64)
+        }
+        (15, 4) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64)
+        }
+        (15, 5) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64)
+        }
+        (15, 6) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64)
+        }
+        (15, 7) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64)
+        }
+        (15, 8) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (15, 9) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (15, 10) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (15, 11) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (15, 12) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (15, 13) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (15, 14) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (15, 15) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (15, 16) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (16, 1) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64)
+        }
+        (16, 2) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64)
+        }
+        (16, 3) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64)
+        }
+        (16, 4) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64)
+        }
+        (16, 5) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64)
+        }
+        (16, 6) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64)
+        }
+        (16, 7) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64)
+        }
+        (16, 8) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (16, 9) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (16, 10) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (16, 11) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (16, 12) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (16, 13) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (16, 14) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (16, 15) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
+        (16, 16) => {
+            register_intermediate!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64; u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+        }
         (i, o) if i > 16 && o > 16 => Err(LinkNumError::InOut(dag_id, node_id)),
         (i, _) if i > 16 => Err(LinkNumError::Input(dag_id, node_id)),
         (_, o) if o > 16 => Err(LinkNumError::Output(dag_id, node_id)),
@@ -605,10 +1127,27 @@ async fn register_intermediate_node(
     }
 }
 
+/// Builds `dag_data` into a registered `Dag`, or records why it failed (see
+/// `awkernel_async_lib::dag::record_build_failure`) and returns the same
+/// error as before. A DAG that fails here got a `dag_id` from `create_dag`
+/// but never reaches `finish_create_dags`/spawn, so without this it would
+/// never appear in the trace dump at all; recording it here means the host
+/// sees a `TRACE_BUILD_MISS` line for it instead of it silently vanishing.
 pub(super) async fn build_dag(dag_data: DagData) -> Result<Arc<Dag>, BuildDagError> {
+    match build_dag_impl(dag_data).await {
+        Ok(dag) => Ok(dag),
+        Err((dag_id, e)) => {
+            record_build_failure(dag_id, format!("{e}"));
+            Err(e)
+        }
+    }
+}
+
+async fn build_dag_impl(dag_data: DagData) -> Result<Arc<Dag>, (u32, BuildDagError)> {
     let dag = create_dag();
     let dag_id = dag.get_id();
 
+    let result: Result<Arc<Dag>, BuildDagError> = async {
     let stats = compute_dag_stats(&dag_data);
     log::debug!(
         "DAG#{dag_id}: volume(C)={}, critical_path(L)={}",
@@ -708,6 +1247,10 @@ pub(super) async fn build_dag(dag_data: DagData) -> Result<Arc<Dag>, BuildDagErr
     }
 
     Ok(dag)
+    }
+    .await;
+
+    result.map_err(|e| (dag_id, e))
 }
 
 #[cfg(test)]

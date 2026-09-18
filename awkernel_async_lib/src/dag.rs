@@ -78,6 +78,7 @@ use alloc::{
     borrow::Cow,
     boxed::Box,
     collections::{btree_map, btree_set::BTreeSet, BTreeMap},
+    string::String,
     sync::Arc,
     vec::Vec,
 };
@@ -88,6 +89,34 @@ use core::{future::Future, pin::Pin, sync::atomic::Ordering, time::Duration};
 use performance::ResponseInfo;
 
 static DAGS: Mutex<Dags> = Mutex::new(Dags::new()); // Set of DAGs.
+
+/// `(dag_id, reason)` for every DAG that got as far as `create_dag()` (so it
+/// has a `dag_id`) but then failed to build -- e.g. rejected by admission
+/// control, or a link-count/arity error -- and so was never spawned and
+/// never appears in `TRACE_TASK`. Recorded independently of the trace
+/// window (see `task::trace`'s `start`/`stop`) because DAG building
+/// typically finishes before auto-trace's start delay elapses; read out by
+/// `task::trace::dump_to_console`, which turns each entry into a
+/// `TRACE_BUILD_MISS` line so host-side tooling (`plot_trace.py`) can count
+/// it as a miss alongside runtime deadline misses instead of it silently
+/// vanishing.
+static BUILD_FAILURES: Mutex<Vec<(u32, String)>> = Mutex::new(Vec::new());
+
+/// Record that `dag_id` failed to build and will therefore never run. See
+/// `BUILD_FAILURES`.
+pub fn record_build_failure(dag_id: u32, reason: String) {
+    let mut node = MCSNode::new();
+    let mut failures = BUILD_FAILURES.lock(&mut node);
+    failures.push((dag_id, reason));
+}
+
+/// Drain and return every build failure recorded so far via
+/// `record_build_failure`. Used by `task::trace::dump_to_console`.
+pub fn take_build_failures() -> Vec<(u32, String)> {
+    let mut node = MCSNode::new();
+    let mut failures = BUILD_FAILURES.lock(&mut node);
+    core::mem::take(&mut *failures)
+}
 
 // The following BTreeMaps use dag_id (u32) as the key.
 static PENDING_TASKS: Mutex<BTreeMap<u32, Vec<PendingTask>>> = Mutex::new(BTreeMap::new());
