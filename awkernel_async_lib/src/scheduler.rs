@@ -113,6 +113,15 @@ pub enum SchedulerType {
     /// executing there (`passive_vp::active_vp_is_busy`).
     PassiveVp(CpuSet),
     GEDF(u64), // relative deadline
+    /// DAG-Fluid's real dispatch (`dag_sched::dp_partition` /
+    /// `scheduler::dp_wrap`): `dag_id`, the DAG this node belongs to. Unlike
+    /// `ClusteredEDF`/`ActiveVp`, the CPU set a `DpWrap` task may run on is
+    /// **not** carried here — it is looked up dynamically at dispatch time
+    /// from `scheduler::dp_wrap`'s own per-CPU entitlement table, which
+    /// changes over time as Deadline Partitions advance (see that module's
+    /// own doc). `cpu_set()`/`is_clustered()` therefore both treat this
+    /// variant like any non-clustered scheduler.
+    DpWrap(u32),
     PrioritizedFIFO(u8),
     PrioritizedRR(u8),
     Panicked,
@@ -125,6 +134,7 @@ impl SchedulerType {
             (SchedulerType::ActiveVp(_, _), SchedulerType::ActiveVp(_, _))
                 | (SchedulerType::MixedVp(_, _, _), SchedulerType::MixedVp(_, _, _))
                 | (SchedulerType::GEDF(_), SchedulerType::GEDF(_))
+                | (SchedulerType::DpWrap(_), SchedulerType::DpWrap(_))
                 | (
                     SchedulerType::ClusteredEDF(_, _),
                     SchedulerType::ClusteredEDF(_, _)
@@ -174,13 +184,13 @@ impl SchedulerType {
         )
     }
 
-    /// True if this scheduler carries DAG light-pool work (currently just
-    /// GEDF). Update this function when adding a second DAG-oriented global
-    /// scheduler; it is the single source of truth for the DAG-pool slice of
-    /// `PRIORITY_LIST` immediately following the clustered prefix (see
-    /// `pool::is_dag_pool_core`).
+    /// True if this scheduler carries DAG light-pool work (GEDF, and
+    /// DAG-Fluid's `DpWrap`). Update this function when adding a further
+    /// DAG-oriented global scheduler; it is the single source of truth for
+    /// the DAG-pool slice of `PRIORITY_LIST` immediately following the
+    /// clustered prefix (see `pool::is_dag_pool_core`).
     pub const fn is_dag_pool_scheduler(&self) -> bool {
-        matches!(self, SchedulerType::GEDF(_))
+        matches!(self, SchedulerType::GEDF(_) | SchedulerType::DpWrap(_))
     }
 }
 
@@ -216,17 +226,25 @@ impl SchedulerType {
 /// - The fifth highest priority.
 ///   - GEDF scheduler.
 /// - The sixth highest priority.
-///   - Prioritized FIFO scheduler.
+///   - DAG-Fluid's `DpWrap` scheduler. Below `GEDF` (both DAG-pool
+///     schedulers, see `is_dag_pool_scheduler`) for the same reason
+///     `PassiveVp` sits below `ClusteredEDF`: Federated/Laxity (`GEDF`) and
+///     DAG-Fluid (`DpWrap`) are alternative policies that never run in the
+///     same build (mutually exclusive Cargo features), so this relative
+///     ordering has no live contention scenario to matter for.
 /// - The seventh highest priority.
+///   - Prioritized FIFO scheduler.
+/// - The eighth highest priority.
 ///   - Prioritized Round-Robin scheduler.
 /// - The lowest priority.
 ///   - Panicked scheduler.
-static PRIORITY_LIST: [SchedulerType; 8] = [
+static PRIORITY_LIST: [SchedulerType; 9] = [
     SchedulerType::ActiveVp(CpuSet::empty(), 0),
     SchedulerType::MixedVp(CpuSet::empty(), 0, CpuSet::empty()),
     SchedulerType::ClusteredEDF(0, CpuSet::empty()),
     SchedulerType::PassiveVp(CpuSet::empty()),
     SchedulerType::GEDF(0),
+    SchedulerType::DpWrap(0),
     SchedulerType::PrioritizedFIFO(0),
     SchedulerType::PrioritizedRR(0),
     SchedulerType::Panicked,
@@ -429,6 +447,7 @@ pub(crate) fn get_scheduler(sched_type: &SchedulerType) -> &'static dyn Schedule
         SchedulerType::PrioritizedFIFO(_) => &prioritized_fifo::SCHEDULER,
         SchedulerType::PrioritizedRR(_) => &prioritized_rr::SCHEDULER,
         SchedulerType::GEDF(_) => &gedf::SCHEDULER,
+        SchedulerType::DpWrap(_) => &dp_wrap::SCHEDULER,
         SchedulerType::ClusteredEDF(_, _) => &clustered_edf::SCHEDULER,
         SchedulerType::ActiveVp(_, _) => &active_vp::SCHEDULER,
         SchedulerType::MixedVp(_, _, _) => &mixed_vp::SCHEDULER,

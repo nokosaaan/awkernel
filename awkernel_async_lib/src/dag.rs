@@ -343,6 +343,28 @@ impl Dag {
         }
     }
 
+    /// The task id `node_id` was spawned as, or `None` if `node_id` does not
+    /// name a node of this DAG. Used by `dag_sched::dp_partition` (DAG-Fluid
+    /// real-machine dispatch) to check whether a specific node has actually
+    /// finished (`task::get_task(id)`'s own `State::Terminated`), not just
+    /// whether its *theoretical* segment deadline has passed — see that
+    /// module's own doc for why the two can differ on real hardware.
+    ///
+    /// Uses [`Mutex::try_lock`] rather than a blocking `lock`: the caller
+    /// runs from timer-interrupt context and must never spin on a lock
+    /// that ordinary (non-interrupt) code elsewhere might hold for a
+    /// non-trivial time (e.g. while routing a pub/sub message through this
+    /// same graph) -- returns `None` (treated as "not confirmed yet", the
+    /// same as `node_id` simply not existing) rather than risk an
+    /// unbounded wait. See `dag_sched::dp_partition::segment_gate_satisfied`'s
+    /// own doc.
+    pub fn get_node_task_id(&self, node_id: u32) -> Option<u32> {
+        let node_idx = to_node_index(node_id);
+        let mut node = MCSNode::new();
+        let graph = self.graph.try_lock(&mut node)?;
+        graph.node_weight(node_idx).map(|info| info.task_id)
+    }
+
     fn add_node_with_topic_edges(
         &self,
         subscribe_topic_names: &[Cow<'static, str>],

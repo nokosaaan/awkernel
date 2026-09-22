@@ -1346,51 +1346,64 @@ async fn build_dag_impl(dag_data: DagData) -> Result<Arc<Dag>, (u32, BuildDagErr
         )
         .ok_or(BuildDagError::DagFluidInfeasible(dag_id))?;
         resource::reserve_dagfluid_capacity(required)?;
-        let sched_type = SchedulerType::GEDF(relative_deadline);
+
+        // Real dispatch (`scheduler::dp_wrap` / `dag_sched::dp_partition`):
+        // compute the Section 8 Step 1 thread-list conversion (Algorithm 1
+        // lines 16-21, see `dag_fluid::assign_segment_deadlines`'s own
+        // doc) and this task's own completion gates
+        // (`dag_fluid::segment_completion_gates`), and register each
+        // segment with the system-wide DP-boundary tracker. Only
+        // meaningful for a task actually decomposed into segments
+        // (`stats.volume > d_star`, i.e. the `τ_paral` case, Section 4.1)
+        // -- a `τ_seq` task (whole DAG stretched into one sequential unit)
+        // has no segments to convert or register, and keeps the plain
+        // `GEDF` placeholder dispatch DAG-Fluid's static-only Phase 0 used
+        // (see `SchedulerType::GEDF`'s own doc: fine for a task DP-Wrap
+        // would reduce to trivially anyway with no segment boundaries to
+        // track).
+        let d_star = crate::dag_fluid::virtual_deadline(period, relative_deadline, stats.critical_path);
+        let schedule = if stats.volume > d_star {
+            crate::dag_fluid::assign_segment_deadlines(&segments, stats.volume, d_star)
+        } else {
+            None
+        };
+
+        let sched_type = if schedule.is_some() {
+            SchedulerType::DpWrap(dag_id)
+        } else {
+            SchedulerType::GEDF(relative_deadline)
+        };
         log::info!(
-            "DAG#{dag_id}: admitted (dagfluid, shared pool) required_capacity={required:.3} -> GEDF(relative_deadline={relative_deadline}) [placeholder dispatch, DP-Wrap pending]"
+            "DAG#{dag_id}: admitted (dagfluid, shared pool) required_capacity={required:.3} -> {sched_type:?}"
         );
 
-        // Phase 1/2 (real-machine DAG-Fluid work): compute the Section 8
-        // Step 1 thread-list conversion (Algorithm 1 lines 16-21, see
-        // `dag_fluid::assign_segment_deadlines`'s own doc), log the
-        // resulting per-segment schedule, and register each segment's own
-        // absolute deadline with the system-wide DP-boundary tracker
-        // (`dag_sched::dp_partition`, Phase 2 -- measurement/logging only
-        // when a boundary actually fires, no dispatch action; see that
-        // module's own doc). The placeholder ClusteredEDF dispatch above
-        // is unaffected either way. Only meaningful for a task actually
-        // decomposed into segments (`stats.volume > d_star`, i.e. the
-        // `τ_paral` case, Section 4.1) -- a `τ_seq` task (whole DAG
-        // stretched into one sequential unit) has no segments to convert
-        // or register.
-        let d_star = crate::dag_fluid::virtual_deadline(period, relative_deadline, stats.critical_path);
-        if stats.volume > d_star {
-            if let Some(schedule) =
-                crate::dag_fluid::assign_segment_deadlines(&segments, stats.volume, d_star)
-            {
-                let offsets = crate::dag_fluid::segment_release_offsets(&schedule);
-                // All of this DAG's own segments share one release-time
-                // baseline (see `dp_partition`'s own doc on why
-                // `Time::now()` at admission stands in for the papers'
-                // `r_i,j` anchor here).
-                let release = awkernel_lib::time::Time::now();
-                for (j, (seg, offset)) in schedule.iter().zip(offsets.iter()).enumerate() {
-                    log::info!(
-                        "DAG#{dag_id}: segment[{j}] l={} m={} r={offset:.3} d={:.3} theta={:.3}",
-                        seg.duration,
-                        seg.concurrency,
-                        seg.relative_deadline,
-                        seg.rate
-                    );
-                    awkernel_async_lib::dag_sched::dp_partition::register_segment(
-                        dag_id,
-                        j,
-                        release,
-                        *offset,
-                        seg.relative_deadline,
-                    );
-                }
+        if let Some(schedule) = schedule {
+            let offsets = crate::dag_fluid::segment_release_offsets(&schedule);
+            let gates = crate::dag_fluid::segment_completion_gates(&dag_data);
+            // All of this DAG's own segments share one release-time
+            // baseline (see `dp_partition`'s own doc on why
+            // `Time::now()` at admission stands in for the papers'
+            // `r_i,j` anchor here).
+            let release = awkernel_lib::time::Time::now();
+            for (j, (seg, offset)) in schedule.iter().zip(offsets.iter()).enumerate() {
+                log::info!(
+                    "DAG#{dag_id}: segment[{j}] l={} m={} r={offset:.3} d={:.3} theta={:.3}",
+                    seg.duration,
+                    seg.concurrency,
+                    seg.relative_deadline,
+                    seg.rate
+                );
+                let gate = gates.get(j).cloned().unwrap_or_default();
+                awkernel_async_lib::dag_sched::dp_partition::register_segment(
+                    dag_id,
+                    j,
+                    release,
+                    *offset,
+                    seg.relative_deadline,
+                    seg.concurrency,
+                    seg.rate,
+                    gate,
+                );
             }
         }
         sched_type

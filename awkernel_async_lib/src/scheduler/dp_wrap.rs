@@ -46,7 +46,31 @@
 //! posture `dag_fluid::heavy_capacity_and_deadline` documents for its own
 //! analogous precondition).
 
-use alloc::vec::Vec;
+use super::{
+    get_priority, peek_preemption_pending, push_preemption_pending, Scheduler, SchedulerType,
+    Task, GLOBAL_WAKE_GET_MUTEX,
+};
+use crate::{
+    dag::calculate_and_update_dag_deadline,
+    task::{
+        get_task, get_task_running, get_tasks_running, set_current_task, set_need_preemption,
+        State, MAX_TASK_PRIORITY,
+    },
+};
+use alloc::{
+    collections::{BTreeMap, BinaryHeap},
+    sync::Arc,
+    vec::Vec,
+};
+use array_macro::array;
+use awkernel_lib::{
+    cpu::NUM_MAX_CPU,
+    sync::mutex::{MCSNode, Mutex},
+};
+use core::{
+    cmp::max,
+    sync::atomic::{AtomicU32, Ordering},
+};
 
 /// McNaughton's wrap-around algorithm. `densities` are `(BlockId, density)`
 /// pairs in the order to lay them along the number line (Funk et al.'s "in
@@ -87,6 +111,384 @@ pub fn wrap_blocks(densities: &[(usize, f64)], m: usize) -> Vec<Vec<(usize, f64,
     }
 
     result
+}
+
+/// DAG-Fluid's real dispatch (`SchedulerType::DpWrap`): a task's own CPU
+/// affinity is not fixed at spawn time (unlike `ClusteredEDF`/`ActiveVp`)
+/// -- it is *which DAG a CPU is currently entitled to*, recomputed by
+/// [`recompute_and_apply`] every time `dag_sched::dp_partition` advances a
+/// Deadline Partition (see that module's own doc for when that happens,
+/// and this module's own doc for the per-DP-not-per-migration-instant
+/// scope decision). Once a CPU is entitled to `dag_id`, any of that DAG's
+/// own ready nodes may run there -- entitlement is per-DAG, not per
+/// individual node or per-segment (see this crate's own design discussion
+/// in `applications/rd_gen_to_dags/src/dag_fluid.rs`'s
+/// `segment_completion_gates` doc for why per-segment tracking was ruled
+/// out: a node's own execution can legitimately span more than one
+/// segment).
+const NO_DAG: u32 = u32::MAX;
+
+/// Per-CPU: the `dag_id` this CPU is currently entitled to, or [`NO_DAG`].
+/// Read by [`DpWrapScheduler::get_next`] (a plain array load, O(1),
+/// alloc-free, panic-free), written only by [`recompute_and_apply`] (boot
+/// admission and Deadline-Partition-boundary time, not itself RT-critical
+/// dispatch-path code, though it is called from timer-interrupt context —
+/// see `dag_sched::dp_partition::on_dp_boundary`'s own WCET note).
+static ENTITLEMENT: [AtomicU32; NUM_MAX_CPU] = array![_ => AtomicU32::new(NO_DAG); NUM_MAX_CPU];
+
+/// The `dag_id` `cpu_id` is currently entitled to, if any.
+pub(crate) fn entitlement_of(cpu_id: usize) -> Option<u32> {
+    match ENTITLEMENT.get(cpu_id) {
+        Some(slot) => match slot.load(Ordering::Relaxed) {
+            NO_DAG => None,
+            dag_id => Some(dag_id),
+        },
+        None => None,
+    }
+}
+
+/// One ready DAG-Fluid node, queued under its own `dag_id` (see
+/// [`DpWrapData`]). Ordering is identical to `gedf::GEDFTask`'s (same
+/// `(absolute_deadline, node_priority, wake_time)` key, smaller
+/// `absolute_deadline` first) -- reused verbatim rather than re-derived,
+/// since within one DAG's own ready pool the tie-break rationale is the
+/// same one GEDF already documents.
+struct DpWrapTask {
+    task: Arc<Task>,
+    absolute_deadline: u64,
+    node_priority: u64,
+    wake_time: u64,
+}
+
+impl PartialOrd for DpWrapTask {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for DpWrapTask {
+    fn eq(&self, other: &Self) -> bool {
+        self.absolute_deadline == other.absolute_deadline
+            && self.node_priority == other.node_priority
+            && self.wake_time == other.wake_time
+    }
+}
+
+impl Ord for DpWrapTask {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        match other.absolute_deadline.cmp(&self.absolute_deadline) {
+            core::cmp::Ordering::Equal => match self.node_priority.cmp(&other.node_priority) {
+                core::cmp::Ordering::Equal => other.wake_time.cmp(&self.wake_time),
+                ord => ord,
+            },
+            ord => ord,
+        }
+    }
+}
+
+impl Eq for DpWrapTask {}
+
+/// One ready-queue per `dag_id`, rather than one global queue (GEDF) or one
+/// queue per fixed `CpuSet` (ClusteredEDF): the entitled CPU set for a
+/// given `dag_id` changes over time (see [`ENTITLEMENT`]), but the queue of
+/// *that DAG's own* ready nodes does not need to move when it does.
+struct DpWrapData {
+    queues: BTreeMap<u32, BinaryHeap<DpWrapTask>>,
+}
+
+impl DpWrapData {
+    fn new() -> Self {
+        Self {
+            queues: BTreeMap::new(),
+        }
+    }
+}
+
+pub struct DpWrapScheduler {
+    data: Mutex<Option<DpWrapData>>,
+    priority: u8,
+}
+
+impl Scheduler for DpWrapScheduler {
+    fn wake_task(&self, task: Arc<Task>) {
+        let (wake_time, absolute_deadline, node_priority, dag_id) = {
+            let mut node_inner = MCSNode::new();
+            let mut info = task.info.lock(&mut node_inner);
+            let dag_info = info.get_dag_info();
+            match info.scheduler_type {
+                SchedulerType::DpWrap(dag_id) => {
+                    let wake_time = awkernel_lib::delay::uptime();
+                    let (absolute_deadline, node_priority) = if let Some(ref dag_info) = dag_info {
+                        (
+                            calculate_and_update_dag_deadline(dag_info, wake_time),
+                            crate::dag::get_node_priority(dag_info.dag_id, dag_info.node_id),
+                        )
+                    } else {
+                        // Every `DpWrap` task is a DAG-Fluid node and should
+                        // always carry `dag_info` -- defensive fallback
+                        // mirroring GEDF's own "no dag_info" arm rather than
+                        // panicking on a should-never-happen case.
+                        (wake_time, 0)
+                    };
+
+                    task.priority
+                        .update_priority_info(self.priority, MAX_TASK_PRIORITY - absolute_deadline);
+                    info.update_absolute_deadline(absolute_deadline);
+
+                    (wake_time, absolute_deadline, node_priority, dag_id)
+                }
+                _ => unreachable!(),
+            }
+        };
+
+        let mut node = MCSNode::new();
+        let _guard = GLOBAL_WAKE_GET_MUTEX.lock(&mut node);
+        if !self.invoke_preemption(task.clone(), dag_id) {
+            let mut node_inner = MCSNode::new();
+            let mut data = self.data.lock(&mut node_inner);
+            let internal_data = data.get_or_insert_with(DpWrapData::new);
+            internal_data
+                .queues
+                .entry(dag_id)
+                .or_default()
+                .push(DpWrapTask {
+                    task: task.clone(),
+                    absolute_deadline,
+                    node_priority,
+                    wake_time,
+                });
+        }
+    }
+
+    fn get_next(&self, execution_ensured: bool) -> Option<Arc<Task>> {
+        let cpu_id = awkernel_lib::cpu::cpu_id();
+        let dag_id = entitlement_of(cpu_id)?;
+
+        let mut node = MCSNode::new();
+        let mut data = self.data.lock(&mut node);
+        let data = (*data).as_mut()?;
+        let queue = data.queues.get_mut(&dag_id)?;
+
+        loop {
+            let task = queue.pop()?;
+
+            {
+                let mut node = MCSNode::new();
+                let mut task_info = task.task.info.lock(&mut node);
+
+                if matches!(task_info.state, State::Terminated | State::Panicked) {
+                    continue;
+                }
+
+                if task_info.state == State::Preempted {
+                    task_info.need_preemption = false;
+                }
+                if execution_ensured {
+                    task_info.state = State::Running;
+                    set_current_task(awkernel_lib::cpu::cpu_id(), task.task.id);
+                }
+            }
+
+            return Some(task.task);
+        }
+    }
+
+    fn scheduler_name(&self) -> SchedulerType {
+        SchedulerType::DpWrap(0)
+    }
+
+    fn priority(&self) -> u8 {
+        self.priority
+    }
+}
+
+pub static SCHEDULER: DpWrapScheduler = DpWrapScheduler {
+    data: Mutex::new(None),
+    priority: get_priority(&SchedulerType::DpWrap(0)),
+};
+
+impl DpWrapScheduler {
+    /// Same shape as `gedf::GEDFScheduler::invoke_preemption`, restricted to
+    /// CPUs currently entitled to `dag_id` (see [`ENTITLEMENT`]) rather than
+    /// every running CPU -- a `DpWrap` task must never preempt a CPU that
+    /// some *other* DAG currently owns the entitlement for.
+    fn invoke_preemption(&self, task: Arc<Task>, dag_id: u32) -> bool {
+        let tasks_running = get_tasks_running()
+            .into_iter()
+            .filter(|rt| rt.task_id != 0) // Filter out idle CPUs.
+            .collect::<alloc::vec::Vec<_>>();
+
+        if tasks_running.iter().any(|rt| rt.task_id == task.id) {
+            return false;
+        }
+
+        // An idle CPU currently entitled to `dag_id` will pick this task up
+        // on its own next `get_next` poll; no forced preemption needed.
+        let entitled_idle_cpu_exists = (1..awkernel_lib::cpu::num_cpu()).any(|cpu| {
+            entitlement_of(cpu) == Some(dag_id) && get_task_running(cpu).task_id == 0
+        });
+        if entitled_idle_cpu_exists {
+            return false;
+        }
+
+        let preemption_target = tasks_running
+            .iter()
+            .filter(|rt| {
+                !crate::task::is_cpu_reserved(rt.cpu_id) && entitlement_of(rt.cpu_id) == Some(dag_id)
+            })
+            .filter_map(|rt| {
+                get_task(rt.task_id).map(|t| {
+                    let highest_pending = peek_preemption_pending(rt.cpu_id).unwrap_or(t.clone());
+                    (max(t, highest_pending), rt.cpu_id)
+                })
+            })
+            .min();
+
+        let Some((target_task, target_cpu)) = preemption_target else {
+            return false;
+        };
+        if task > target_task {
+            push_preemption_pending(target_cpu, task);
+            let preempt_irq = awkernel_lib::interrupt::get_preempt_irq();
+            set_need_preemption(target_task.id, target_cpu);
+            awkernel_lib::interrupt::send_ipi(preempt_irq, target_cpu as u32);
+            return true;
+        }
+
+        false
+    }
+}
+
+/// Recompute the current Deadline Partition's per-CPU entitlement from
+/// every currently-active DAG-Fluid segment's own `(dag_id, concurrency,
+/// rate)` (`rate` = that segment's `theta_i,j`, `concurrency` = `m_i,j`
+/// interchangeable virtual threads -- see
+/// `rd_gen_to_dags::dag_fluid::SegmentSchedule`'s own doc), and apply it.
+/// Called by `dag_sched::dp_partition` once a Deadline Partition boundary
+/// is actually acted on (its own completion-gate having been satisfied —
+/// see that module's own doc for why advancing is gated on real node
+/// completion, not just the theoretical deadline).
+///
+/// Each virtual thread becomes one entry in [`wrap_blocks`]'s `densities`
+/// list (`dag_id` pushed `concurrency` times), so a segment with
+/// `concurrency > 1` can legitimately land on more than one processor at
+/// once -- real parallelism, matching that segment's own concurrency (see
+/// this crate's own worked example in code review discussion: a segment
+/// with two ready sibling nodes and two entitled CPUs runs both at once,
+/// each CPU independently popping one from the DAG's shared ready queue).
+///
+/// # Scope: per-DP granularity, not per-migration-instant
+/// This applies one flat entitlement for the CPU for the *entire* current
+/// DP, rather than the paper's own intra-DP wrap-around switching
+/// (McNaughton's sub-slice migration points within a single DP) — doing
+/// that precisely would need a second, per-CPU-armed intra-DP timer/IPI
+/// channel, traded off (in design discussion) against reusing
+/// `dp_partition`'s existing once-per-DP-boundary signal for both lower
+/// total IPI traffic and no added measurement bias (an extra IPI hop's
+/// latency on every sub-slice switch would pollute the very
+/// theory-vs-reality latency numbers this project measures). A block
+/// [`wrap_blocks`] splits across two processors (a "migrating" block, in
+/// the paper's own terms) is approximated here by assigning the whole DP
+/// to whichever processor holds the *larger* of its two shares.
+///
+/// # WCET note
+/// Bounded by `active.len()` (at most the number of currently-admitted
+/// DAG-Fluid DAGs) times each one's own `concurrency` for the `densities`
+/// build, then by `pool.len()` (at most `num_cpu()`) for [`wrap_blocks`]
+/// and the apply loop; allocates (`Vec`/`BinaryHeap` growth) but only ever
+/// from `dag_sched::dp_partition::on_dp_boundary`'s timer-interrupt
+/// context, not a per-task dispatch path — see that module's own "not
+/// WCET-proven" scope note, which this function shares.
+pub fn recompute_and_apply(active: &[(u32, u32, f64)]) {
+    let mut slot_table: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+    let mut densities: alloc::vec::Vec<(usize, f64)> = alloc::vec::Vec::new();
+    for &(dag_id, concurrency, rate) in active {
+        for _ in 0..concurrency {
+            densities.push((slot_table.len(), rate));
+            slot_table.push(dag_id);
+        }
+    }
+
+    let pool: alloc::vec::Vec<usize> =
+        crate::dag_sched::resource::dagfluid_pool_cpu_set().iter().collect();
+    if pool.is_empty() {
+        return;
+    }
+
+    let plan = wrap_blocks(&densities, pool.len());
+
+    for (proc, &cpu_id) in pool.iter().enumerate() {
+        let winner = plan.get(proc).and_then(|blocks| {
+            blocks
+                .iter()
+                .max_by(|a, b| (a.2 - a.1).partial_cmp(&(b.2 - b.1)).unwrap_or(core::cmp::Ordering::Equal))
+        });
+        let new_dag = winner.map(|&(slot_idx, _, _)| slot_table[slot_idx]);
+        apply_entitlement(cpu_id, new_dag);
+    }
+}
+
+/// Apply one CPU's new entitlement decision from [`recompute_and_apply`],
+/// forcing a preemption only when a concrete successor task is already
+/// in hand -- never an unconditional "stop whatever is running" (see
+/// `scheduler::active_vp::tick_budget`'s own doc for the reproduced hang
+/// that pattern caused in `task::preempt::do_preemption`: it only
+/// context-switches when `PREEMPTION_PENDING_TASKS` holds a specific
+/// successor, so pushing a preemption request with none in mind can strand
+/// the displaced task forever).
+fn apply_entitlement(cpu_id: usize, new_dag: Option<u32>) {
+    let Some(slot) = ENTITLEMENT.get(cpu_id) else {
+        return;
+    };
+
+    let mut node = MCSNode::new();
+    let _guard = GLOBAL_WAKE_GET_MUTEX.lock(&mut node);
+
+    let old = slot.swap(new_dag.unwrap_or(NO_DAG), Ordering::Relaxed);
+    let old_dag = if old == NO_DAG { None } else { Some(old) };
+    if old_dag == new_dag {
+        return;
+    }
+    let Some(dag_id) = new_dag else {
+        return;
+    };
+
+    let running = get_task_running(cpu_id);
+    if running.task_id == 0 {
+        // Idle: nudge it to re-poll `get_next_task` now, rather than wait
+        // for `task::wake_workers`'s own next pass.
+        awkernel_lib::cpu::wake_cpu(cpu_id);
+        return;
+    }
+
+    if let Some(t) = get_task(running.task_id) {
+        let mut node2 = MCSNode::new();
+        if t.info.lock(&mut node2).get_dag_info().map(|d| d.dag_id) == Some(dag_id) {
+            // Already running dag_id's own work (e.g. entitlement moved
+            // away and immediately back) -- nothing to do.
+            return;
+        }
+    }
+
+    let mut node_inner = MCSNode::new();
+    let mut data = SCHEDULER.data.lock(&mut node_inner);
+    let Some(data) = data.as_mut() else {
+        return;
+    };
+    let Some(queue) = data.queues.get_mut(&dag_id) else {
+        return;
+    };
+    let Some(successor) = queue.pop() else {
+        // No ready node for the newly-entitled DAG yet -- leave the
+        // current task running rather than force a switch with no
+        // successor in hand (see this function's own doc).
+        return;
+    };
+
+    push_preemption_pending(cpu_id, successor.task);
+    let preempt_irq = awkernel_lib::interrupt::get_preempt_irq();
+    set_need_preemption(running.task_id, cpu_id);
+    awkernel_lib::interrupt::send_ipi(preempt_irq, cpu_id as u32);
 }
 
 #[cfg(test)]

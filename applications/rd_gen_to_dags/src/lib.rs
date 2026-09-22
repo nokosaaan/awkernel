@@ -112,7 +112,14 @@ pub async fn run() {
     // admitted, so every segment `build_dag`'s `dagfluid` arm registers
     // below has somewhere to land. A no-op for federated/laxity.
     #[cfg(feature = "dagfluid")]
-    awkernel_async_lib::dag_sched::dp_partition::install();
+    {
+        awkernel_async_lib::dag_sched::dp_partition::install();
+        // The background task that actually checks completion gates and
+        // advances segments (see that module's own "Split design" doc --
+        // this must run from ordinary task context, never from the
+        // DpBoundary timer callback `install()` just registered).
+        awkernel_async_lib::dag_sched::dp_partition::spawn_advancer();
+    }
 
     let dags_data = match parse_yaml::parse_dags(DAG_FILES) {
         Ok(data) => data,
@@ -141,10 +148,14 @@ pub async fn run() {
     }
 
     // Every DAG-Fluid segment across every admitted DAG is registered by
-    // now (admission is sequential and complete at this point); arm for
-    // the earliest one before dispatch starts.
+    // now (admission is sequential and complete at this point): grant each
+    // DAG's own segment-0 entitlement before dispatch starts, then arm the
+    // timer for the earliest boundary.
     #[cfg(feature = "dagfluid")]
-    awkernel_async_lib::dag_sched::dp_partition::arm_next();
+    {
+        awkernel_async_lib::dag_sched::dp_partition::apply_initial_entitlement();
+        awkernel_async_lib::dag_sched::dp_partition::arm_next();
+    }
 
     match finish_create_dags(&success_build_dags).await {
         Ok(_) => {
