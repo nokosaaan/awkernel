@@ -38,8 +38,10 @@
 //! `gate_nodes` list ([`rd_gen_to_dags::dag_fluid::segment_completion_gates`]'s
 //! own output — the node ids the idealized timeline expects to finish
 //! exactly at this segment's end): [`advance_due_segments`] only actually
-//! advances past a boundary once every node in its gate has reached
-//! `task::State::Terminated` for real. Until then, the CPU(s) currently
+//! advances past a boundary once every node in its gate has really
+//! processed at least one period (see [`gate_satisfied_from_cache`]'s own
+//! doc for why `DagInfo::period_index`, not `TaskInfo`'s own `State`, is
+//! the right signal for this). Until then, the CPU(s) currently
 //! entitled to that DAG keep their entitlement (the segment does **not**
 //! lose its capacity share), the overrun is logged once, and the boundary
 //! is retried on the advancer's own next poll — the gap between
@@ -74,7 +76,7 @@
 //! The fix is this module's current split: [`on_dp_boundary`] touches
 //! only [`PENDING`] (proven safe from interrupt context) purely to timestamp
 //! *when* each boundary's theoretical deadline was actually observed;
-//! every DAG/task lookup (`segment_gate_satisfied`) and every `CURRENT`/
+//! every DAG/task lookup (`resolve_gate_period_indices`) and every `CURRENT`/
 //! entitlement mutation happens only from [`advance_due_segments`],
 //! which never runs from interrupt context.
 //!
@@ -99,13 +101,16 @@
 //! see `rd_gen_to_dags::build_dag`'s `dagfluid` arm); this is a
 //! documented approximation, not the papers' own semantics.
 
-use alloc::{boxed::Box, collections::BTreeMap, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, sync::Arc, vec::Vec};
 use awkernel_lib::{
     sync::mutex::{MCSNode, Mutex},
     time::Time,
     timer::{self, TimerRequestId},
 };
-use core::time::Duration;
+use core::{
+    sync::atomic::{AtomicU32, Ordering},
+    time::Duration,
+};
 
 /// How often [`advance_due_segments`] polls [`PENDING`] for boundaries
 /// whose completion gate has newly cleared. Short enough that a
@@ -130,6 +135,19 @@ struct BoundaryEntry {
     /// node ids the idealized timeline expects to finish exactly at this
     /// segment's end.
     gate_nodes: Vec<u32>,
+    /// Lazily resolved, one slot per `gate_nodes` entry (same order,
+    /// same length): that node's own `DagInfo::period_index` handle,
+    /// once [`resolve_gate_period_indices`] has managed to look it up
+    /// (`None` until then — a node's task may not exist yet the first
+    /// few times this is checked, since [`register_segment`] runs before
+    /// `register_dag_nodes` spawns the actual tasks). Cached rather than
+    /// re-resolved every poll: `period_index` is `Arc<AtomicU32>`, so once
+    /// cached, checking it is a lock-free atomic load, needing no further
+    /// `Dag`/`Task` lock acquisition at all — see
+    /// [`gate_satisfied_from_cache`]'s own doc for why this is a safer
+    /// completion signal than `TaskInfo`'s own `State` in the first
+    /// place.
+    gate_period_indices: Vec<Option<Arc<AtomicU32>>>,
     /// Set by [`on_dp_boundary`] once it has logged this entry's
     /// scheduled-vs-actual latency measurement, so a repeat timer fire
     /// (or the timer simply never being re-armed for it again, see that
@@ -190,6 +208,7 @@ pub fn register_segment(
     gate_nodes: Vec<u32>,
 ) {
     let scheduled = release + millis_f64_to_duration(offset_ms + duration_ms);
+    let gate_period_indices = alloc::vec![None; gate_nodes.len()];
     let mut node = MCSNode::new();
     let mut pending = PENDING.lock(&mut node);
     pending.push(BoundaryEntry {
@@ -199,6 +218,7 @@ pub fn register_segment(
         concurrency,
         rate,
         gate_nodes,
+        gate_period_indices,
         logged: false,
         warned_overrun: false,
     });
@@ -236,62 +256,84 @@ pub fn apply_initial_entitlement() {
     apply_current_entitlement();
 }
 
-/// Whether every node in `gate_nodes` has really reached
-/// `task::State::Terminated` — see this module's own doc on why a
-/// boundary's advance is gated on this rather than the clock alone.
+/// For each `cached` slot still `None`, try to resolve its gate node's own
+/// `DagInfo::period_index` handle and fill it in. Only ever called from
+/// [`advance_due_segments`] (ordinary task context) — see this module's
+/// own "Split design" doc for why this must never run from
+/// [`on_dp_boundary`]'s interrupt context.
 ///
-/// Only ever called from [`advance_due_segments`] (ordinary task
-/// context) — see this module's own "Split design" doc for why this
-/// must never run from [`on_dp_boundary`]'s interrupt context.
-///
-/// `dag_id` not naming a live DAG is treated as "already satisfied"
-/// (defensive: should only happen for a should-never-occur
-/// admission/registration mismatch, and retrying forever against a
-/// phantom DAG would be worse than moving on). A gate node's own lookup
-/// (`Dag::get_node_task_id`, `task::get_task`, `TaskInfo`'s own state)
-/// failing is treated as "**not** yet satisfied" — the opposite default,
-/// because silently treating a real, still-tracked node as done is the
-/// one mistake this whole gate exists to prevent.
-///
-/// # Known gap: `State::Terminated` never happens for a live DAG's own
-/// reactor tasks
-/// Confirmed by direct observation once the interrupt-safety redesign
-/// above made it possible to actually exercise this function against a
-/// real DAG: a periodic source reactor (`spawn_periodic_reactor`) loops
-/// forever (`interval.tick().await` each period) and an
-/// intermediate/sink reactor loops waiting for its next pub/sub message
-/// — neither ever reaches `State::Terminated` during normal steady-state
-/// operation (only DAG teardown would do that). This means a gate whose
-/// nodes are still "alive" (the normal case for any DAG still running)
-/// can never actually be satisfied by this check as written, and every
-/// segment boundary after admission will overrun forever. The correct
-/// signal is "this node finished its *current job's* contribution" —
-/// most likely tracked via `DagInfo::period_index`'s own progression
-/// (already read elsewhere for tracing) or `State::Waiting` (idle between
-/// releases), not `State::Terminated` — but this needs its own design
-/// pass (in particular, distinguishing "just finished period N" from
-/// "hasn't started its first period yet", which can look similar from
-/// `TaskInfo::get_state()` alone). Left as `Terminated` for now since
-/// fixing the interrupt-context hang was this redesign's scope; the
-/// overrun this gap causes is at least safe and clearly logged, not
-/// silent.
-fn segment_gate_satisfied(dag_id: u32, gate_nodes: &[u32]) -> bool {
+/// A node's task may not exist yet the first few times this runs
+/// (`register_segment` runs before `register_dag_nodes` spawns the
+/// actual tasks — see [`BoundaryEntry::gate_period_indices`]'s own doc),
+/// so a lookup failing here just leaves that slot `None` for the next
+/// poll to retry; already-resolved slots are left untouched (`period_index`
+/// is stable for a task's whole lifetime, no need to re-resolve).
+fn resolve_gate_period_indices(
+    dag_id: u32,
+    gate_nodes: &[u32],
+    cached: &mut [Option<Arc<AtomicU32>>],
+) {
     let Some(dag) = crate::dag::get_dag(dag_id) else {
-        return true;
+        return;
     };
-    gate_nodes.iter().all(|&node_id| {
+    for (slot, &node_id) in cached.iter_mut().zip(gate_nodes) {
+        if slot.is_some() {
+            continue;
+        }
         let Some(task_id) = dag.get_node_task_id(node_id) else {
-            return false;
+            continue;
         };
         let Some(task) = crate::task::get_task(task_id) else {
-            return false;
+            continue;
         };
-        let mut node = MCSNode::new();
-        let state = task.info.lock(&mut node).get_state();
-        matches!(
-            state,
-            crate::task::State::Terminated | crate::task::State::Panicked
-        )
+        let dag_info = {
+            let mut node = MCSNode::new();
+            let guard = task.info.lock(&mut node);
+            guard.get_dag_info()
+        };
+        if let Some(dag_info) = dag_info {
+            *slot = Some(dag_info.period_index);
+        }
+    }
+}
+
+/// Whether every gate node's own `DagInfo::period_index` (see
+/// [`resolve_gate_period_indices`]) shows it has processed at least one
+/// period. A `None` slot (not yet resolved: either the task doesn't exist
+/// yet, or its very first period hasn't released) counts as **not**
+/// satisfied — the same "unknown means not yet done" default
+/// [`resolve_gate_period_indices`]'s own doc uses, for the same reason.
+///
+/// # Why `period_index`, not `TaskInfo`'s own `State`
+/// An earlier version checked `State::Terminated`. Confirmed by direct
+/// observation once the interrupt-safety redesign above made it possible
+/// to actually exercise this against a real DAG: a periodic source
+/// reactor (`spawn_periodic_reactor`) loops forever (`interval.tick()
+/// .await` each period) and an intermediate/sink reactor loops waiting
+/// for its next pub/sub message — neither ever reaches `State::Terminated`
+/// during normal steady-state operation (only DAG teardown would do
+/// that), so that check could never actually be satisfied.
+///
+/// `State::Waiting` (idle between releases) was considered instead, but
+/// rejected: a reactor sits in `Waiting` both *before* its current
+/// period's inputs have arrived and *after* it finishes that period
+/// waiting for the next one — the same state value for two opposite
+/// answers to "has this period's work been done yet?", which risks a
+/// false "satisfied" the moment a node happens to be waiting for its
+/// *first* period rather than genuinely done with it.
+///
+/// `DagInfo::period_index` (already tracked elsewhere for trace
+/// labeling) has no such ambiguity: it starts at the explicit sentinel
+/// [`crate::task::NO_PERIOD_YET`] and only ever moves forward, exactly
+/// once per period actually processed, so "has it moved past
+/// `NO_PERIOD_YET`" unambiguously means "has completed at least one
+/// period" — the correct signal for this one-shot (admission-time)
+/// gate. It is also `Arc<AtomicU32>`, so checking it needs no `Dag`/`Task`
+/// lock at all once cached (see [`resolve_gate_period_indices`]).
+fn gate_satisfied_from_cache(cached: &[Option<Arc<AtomicU32>>]) -> bool {
+    cached.iter().all(|slot| match slot {
+        Some(period_index) => period_index.load(Ordering::Acquire) != crate::task::NO_PERIOD_YET,
+        None => false,
     })
 }
 
@@ -372,7 +414,7 @@ fn on_dp_boundary() {
 
 /// Poll [`PENDING`] once for boundaries whose scheduled time has arrived,
 /// and actually advance the ones whose completion gate
-/// ([`segment_gate_satisfied`]) is satisfied — see this module's own
+/// ([`gate_satisfied_from_cache`]) is satisfied — see this module's own
 /// "Split design" doc for why this, and not [`on_dp_boundary`], is where
 /// the DAG/task lookups and `CURRENT`/entitlement mutation happen. Called
 /// from ordinary (non-interrupt) task context only — see
@@ -381,9 +423,12 @@ fn on_dp_boundary() {
 /// - **Satisfied**: removed from [`PENDING`], and [`CURRENT`] advanced to
 ///   whatever segment of that `dag_id` comes next (or removed entirely if
 ///   this was its last segment).
-/// - **Not yet satisfied**: left in [`PENDING`]; the overrun is logged
-///   once (guarded by [`BoundaryEntry::warned_overrun`], so a still-blocked
-///   entry doesn't spam the log on every poll).
+/// - **Not yet satisfied**: left in [`PENDING`] (with whatever gate
+///   handles [`resolve_gate_period_indices`] managed to newly cache
+///   written back, so later polls don't redo that resolution); the
+///   overrun is logged once (guarded by
+///   [`BoundaryEntry::warned_overrun`], so a still-blocked entry doesn't
+///   spam the log on every poll).
 ///
 /// [`apply_current_entitlement`] is called once at the end if anything
 /// actually advanced.
@@ -391,26 +436,49 @@ fn advance_due_segments() {
     let now = Time::now();
 
     // Snapshot every due entry's own fields up front (one `PENDING` lock,
-    // released before `segment_gate_satisfied` looks up live DAG/task
-    // state, which takes other locks of its own).
-    let due: Vec<(usize, u32, usize, Time, Vec<u32>)> = {
+    // released before `resolve_gate_period_indices` looks up live
+    // DAG/task state, which takes other locks of its own). `gate_nodes`
+    // and `gate_period_indices` are cheap to clone (small `Vec`, and
+    // `Option<Arc<_>>` clones are just refcount bumps).
+    let due: Vec<(usize, u32, usize, Vec<u32>, Vec<Option<Arc<AtomicU32>>>)> = {
         let mut node = MCSNode::new();
         let pending = PENDING.lock(&mut node);
         pending
             .iter()
             .enumerate()
             .filter(|(_, e)| e.scheduled <= now)
-            .map(|(i, e)| (i, e.dag_id, e.segment_index, e.scheduled, e.gate_nodes.clone()))
+            .map(|(i, e)| {
+                (
+                    i,
+                    e.dag_id,
+                    e.segment_index,
+                    e.gate_nodes.clone(),
+                    e.gate_period_indices.clone(),
+                )
+            })
             .collect()
     };
 
     let mut resolved_indices: Vec<usize> = Vec::new();
     let mut newly_blocked: Vec<usize> = Vec::new();
-    for (i, dag_id, _segment_index, _scheduled, gate_nodes) in &due {
-        if segment_gate_satisfied(*dag_id, gate_nodes) {
-            resolved_indices.push(*i);
+    let mut cache_updates: Vec<(usize, Vec<Option<Arc<AtomicU32>>>)> = Vec::new();
+    for (i, dag_id, _segment_index, gate_nodes, mut cached) in due {
+        resolve_gate_period_indices(dag_id, &gate_nodes, &mut cached);
+        if gate_satisfied_from_cache(&cached) {
+            resolved_indices.push(i);
         } else {
-            newly_blocked.push(*i);
+            newly_blocked.push(i);
+        }
+        cache_updates.push((i, cached));
+    }
+
+    if !cache_updates.is_empty() {
+        let mut node = MCSNode::new();
+        let mut pending = PENDING.lock(&mut node);
+        for (i, cached) in cache_updates {
+            if let Some(entry) = pending.get_mut(i) {
+                entry.gate_period_indices = cached;
+            }
         }
     }
 
