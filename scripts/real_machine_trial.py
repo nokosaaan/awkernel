@@ -48,7 +48,19 @@ DEFAULT_STAGING_DIR = Path("/home/nokosan/ws/RD-Gen/test/awkernel_staged")
 # build time via cargo feature, not at runtime -- None means Federated, the
 # default that needs no extra feature. Threaded into the build via the
 # Makefile's EXTRA_FEATURES (see run_build).
-ALGO_FEATURES = {"federated": None, "vfed": "rd_gen_vfed", "laxity": "rd_gen_laxity"}
+#
+# "dagfluid" wires DAG-Fluid's real DP-Wrap dispatch (scheduler::dp_wrap /
+# dag_sched::dp_partition) rather than a fresh policy -- see those modules'
+# own docs for its two known real-machine-only caveats: entitlement is
+# coarse-grained per DAG (not per segment/node), and the completion gate's
+# overrun latency (theory vs. actual completion) is exactly the number this
+# trial should be read for, not a pass/fail signal on its own.
+ALGO_FEATURES = {
+    "federated": None,
+    "vfed": "rd_gen_vfed",
+    "laxity": "rd_gen_laxity",
+    "dagfluid": "rd_gen_dagfluid",
+}
 
 # bcdedit's own field labels ("identifier"/"description") are localized to the
 # target's Windows display language, so we don't match on them -- only on the
