@@ -307,11 +307,19 @@ def stage_group(pool_dir, dag_names, staging_dir):
     return staged
 
 
-def run_build(awkernel_dir, staging_dir, dry_run, algorithm="federated"):
+def run_build(awkernel_dir, staging_dir, dry_run, algorithm="federated", smt_disable=True):
     make_args = ["make", "x86_64", "RELEASE=1"]
-    extra_feature = ALGO_FEATURES[algorithm]
-    if extra_feature:
-        make_args.append(f"EXTRA_FEATURES=--features {extra_feature}")
+    features = []
+    algo_feature = ALGO_FEATURES[algorithm]
+    if algo_feature:
+        features.append(algo_feature)
+    # On by default: the real target's BIOS exposes no HT on/off toggle (see
+    # kernel_main.rs's own doc comment on the filter), so every trial parks
+    # SMT sibling APs unless explicitly asked not to.
+    if smt_disable:
+        features.append("smt_disable")
+    if features:
+        make_args.append(f"EXTRA_FEATURES=--features {','.join(features)}")
     print(f"[build] RD_GEN_DAGS_DIR={staging_dir} {' '.join(make_args)}")
     if dry_run:
         return
@@ -436,13 +444,23 @@ def run_trial_for_algorithm(args, state, boot_cache_path, batch_id, algorithm, s
     one admission-policy algorithm. `selection_info` (the DAG selection, made
     once per batch by `run_trial`) is copied into this trial's own state
     record verbatim, alongside `batch_id`/`algorithm`, so every algorithm run
-    against the same DAG(s) shares a `dag_selection_batch` value."""
+    against the same DAG(s) shares a `dag_selection_batch` value.
+
+    The log file is named after `batch_id`, not a per-run counter: every
+    algorithm in one `--algorithms` sweep runs against the identical staged
+    DAG(s) (see `run_trial`), so `log/trace_<batch_id>_<algorithm>.log` for
+    each algorithm groups the directly comparable runs under one shared
+    number (e.g. `trace_211_vfed.log` / `trace_211_laxity.log`), rather than
+    each algorithm drifting onto its own trial number. `trial_id` still
+    uniquely numbers this run in `state`/`dag_selection.json` (multiple
+    algorithms share one `batch_id`, so it alone can't serve as a state
+    record's primary key)."""
     trial_id = next_trial_id(state)
-    print(f"--- trial {trial_id} (algorithm={algorithm}) ---")
+    print(f"--- trial {batch_id} (algorithm={algorithm}, smt_disable={args.smt_disable}) ---")
 
-    run_build(args.awkernel_dir, args.staging_dir, args.dry_run, algorithm)
+    run_build(args.awkernel_dir, args.staging_dir, args.dry_run, algorithm, args.smt_disable)
 
-    log_path = args.log_dir / f"{args.log_prefix}{trial_id}_{algorithm}.log"
+    log_path = args.log_dir / f"{args.log_prefix}{batch_id}_{algorithm}.log"
     minicom_handle = start_minicom(args.serial_device, args.baud, log_path, args.sudo_minicom, args.dry_run)
     time.sleep(2)  # let minicom attach to the port before we trigger the reboot
 
@@ -466,6 +484,7 @@ def run_trial_for_algorithm(args, state, boot_cache_path, batch_id, algorithm, s
         "trial": trial_id,
         "dag_selection_batch": batch_id,
         "algorithm": algorithm,
+        "smt_disable": args.smt_disable,
         **selection_info,
         "log_file": str(log_path),
         "boot_entry": boot_entry,
@@ -480,7 +499,7 @@ def run_trial_for_algorithm(args, state, boot_cache_path, batch_id, algorithm, s
         status = "marker found"
     else:
         status = f"timed out after {args.max_wait_secs}s"
-    print(f"[trial {trial_id}] done ({status}) -> {log_path}")
+    print(f"[trial {batch_id}] done ({status}) -> {log_path}")
 
 
 def run_trial(args, state, boot_cache_path, trials_jsonl):
@@ -568,8 +587,13 @@ def parse_args():
                          "is what actually absorbs the wait until the target reboots back to "
                          "its normal OS on its own, so keep it above AUTO_REBOOT_SECS too")
     p.add_argument("--rediscover-boot-entry", action="store_true", help="force re-querying bcdedit instead of using the cached GUID")
+    p.add_argument("--no-smt-disable", action="store_true",
+                    help="build without the kernel's smt_disable feature, i.e. leave HT sibling "
+                         "APs woken (default: smt_disable is on -- the target's BIOS has no HT "
+                         "toggle, see kernel_main.rs's own doc comment on the filter)")
     p.add_argument("--dry-run", action="store_true", help="print planned actions without touching the network/build/serial port")
     args = p.parse_args()
+    args.smt_disable = not args.no_smt_disable
     if args.log_dir is None:
         args.log_dir = args.awkernel_dir / "log"
     args.algorithms = [a.strip() for a in args.algorithms.split(",") if a.strip()]
