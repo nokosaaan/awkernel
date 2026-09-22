@@ -221,7 +221,7 @@ pub(crate) fn decompose_segments(dag_data: &DagData) -> Vec<Segment> {
 /// are `T_i`/`D_i`/`L_i`. Always returns `deadline` (row 1) when `period >=
 /// deadline` (constrained deadline, `T_i/D_i >= 1`) — the only case this
 /// crate's own generated pools ever exercise.
-fn virtual_deadline(period: u64, deadline: u64, critical_path: u64) -> u64 {
+pub(crate) fn virtual_deadline(period: u64, deadline: u64, critical_path: u64) -> u64 {
     let t = period as f64;
     let d = deadline as f64;
     let l = critical_path as f64;
@@ -264,10 +264,11 @@ fn libm_sqrt(x: f64) -> f64 {
 
 /// Algorithm 1 (2022 paper), lines 1–15 only: the iterative greedy
 /// light/heavy split, returning `(C^H_i, D^H_i)`. Lines 16–21 (assigning
-/// each segment's own relative deadline `d_i,j`) are omitted — they exist
-/// to support the paper's *dynamic* dispatch layer (DP-Wrap), out of scope
-/// for this static-only admission test; only the aggregate `C^H_i`/`D^H_i`
-/// feed into [`required_capacity`].
+/// each segment's own relative deadline `d_i,j`) are handled separately by
+/// [`assign_segment_deadlines`] (dynamic-dispatch support, added for the
+/// real-machine DAG-Fluid work's Phase 1 -- DP boundary computation only,
+/// no dispatch yet); only the aggregate `C^H_i`/`D^H_i` computed here feed
+/// into [`required_capacity`].
 ///
 /// Returns `None` if every segment ends up peeled as light (no heavy
 /// segment remains) or either aggregate is non-positive — per Lemma 5.2 of
@@ -304,6 +305,147 @@ fn heavy_capacity_and_deadline(
     (c_r > 0.0 && d_r > 0.0).then_some((c_r, d_r))
 }
 
+/// One entry of [`assign_segment_deadlines`]'s output, in `segments`' own
+/// (chronological/timeline) order — NOT the `m_i,j`-sorted order Algorithm
+/// 1 uses internally only for light/heavy classification (lines 1–15).
+/// Section 8's `r_i,j` (segment release offset) needs the timeline order to
+/// accumulate predecessor segments' deadlines; see
+/// [`crate::dag_fluid`]'s own module doc and
+/// [`segment_release_offsets`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SegmentSchedule {
+    /// `l_i,j`: this segment's own thread WCET, copied from the input
+    /// [`Segment`].
+    pub duration: u64,
+    /// `m_i,j`: this segment's thread count, copied from the input
+    /// [`Segment`].
+    pub concurrency: u32,
+    /// `d_i,j` (Algorithm 1 lines 17/20): this segment's own relative
+    /// deadline.
+    pub relative_deadline: f64,
+    /// `θ_i,j` (Definition 4.1, `l_i,j / d_i,j`): the execution rate every
+    /// thread in this segment runs at once dispatched. `1.0` for light
+    /// segments (by construction: `d_i,j == l_i,j` there); at most `1.0`
+    /// for heavy segments too, per Lemma 5.4's own proof (not re-derived
+    /// here — this function trusts the paper's proof rather than
+    /// asserting it defensively, since `#[cfg(test)]` below checks it
+    /// against the paper's own worked example instead).
+    pub rate: f64,
+}
+
+/// Algorithm 1 (2022 paper) lines 16–21, in full — reproduced here
+/// verbatim from the primary source (Guan, Peng, Qiao, IEEE TC 2022,
+/// Section 4.1):
+///
+/// ```text
+///  1: σ^H_i ← σ_i, σ^L_i ← ∅
+///  2: sort σ^H_i in increasing order of m_i,j
+///  3: C^r_i ← C_i, D^r_i ← D*_i
+///  4: while σ^H_i ≠ ∅ do
+///  5:   get the head element σ_i,h from σ^H_i
+///  6:   if C^r_i / (D^r_i · m_i,h) > 1 then
+///  7:     σ^L_i ← σ^L_i ∪ {σ_i,h}
+///  8:     σ^H_i ← σ^H_i \ {σ_i,h}
+///  9:     C^r_i ← C^r_i − l_i,h·m_i,h
+/// 10:     D^r_i ← D^r_i − l_i,h
+/// 11:   else
+/// 12:     break
+/// 13:   end if
+/// 14: end while
+/// 15: C^H_i ← C^r_i, D^H_i ← D^r_i
+/// 16: for each element σ_i,j in σ^L_i do
+/// 17:   d_i,j ← l_i,j
+/// 18: end for
+/// 19: for each element σ_i,j in σ^H_i do
+/// 20:   d_i,j ← D^H_i · m_i,j · l_i,j / C^H_i
+/// 21: end for
+/// ```
+///
+/// Lines 1–15 are re-run here rather than reusing
+/// [`heavy_capacity_and_deadline`] (which computes the exact same
+/// `(C^H_i, D^H_i)`): that function only returns the aggregate, having
+/// already discarded *which* original segments ended up in `σ^L_i` versus
+/// `σ^H_i`, which lines 16–21 need per segment. Duplicating lines 1–15
+/// here (instead of changing that function's return type) keeps
+/// [`required_capacity`]'s already-tested static-admission path — Phase 0
+/// of the real-machine DAG-Fluid work, already wired into
+/// `crate::build_dag` and shipped — untouched by this Phase 1 addition.
+///
+/// Returns `None` under the same conditions as
+/// [`heavy_capacity_and_deadline`] (no heavy segment, or a non-positive
+/// aggregate) — both call sites should only reach this once
+/// `required_capacity` has already confirmed `volume > virtual_deadline`
+/// admits at least one heavy segment (Lemma 5.2).
+pub fn assign_segment_deadlines(
+    segments: &[Segment],
+    volume: u64,
+    virtual_deadline: u64,
+) -> Option<Vec<SegmentSchedule>> {
+    let mut order: Vec<usize> = (0..segments.len()).collect();
+    order.sort_by_key(|&i| segments[i].concurrency);
+
+    let mut c_r = volume as f64;
+    let mut d_r = virtual_deadline as f64;
+    let mut light: alloc::collections::BTreeSet<usize> = alloc::collections::BTreeSet::new();
+
+    for &i in &order {
+        let seg = &segments[i];
+        let m = seg.concurrency as f64;
+        if c_r / (d_r * m) > 1.0 {
+            light.insert(i);
+            c_r -= seg.duration as f64 * m;
+            d_r -= seg.duration as f64;
+        } else {
+            break;
+        }
+    }
+
+    if light.len() == segments.len() {
+        return None;
+    }
+    if !(c_r > 0.0 && d_r > 0.0) {
+        return None;
+    }
+    let c_heavy = c_r;
+    let d_heavy = d_r;
+
+    let mut out = Vec::with_capacity(segments.len());
+    for (i, seg) in segments.iter().enumerate() {
+        let relative_deadline = if light.contains(&i) {
+            seg.duration as f64 // line 17
+        } else {
+            // line 20
+            d_heavy * seg.concurrency as f64 * seg.duration as f64 / c_heavy
+        };
+        let rate = seg.duration as f64 / relative_deadline; // Definition 4.1
+        out.push(SegmentSchedule {
+            duration: seg.duration,
+            concurrency: seg.concurrency,
+            relative_deadline,
+            rate,
+        });
+    }
+    Some(out)
+}
+
+/// Section 4.2's `r_i,j` (each segment's own release offset, relative to
+/// the task's own release/arrival time — not an absolute system time):
+/// "we set `r_i,j` equal [to] the release time of `τ_i` plus the sum of
+/// all its predecessor segments' relative deadlines." `schedule` must be
+/// in the same chronological order [`assign_segment_deadlines`] returns
+/// it in; `offsets[j]` is the sum of `schedule[..j]`'s own
+/// `relative_deadline`s (`offsets[0] == 0.0`, the first segment starts at
+/// the task's own release time).
+pub fn segment_release_offsets(schedule: &[SegmentSchedule]) -> Vec<f64> {
+    let mut offsets = Vec::with_capacity(schedule.len());
+    let mut acc = 0.0;
+    for s in schedule {
+        offsets.push(acc);
+        acc += s.relative_deadline;
+    }
+    offsets
+}
+
 /// Algorithm 2 (2022 paper)'s per-task capacity contribution: `None` if the
 /// task is unconditionally infeasible (`critical_path > deadline`, i.e.
 /// `L_i > D_i`, violating this crate's own base precondition — mirrors
@@ -338,6 +480,26 @@ pub fn required_capacity(
     Some(concurrent_jobs * rate)
 }
 
+/// Round `capacity` (a [`required_capacity`] value, or any other
+/// non-negative real-valued core requirement) up to the nearest whole core
+/// count, clamped to at least 1 -- a real fluid-rate task never needs zero
+/// *dedicated* cores once mapped onto the placeholder ClusteredEDF dispatch
+/// [`crate::build_dag`] uses under the `dagfluid` feature (see that
+/// module's own doc for why dispatch is a placeholder, not real DP-Fair).
+/// `f64::ceil()` needs `std`/`libm`, unavailable in this crate's `no_std`
+/// kernel build (same constraint as [`libm_sqrt`]), so this rounds via an
+/// integer cast (truncates towards zero for a non-negative input, i.e.
+/// floors) plus a comparison, rather than a float method.
+pub fn ceil_capacity_to_cores(capacity: f64) -> u16 {
+    let floor = capacity as u16;
+    let rounded = if (floor as f64) < capacity {
+        floor.saturating_add(1)
+    } else {
+        floor
+    };
+    rounded.max(1)
+}
+
 /// A whole task set of `(volume, period, critical_path, deadline,
 /// segments)` tuples is feasible on `m` shared cores iff
 /// `sum(required_capacity_i) <= m` — a direct transcription of Algorithm
@@ -360,6 +522,48 @@ mod tests {
     use super::*;
     use crate::dag_stats::compute_dag_stats;
     use crate::parse_yaml::parse_dags;
+
+    /// Algorithm 1's own worked example (2022 paper, Fig. 1 and its
+    /// caption): `C_i=120, L_i=60, T_i=90, D_i=80`, five segments
+    /// `(l_i,j, m_i,j)` = `(10,1), (10,2), (20,3), (10,2), (10,1)` in
+    /// timeline order. `T_i/D_i = 90/80 = 1.125 >= 1` selects Table 1's
+    /// row 1, so `D*_i = D_i = 80` (confirmed by
+    /// `virtual_deadline(90, 80, 60) == 80` below). The paper's own text
+    /// states the resulting `D^H_i=60, C^H_i=100` directly (Fig. 1's
+    /// caption), and Fig. 1d gives `d_i,j` = 10, 12, 36, 12, 10 and
+    /// `θ_i,j` = 1, 5/6, 5/9, 5/6, 1 for the five segments in order —
+    /// every value checked here is transcribed from the primary source,
+    /// not derived.
+    #[test]
+    fn test_assign_segment_deadlines_matches_paper_worked_example() {
+        let segments = [
+            Segment { duration: 10, concurrency: 1 },
+            Segment { duration: 10, concurrency: 2 },
+            Segment { duration: 20, concurrency: 3 },
+            Segment { duration: 10, concurrency: 2 },
+            Segment { duration: 10, concurrency: 1 },
+        ];
+        let volume = 120;
+        let d_star = virtual_deadline(90, 80, 60);
+        assert_eq!(d_star, 80);
+
+        let schedule = assign_segment_deadlines(&segments, volume, d_star).unwrap();
+        let deadlines: Vec<f64> = schedule.iter().map(|s| s.relative_deadline).collect();
+        assert_eq!(deadlines, alloc::vec![10.0, 12.0, 36.0, 12.0, 10.0]);
+
+        let rates: Vec<f64> = schedule.iter().map(|s| s.rate).collect();
+        assert_eq!(rates, alloc::vec![1.0, 10.0 / 12.0, 20.0 / 36.0, 10.0 / 12.0, 1.0]);
+        // Paper's own Definition 4.1 states the light-segment rate as
+        // exactly 5/6 and 5/9 -- confirm the fractions reduce to those.
+        assert!((rates[1] - 5.0 / 6.0).abs() < 1e-9);
+        assert!((rates[2] - 5.0 / 9.0).abs() < 1e-9);
+
+        let offsets = segment_release_offsets(&schedule);
+        assert_eq!(offsets, alloc::vec![0.0, 10.0, 22.0, 58.0, 70.0]);
+        // Sum of every segment's own relative deadline equals D*_i (Eq. 3).
+        let total: f64 = deadlines.iter().sum();
+        assert!((total - d_star as f64).abs() < 1e-9);
+    }
 
     #[test]
     fn test_decompose_segments_linear_chain() {

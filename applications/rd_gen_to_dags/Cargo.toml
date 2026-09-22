@@ -31,13 +31,17 @@ nanoseconds = []
 # Scheduler Type
 prioritized_fifo = []
 
-# Admission policy: federated (default, admit_dag), vfed (admit_one), or
-# laxity (plain GEDF + a self-derived static Laxity-Based node priority --
-# see build_dag.rs's own doc comment on that arm for why it has no published
-# primary source). Mutually exclusive; see build_dag.rs's feature-gated
-# admission call site.
+# Admission policy: federated (default, admit_dag), vfed (admit_one), laxity
+# (plain GEDF + a self-derived static Laxity-Based node priority -- see
+# build_dag.rs's own doc comment on that arm for why it has no published
+# primary source), or dagfluid (DAG-Fluid's static admission test only --
+# dispatch is a ClusteredEDF-over-ceil(required_capacity)-cores placeholder,
+# not the papers' fluid-rate DP-Fair/DP-Wrap execution; see build_dag.rs's
+# own doc comment on that arm). Mutually exclusive; see build_dag.rs's
+# feature-gated admission call site.
 vfed = []
 laxity = []
+dagfluid = []
 
 # For test
 std = ["awkernel_lib/std", "awkernel_async_lib/std"]

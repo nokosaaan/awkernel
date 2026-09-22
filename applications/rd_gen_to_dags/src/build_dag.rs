@@ -4,19 +4,29 @@ use crate::dag_stats::compute_node_laxity;
 use crate::parse_yaml::{DagData, NodeData};
 use crate::time_unit::{convert_duration, simulated_execution_time};
 
-use alloc::{borrow::Cow, format, sync::Arc, vec::Vec};
-#[cfg(not(any(feature = "vfed", feature = "laxity")))]
+use alloc::{borrow::Cow, collections::BTreeMap, format, sync::Arc, vec::Vec};
+#[cfg(not(any(feature = "vfed", feature = "laxity", feature = "dagfluid")))]
 use awkernel_async_lib::dag_sched::policy::federated::admit_dag;
 #[cfg(feature = "vfed")]
-use awkernel_async_lib::dag_sched::policy::vfed::{self, PackingStrategy, VFedError};
+use awkernel_async_lib::dag_sched::policy::vfed::{self, VFedError};
+#[cfg(feature = "dagfluid")]
+use awkernel_async_lib::dag_sched::resource::{self, ResourceError};
 use awkernel_async_lib::{
     dag::{create_dag, record_build_failure, Dag},
-    dag_sched::{metrics::DagMetrics, policy::federated::FederatedError},
+    dag_sched::policy::federated::FederatedError,
     scheduler::SchedulerType,
 };
+#[cfg(not(any(feature = "vfed", feature = "dagfluid")))]
+use awkernel_async_lib::dag_sched::metrics::DagMetrics;
 
-#[cfg(all(feature = "vfed", feature = "laxity"))]
-compile_error!("features \"vfed\" and \"laxity\" select mutually exclusive admission policies");
+#[cfg(any(
+    all(feature = "vfed", feature = "laxity"),
+    all(feature = "vfed", feature = "dagfluid"),
+    all(feature = "laxity", feature = "dagfluid"),
+))]
+compile_error!(
+    "features \"vfed\", \"laxity\", and \"dagfluid\" select mutually exclusive admission policies"
+);
 
 /// Represents errors related to the number of links for a node.
 /// `(DAG ID, Node ID)` tuple to identify the specific DAG and node where the error occurred.
@@ -65,6 +75,16 @@ pub(crate) enum BuildDagError {
     /// infeasible under any policy, not specific to this one.
     #[cfg(feature = "laxity")]
     LaxityInfeasible(u32),
+    /// (`dagfluid` feature only) `dag_fluid::required_capacity` returned
+    /// `None`: either `critical_path > relative_deadline` (unconditionally
+    /// infeasible under any policy), or a degenerate segment decomposition
+    /// (see that function's own doc).
+    #[cfg(feature = "dagfluid")]
+    DagFluidInfeasible(u32),
+    /// (`dagfluid` feature only) the shared core ledger could not satisfy
+    /// this DAG's `ceil(required_capacity)`-cores placeholder request.
+    #[cfg(feature = "dagfluid")]
+    DagFluidResource(ResourceError),
 }
 
 impl core::fmt::Display for BuildDagError {
@@ -88,7 +108,21 @@ impl core::fmt::Display for BuildDagError {
                 f,
                 "DAG#{dag_id}: relative_deadline <= critical_path, unconditionally infeasible"
             ),
+            #[cfg(feature = "dagfluid")]
+            BuildDagError::DagFluidInfeasible(dag_id) => write!(
+                f,
+                "DAG#{dag_id}: relative_deadline <= critical_path, unconditionally infeasible"
+            ),
+            #[cfg(feature = "dagfluid")]
+            BuildDagError::DagFluidResource(e) => write!(f, "{e}"),
         }
+    }
+}
+
+#[cfg(feature = "dagfluid")]
+impl From<ResourceError> for BuildDagError {
+    fn from(e: ResourceError) -> Self {
+        BuildDagError::DagFluidResource(e)
     }
 }
 
@@ -1133,6 +1167,7 @@ async fn register_intermediate_node(
 /// but never reaches `finish_create_dags`/spawn, so without this it would
 /// never appear in the trace dump at all; recording it here means the host
 /// sees a `TRACE_BUILD_MISS` line for it instead of it silently vanishing.
+#[cfg(not(feature = "vfed"))]
 pub(super) async fn build_dag(dag_data: DagData) -> Result<Arc<Dag>, BuildDagError> {
     match build_dag_impl(dag_data).await {
         Ok(dag) => Ok(dag),
@@ -1143,6 +1178,66 @@ pub(super) async fn build_dag(dag_data: DagData) -> Result<Arc<Dag>, BuildDagErr
     }
 }
 
+/// V-Fed's counterpart to `build_dag`, taking an `assignment` already
+/// decided by a prior `vfed::admit_batch` call over the whole task set
+/// (see `build_dag_impl_vfed`'s own doc).
+#[cfg(feature = "vfed")]
+pub(super) async fn build_dag_vfed(
+    dag_data: DagData,
+    assignment: vfed::VFedAssignment,
+) -> Result<Arc<Dag>, BuildDagError> {
+    match build_dag_impl_vfed(dag_data, assignment).await {
+        Ok(dag) => Ok(dag),
+        Err((dag_id, e)) => {
+            record_build_failure(dag_id, format!("{e}"));
+            Err(e)
+        }
+    }
+}
+
+/// Register every node of `dag_data` against `dag` under `sched_type`,
+/// setting each node's laxity-derived priority too when `_node_laxity` is
+/// `Some` (`laxity` feature only -- `None` on every other build, including
+/// V-Fed's, which has no notion of node-level laxity). Shared tail of both
+/// Federated/Laxity's per-DAG admission (`build_dag_impl`) and V-Fed's batch
+/// admission (`build_dag_impl_vfed`), so this loop -- and its
+/// `node.get_id()`-ordering assumption -- exists in exactly one place
+/// regardless of which admission policy decided `sched_type`.
+async fn register_dag_nodes(
+    dag: &Arc<Dag>,
+    dag_data: &DagData,
+    sched_type: SchedulerType,
+    _node_laxity: Option<BTreeMap<u32, u64>>,
+) -> Result<(), BuildDagError> {
+    for node in dag_data.get_nodes() {
+        if node.is_source() {
+            register_source_node(dag, node, sched_type).await?;
+        } else if node.is_sink() {
+            register_sink_node(dag, node, sched_type).await?;
+        } else {
+            register_intermediate_node(dag, node, sched_type).await?;
+        }
+
+        // Shorter laxity = more urgent: invert so it maps to a *larger*
+        // `node_priority`, matching `gedf.rs`'s ordering
+        // (`GEDFTask`'s `Ord` picks the *largest* `node_priority` first
+        // among equal-deadline tasks). Called here, before
+        // `finish_create_dags`, per `set_node_priority`'s own doc
+        // requirement. `node.get_id()` is safe to use directly as the
+        // runtime `node_id`: `DagData::get_nodes()` is backed by a
+        // `BTreeMap<u32, NodeData>` keyed by this same id
+        // (parse_yaml.rs's `convert_to_dag`), so registration happens in
+        // ascending-id order and lines up with the sequential id
+        // `register_*_reactor` assigns internally.
+        #[cfg(feature = "laxity")]
+        if let Some(laxity) = _node_laxity.as_ref().and_then(|m| m.get(&node.get_id())) {
+            dag.set_node_priority(node.get_id(), u64::MAX.saturating_sub(*laxity));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "vfed"))]
 async fn build_dag_impl(dag_data: DagData) -> Result<Arc<Dag>, (u32, BuildDagError)> {
     let dag = create_dag();
     let dag_id = dag.get_id();
@@ -1168,9 +1263,10 @@ async fn build_dag_impl(dag_data: DagData) -> Result<Arc<Dag>, (u32, BuildDagErr
         .and_then(NodeData::get_end_to_end_deadline)
         .ok_or(BuildDagError::MissingDagTiming(dag_id))?;
 
+    #[cfg(not(feature = "dagfluid"))]
     let config = DagMetrics::from_static(stats.volume, stats.critical_path, period, relative_deadline);
 
-    #[cfg(not(any(feature = "vfed", feature = "laxity")))]
+    #[cfg(not(any(feature = "laxity", feature = "dagfluid")))]
     let sched_type = {
         let assignment = admit_dag(config)?;
         let sched_type = assignment.scheduler_type;
@@ -1188,16 +1284,6 @@ async fn build_dag_impl(dag_data: DagData) -> Result<Arc<Dag>, (u32, BuildDagErr
                 assignment.source
             );
         }
-        sched_type
-    };
-
-    #[cfg(feature = "vfed")]
-    let sched_type = {
-        let assignment = vfed::admit_one(config, PackingStrategy::FirstFit)?;
-        let sched_type = assignment
-            .into_scheduler_type(relative_deadline)
-            .ok_or(BuildDagError::VFedSchedulerTypeMissing(dag_id))?;
-        log::info!("DAG#{dag_id}: admitted (vfed) as {assignment:?} -> {sched_type:?}");
         sched_type
     };
 
@@ -1220,33 +1306,139 @@ async fn build_dag_impl(dag_data: DagData) -> Result<Arc<Dag>, (u32, BuildDagErr
         (sched_type, laxity)
     };
 
-    for node in dag_data.get_nodes() {
-        if node.is_source() {
-            register_source_node(&dag, node, sched_type).await?;
-        } else if node.is_sink() {
-            register_sink_node(&dag, node, sched_type).await?;
-        } else {
-            register_intermediate_node(&dag, node, sched_type).await?;
-        }
+    // DAG-Fluid, static admission only (see `crate::dag_fluid`'s own doc):
+    // `required_capacity` gives this DAG's own real-valued contribution to
+    // the shared capacity pool -- order-independent (unlike V-Fed's
+    // Algorithm 1, `Σrequired_capacity_i <= m` is a plain running sum), so
+    // admitting one DAG at a time in file order, same as Federated/Laxity
+    // above, is exactly equivalent to a batch run; no `admit_batch`-style
+    // two-pass dance is needed here. Dispatch is a *placeholder*, not the
+    // papers' DP-Fair/DP-Wrap fluid-rate execution: this DAG's fractional
+    // capacity is rounded up to `ceil(required_capacity)` whole cores
+    // (`dag_fluid::ceil_capacity_to_cores`) and reserved as an ordinary
+    // ClusteredEDF cluster from the same shared ledger Federated/V-Fed use
+    // (`dag_sched::resource`). See this crate's own `dag_fluid.rs` module
+    // doc for the dynamic (DP-Fair/DP-Wrap) dispatch work this stands in
+    // for.
+    #[cfg(feature = "dagfluid")]
+    let sched_type = {
+        let segments = crate::dag_fluid::decompose_segments(&dag_data);
+        let required = crate::dag_fluid::required_capacity(
+            stats.volume,
+            period,
+            stats.critical_path,
+            relative_deadline,
+            &segments,
+        )
+        .ok_or(BuildDagError::DagFluidInfeasible(dag_id))?;
+        let cores_needed = crate::dag_fluid::ceil_capacity_to_cores(required);
+        let cores = resource::allocate_cluster(cores_needed)?;
+        let sched_type = SchedulerType::ClusteredEDF(relative_deadline, cores);
+        let core_ids: Vec<usize> = cores.iter().collect();
+        log::info!(
+            "DAG#{dag_id}: admitted (dagfluid, static) required_capacity={required:.3} -> ClusteredEDF(relative_deadline={relative_deadline}, cores={core_ids:?})"
+        );
 
-        // Shorter laxity = more urgent: invert so it maps to a *larger*
-        // `node_priority`, matching `gedf.rs`'s ordering
-        // (`GEDFTask`'s `Ord` picks the *largest* `node_priority` first
-        // among equal-deadline tasks). Called here, before
-        // `finish_create_dags`, per `set_node_priority`'s own doc
-        // requirement. `node.get_id()` is safe to use directly as the
-        // runtime `node_id`: `DagData::get_nodes()` is backed by a
-        // `BTreeMap<u32, NodeData>` keyed by this same id
-        // (parse_yaml.rs's `convert_to_dag`), so registration happens in
-        // ascending-id order and lines up with the sequential id
-        // `register_*_reactor` assigns internally.
-        #[cfg(feature = "laxity")]
-        if let Some(&laxity) = node_laxity.get(&node.get_id()) {
-            dag.set_node_priority(node.get_id(), u64::MAX.saturating_sub(laxity));
+        // Phase 1 (real-machine DAG-Fluid work): compute the Section 8
+        // Step 1 thread-list conversion (Algorithm 1 lines 16-21, see
+        // `dag_fluid::assign_segment_deadlines`'s own doc) and log the
+        // resulting per-segment schedule and this DAG's own nearest DP
+        // boundary candidate -- computation and logging only, no dispatch
+        // action taken on it yet (the placeholder ClusteredEDF dispatch
+        // above is unaffected). Only meaningful for a task actually
+        // decomposed into segments (`stats.volume > d_star`, i.e. the
+        // `τ_paral` case, Section 4.1) -- a `τ_seq` task (whole DAG
+        // stretched into one sequential unit) has no segments to convert.
+        let d_star = crate::dag_fluid::virtual_deadline(period, relative_deadline, stats.critical_path);
+        if stats.volume > d_star {
+            if let Some(schedule) =
+                crate::dag_fluid::assign_segment_deadlines(&segments, stats.volume, d_star)
+            {
+                let offsets = crate::dag_fluid::segment_release_offsets(&schedule);
+                for (j, (seg, offset)) in schedule.iter().zip(offsets.iter()).enumerate() {
+                    log::info!(
+                        "DAG#{dag_id}: segment[{j}] l={} m={} r={offset:.3} d={:.3} theta={:.3}",
+                        seg.duration,
+                        seg.concurrency,
+                        seg.relative_deadline,
+                        seg.rate
+                    );
+                }
+                // Nearest DP boundary candidate this DAG itself contributes:
+                // the earliest segment absolute deadline (r_i,j + d_i,j)
+                // relative to this DAG's own release time. A real
+                // system-wide DP-partition tracker (across every
+                // concurrently-admitted DAG-Fluid task, wired to
+                // `awkernel_lib::timer`'s `TimerRequestId::DpBoundary`) is
+                // out of scope for this phase -- see this crate's
+                // `dag_fluid.rs` module doc.
+                if let Some((j, boundary)) = schedule
+                    .iter()
+                    .zip(offsets.iter())
+                    .map(|(seg, offset)| offset + seg.relative_deadline)
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| a.total_cmp(b))
+                {
+                    log::info!(
+                        "DAG#{dag_id}: nearest DP boundary candidate at segment[{j}], t={boundary:.3} (relative to this DAG's own release)"
+                    );
+                }
+            }
         }
-    }
+        sched_type
+    };
+
+    #[cfg(feature = "laxity")]
+    register_dag_nodes(&dag, &dag_data, sched_type, Some(node_laxity)).await?;
+    #[cfg(not(feature = "laxity"))]
+    register_dag_nodes(&dag, &dag_data, sched_type, None).await?;
 
     Ok(dag)
+    }
+    .await;
+
+    result.map_err(|e| (dag_id, e))
+}
+
+/// V-Fed's batch counterpart to `build_dag_impl`: `assignment` was already
+/// decided for the *whole* task set by `vfed::admit_batch` (see that
+/// function's own doc, and `dag_sched::policy::vfed`'s module doc for why
+/// V-Fed needs this instead of one `admit_one` call per DAG -- Algorithm 1
+/// sorts and packs the entire batch together, so admitting DAGs one at a
+/// time in file order isn't equivalent). This function only turns that
+/// pre-decided `assignment` into node registrations; it does no admission
+/// of its own.
+#[cfg(feature = "vfed")]
+async fn build_dag_impl_vfed(
+    dag_data: DagData,
+    assignment: vfed::VFedAssignment,
+) -> Result<Arc<Dag>, (u32, BuildDagError)> {
+    let dag = create_dag();
+    let dag_id = dag.get_id();
+
+    let result: Result<Arc<Dag>, BuildDagError> = async {
+        let stats = compute_dag_stats(&dag_data);
+        log::debug!(
+            "DAG#{dag_id}: volume(C)={}, critical_path(L)={}",
+            stats.volume,
+            stats.critical_path
+        );
+
+        let relative_deadline = dag_data
+            .get_nodes()
+            .iter()
+            .find(|node| node.is_sink())
+            .and_then(NodeData::get_end_to_end_deadline)
+            .ok_or(BuildDagError::MissingDagTiming(dag_id))?;
+
+        let sched_type = assignment
+            .into_scheduler_type(relative_deadline)
+            .ok_or(BuildDagError::VFedSchedulerTypeMissing(dag_id))?;
+        log::info!("DAG#{dag_id}: admitted (vfed, batch) as {assignment:?} -> {sched_type:?}");
+
+        register_dag_nodes(&dag, &dag_data, sched_type, None).await?;
+
+        Ok(dag)
     }
     .await;
 

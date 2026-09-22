@@ -101,6 +101,11 @@ rd_gen_vfed = ["rd_gen_to_dags", "rd_gen_to_dags/vfed"]
 # Switch rd_gen_to_dags's admission policy from Federated (default) to the
 # static Laxity-Based baseline (plain GEDF + per-node priority).
 rd_gen_laxity = ["rd_gen_to_dags", "rd_gen_to_dags/laxity"]
+# Switch rd_gen_to_dags's admission policy from Federated (default) to
+# DAG-Fluid's static admission test (placeholder ClusteredEDF dispatch, not
+# the papers' fluid-rate DP-Fair/DP-Wrap execution -- see build_dag.rs's own
+# doc comment on that arm).
+rd_gen_dagfluid = ["rd_gen_to_dags", "rd_gen_to_dags/dagfluid"]
 autoware = ["dep:autoware"]
 
 # Test applications
