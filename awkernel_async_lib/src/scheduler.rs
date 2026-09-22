@@ -19,6 +19,7 @@ use alloc::boxed::Box;
 
 pub(crate) mod active_vp;
 mod clustered_edf;
+pub mod dp_wrap;
 pub mod gedf;
 pub(crate) mod mixed_vp;
 pub(super) mod panicked;

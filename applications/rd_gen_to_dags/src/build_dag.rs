@@ -1306,20 +1306,34 @@ async fn build_dag_impl(dag_data: DagData) -> Result<Arc<Dag>, (u32, BuildDagErr
         (sched_type, laxity)
     };
 
-    // DAG-Fluid, static admission only (see `crate::dag_fluid`'s own doc):
-    // `required_capacity` gives this DAG's own real-valued contribution to
-    // the shared capacity pool -- order-independent (unlike V-Fed's
-    // Algorithm 1, `Σrequired_capacity_i <= m` is a plain running sum), so
-    // admitting one DAG at a time in file order, same as Federated/Laxity
-    // above, is exactly equivalent to a batch run; no `admit_batch`-style
-    // two-pass dance is needed here. Dispatch is a *placeholder*, not the
-    // papers' DP-Fair/DP-Wrap fluid-rate execution: this DAG's fractional
-    // capacity is rounded up to `ceil(required_capacity)` whole cores
-    // (`dag_fluid::ceil_capacity_to_cores`) and reserved as an ordinary
-    // ClusteredEDF cluster from the same shared ledger Federated/V-Fed use
-    // (`dag_sched::resource`). See this crate's own `dag_fluid.rs` module
-    // doc for the dynamic (DP-Fair/DP-Wrap) dispatch work this stands in
-    // for.
+    // DAG-Fluid (see `crate::dag_fluid`'s own doc): `required_capacity`
+    // gives this DAG's own real-valued contribution to the shared capacity
+    // pool -- order-independent (unlike V-Fed's Algorithm 1,
+    // `Σrequired_capacity_i <= m` is a plain running sum), so admitting one
+    // DAG at a time in file order, same as Federated/Laxity above, is
+    // exactly equivalent to a batch run; no `admit_batch`-style two-pass
+    // dance is needed here.
+    //
+    // Resource model: every DAG-Fluid DAG shares one pool of cores
+    // (`resource::reserve_dagfluid_capacity`/`dagfluid_pool_cpu_set`) --
+    // fluid theory's own assumption (`Σrequired_capacity_i <= m`), matching
+    // the same aggregate check `dag_fluid::is_batch_feasible` already runs
+    // offline -- rather than each DAG claiming an exclusive cluster the way
+    // an earlier revision of this arm did (Federated/V-Fed-style, one
+    // cluster per DAG; superseded because it can't express multiple
+    // DAG-Fluid tasks actually sharing capacity).
+    //
+    // Dispatch: still a *placeholder*, not the papers' DP-Fair/DP-Wrap
+    // fluid-rate execution -- plain `GEDF` over the shared pool (the same
+    // placeholder role Federated's light tasks already use `GEDF` for).
+    // The real DP-Wrap dispatch mechanism (Funk, Levin, Sadowski, Pye,
+    // Brandt, "DP-Fair: A unifying theory for optimal hard real-time
+    // multiprocessor scheduling", Real-Time Systems 2011) is not
+    // implemented yet -- deliberately deferred pending that paper's own
+    // primary source (not just the DAG-Fluid paper's summary of it) so its
+    // 3 dispatch rules (Section 8) are transcribed precisely rather than
+    // reconstructed from a secondary description. See this crate's own
+    // `dag_fluid.rs` module doc.
     #[cfg(feature = "dagfluid")]
     let sched_type = {
         let segments = crate::dag_fluid::decompose_segments(&dag_data);
@@ -1331,12 +1345,10 @@ async fn build_dag_impl(dag_data: DagData) -> Result<Arc<Dag>, (u32, BuildDagErr
             &segments,
         )
         .ok_or(BuildDagError::DagFluidInfeasible(dag_id))?;
-        let cores_needed = crate::dag_fluid::ceil_capacity_to_cores(required);
-        let cores = resource::allocate_cluster(cores_needed)?;
-        let sched_type = SchedulerType::ClusteredEDF(relative_deadline, cores);
-        let core_ids: Vec<usize> = cores.iter().collect();
+        resource::reserve_dagfluid_capacity(required)?;
+        let sched_type = SchedulerType::GEDF(relative_deadline);
         log::info!(
-            "DAG#{dag_id}: admitted (dagfluid, static) required_capacity={required:.3} -> ClusteredEDF(relative_deadline={relative_deadline}, cores={core_ids:?})"
+            "DAG#{dag_id}: admitted (dagfluid, shared pool) required_capacity={required:.3} -> GEDF(relative_deadline={relative_deadline}) [placeholder dispatch, DP-Wrap pending]"
         );
 
         // Phase 1/2 (real-machine DAG-Fluid work): compute the Section 8

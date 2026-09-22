@@ -96,8 +96,16 @@ struct PoolLedger {
     /// worker CPUs this module has already promised to a cluster, so two
     /// exclusive clusters never get the same core.
     claimed_cores: CpuSet,
-    /// Sum of every admitted light-pool DAG's utilization, scaled by
-    /// [`UTILIZATION_SCALE`].
+    /// Sum of every admitted *shared-pool* DAG's committed capacity, scaled
+    /// by [`UTILIZATION_SCALE`] — Federated's light-task utilization
+    /// (`volume/window`) when the `federated`/`vfed` features are
+    /// compiled in, or DAG-Fluid's `required_capacity` (already in
+    /// core-units, just scaled — see [`reserve_dagfluid_capacity`]) when
+    /// `dagfluid` is. One field, not two, because those admission
+    /// policies are mutually exclusive Cargo features (`rd_gen_to_dags`'s
+    /// own `compile_error!` guard) — never compiled into the same kernel
+    /// build, so this field is never double-purposed at runtime despite
+    /// serving either meaning depending on which policy is active.
     light_utilization_scaled: u64,
 }
 
@@ -215,5 +223,76 @@ pub fn release_light_utilization(volume: u64, window: u64) {
     let mut node = MCSNode::new();
     let mut pool = POOL.lock(&mut node);
     pool.light_utilization_scaled = pool.light_utilization_scaled.saturating_sub(released);
+}
+
+/// DAG-Fluid's counterpart to [`reserve_light_utilization`]: commit
+/// `required_capacity` (a [`crate`]-external `dag_fluid::required_capacity`
+/// value — already denominated in core-units, e.g. `1.5` means "one and a
+/// half cores' worth", not a `0..1` ratio) against the same shared pool
+/// Federated's light tasks would otherwise use. Mutually exclusive with
+/// [`reserve_light_utilization`] in practice (see [`PoolLedger`]'s own
+/// doc), so reusing one counter is safe, not a collision.
+///
+/// This is what makes DAG-Fluid tasks genuinely *share* the pool (fluid
+/// theory's own assumption — `Σrequired_capacity_i <= m`) instead of each
+/// claiming an exclusive cluster the way the Phase 0 placeholder dispatch
+/// did: multiple DAG-Fluid tasks admitted this way draw down the same
+/// `light_pool_size()` capacity together, the same shape
+/// `dag_fluid::is_batch_feasible`'s own static admission test already
+/// checks offline.
+///
+/// Returns the scaled amount actually reserved (release it later with the
+/// same `required_capacity` via [`release_dagfluid_capacity`]).
+pub fn reserve_dagfluid_capacity(required_capacity: f64) -> Result<u64, ResourceError> {
+    // `required_capacity` is a small positive value (bounded by `m`, the
+    // system's own core count, at most `NUM_MAX_CPU`) in every caller this
+    // module knows of, so this product cannot approach `u64::MAX` in
+    // practice; `.max(0.0)` guards a negative input (should not occur --
+    // `dag_fluid::required_capacity` never returns one) from wrapping on
+    // the `as u64` cast, which truncates towards zero for a non-negative
+    // f64 rather than rounding -- consistent with this crate's other
+    // `no_std`-safe float-to-integer conversions (e.g.
+    // `dag_fluid::ceil_capacity_to_cores`), all of which document the same
+    // "no `std`/`libm` `.round()`/`.ceil()`" constraint.
+    let additional = (required_capacity.max(0.0) * UTILIZATION_SCALE as f64) as u64;
+
+    let mut node = MCSNode::new();
+    let mut pool = POOL.lock(&mut node);
+
+    let capacity = (light_pool_size(&pool) as u64).saturating_mul(UTILIZATION_SCALE);
+    let committed = pool.light_utilization_scaled;
+
+    if committed.saturating_add(additional) > capacity {
+        return Err(ResourceError::LightPoolOversubscribed {
+            additional_utilization_scaled: additional,
+            available_capacity_scaled: capacity.saturating_sub(committed),
+        });
+    }
+
+    pool.light_utilization_scaled = committed + additional;
+    Ok(additional)
+}
+
+/// Release capacity previously committed by [`reserve_dagfluid_capacity`].
+pub fn release_dagfluid_capacity(required_capacity: f64) {
+    let released = (required_capacity.max(0.0) * UTILIZATION_SCALE as f64) as u64;
+    let mut node = MCSNode::new();
+    let mut pool = POOL.lock(&mut node);
+    pool.light_utilization_scaled = pool.light_utilization_scaled.saturating_sub(released);
+}
+
+/// The shared pool's worker CPUs (see [`light_pool_size`]) as a [`CpuSet`],
+/// for whichever `SchedulerType` DAG-Fluid's shared-pool dispatch uses to
+/// register its nodes (all of them share the *same* `cpu_set`, unlike an
+/// exclusive [`allocate_cluster`] cluster — see `dag_sched::policy` for
+/// where this is called from).
+pub fn dagfluid_pool_cpu_set() -> CpuSet {
+    let mut node = MCSNode::new();
+    let pool = POOL.lock(&mut node);
+    let mut set = CpuSet::empty();
+    for cpu in (1..num_cpu()).filter(|&cpu| is_dag_pool_core(cpu) && !pool.claimed_cores.contains(cpu)) {
+        set.insert(cpu);
+    }
+    set
 }
 

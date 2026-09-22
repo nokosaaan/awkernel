@@ -480,26 +480,6 @@ pub fn required_capacity(
     Some(concurrent_jobs * rate)
 }
 
-/// Round `capacity` (a [`required_capacity`] value, or any other
-/// non-negative real-valued core requirement) up to the nearest whole core
-/// count, clamped to at least 1 -- a real fluid-rate task never needs zero
-/// *dedicated* cores once mapped onto the placeholder ClusteredEDF dispatch
-/// [`crate::build_dag`] uses under the `dagfluid` feature (see that
-/// module's own doc for why dispatch is a placeholder, not real DP-Fair).
-/// `f64::ceil()` needs `std`/`libm`, unavailable in this crate's `no_std`
-/// kernel build (same constraint as [`libm_sqrt`]), so this rounds via an
-/// integer cast (truncates towards zero for a non-negative input, i.e.
-/// floors) plus a comparison, rather than a float method.
-pub fn ceil_capacity_to_cores(capacity: f64) -> u16 {
-    let floor = capacity as u16;
-    let rounded = if (floor as f64) < capacity {
-        floor.saturating_add(1)
-    } else {
-        floor
-    };
-    rounded.max(1)
-}
-
 /// A whole task set of `(volume, period, critical_path, deadline,
 /// segments)` tuples is feasible on `m` shared cores iff
 /// `sum(required_capacity_i) <= m` — a direct transcription of Algorithm
