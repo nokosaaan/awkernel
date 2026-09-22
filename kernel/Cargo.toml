@@ -154,3 +154,11 @@ test_clustered_edf = ["userland/test_clustered_edf"]
 test_active_vp = ["userland/test_active_vp"]
 rd_gen_vfed = ["userland/rd_gen_vfed"]
 rd_gen_laxity = ["userland/rd_gen_laxity"]
+
+# Skip waking any AP whose local APIC ID has bit 0 set, i.e. every SMT/Hyper-
+# Threading sibling thread, so the kernel only brings up one logical CPU per
+# physical core. A workaround for real machines whose BIOS/UEFI exposes no
+# HT on/off toggle (see kernel_main.rs's own doc comment on the filter for
+# why bit 0 and its limits). Off by default: unset, every enabled logical
+# CPU reported by the MADT is woken as before.
+smt_disable = []

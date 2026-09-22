@@ -299,6 +299,32 @@ fn kernel_main2(
                     && (matches!(type_apic, TypeApic::Xapic(_)) && p.local_apic_id < 255
                         || matches!(type_apic, TypeApic::X2Apic(_)))
                 {
+                    // `smt_disable`: leave every SMT/Hyper-Threading sibling thread
+                    // parked in `WaitingForSipi` (never sent a SIPI, never runs) so
+                    // only one logical CPU per physical core is woken. A stand-in for
+                    // a BIOS/UEFI HT toggle on machines that don't expose one -- see
+                    // real-machine.md's "実機対応記録": HT's two logical CPUs share
+                    // one physical core's execution units, so a task's measured WCET
+                    // varies with whatever its sibling happens to be doing at the
+                    // time, a channel Federated-style admission (which assumes `m`
+                    // independent identical processors) doesn't model, and worse,
+                    // leaving both siblings enabled makes Awkernel see double the
+                    // real core count, over-admitting DAGs the physical machine can't
+                    // actually schedule. The filter relies on the low bit of the
+                    // initial APIC ID encoding the SMT thread index within a core
+                    // (Intel's CPUID leaf 0x1F/0xB topology enumeration) -- true on
+                    // every machine confirmed so far, but not an architectural
+                    // guarantee, so a target with a different APIC ID layout would
+                    // need a different filter, not just this bit.
+                    #[cfg(feature = "smt_disable")]
+                    if p.local_apic_id & 1 != 0 {
+                        log::info!(
+                            "smt_disable: leaving SMT sibling AP parked (APIC ID {})",
+                            p.local_apic_id
+                        );
+                        continue;
+                    }
+
                     non_primary_cpus.insert(p.local_apic_id);
                 }
             }
