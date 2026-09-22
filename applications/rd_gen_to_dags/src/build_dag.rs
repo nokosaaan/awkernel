@@ -1339,22 +1339,30 @@ async fn build_dag_impl(dag_data: DagData) -> Result<Arc<Dag>, (u32, BuildDagErr
             "DAG#{dag_id}: admitted (dagfluid, static) required_capacity={required:.3} -> ClusteredEDF(relative_deadline={relative_deadline}, cores={core_ids:?})"
         );
 
-        // Phase 1 (real-machine DAG-Fluid work): compute the Section 8
+        // Phase 1/2 (real-machine DAG-Fluid work): compute the Section 8
         // Step 1 thread-list conversion (Algorithm 1 lines 16-21, see
-        // `dag_fluid::assign_segment_deadlines`'s own doc) and log the
-        // resulting per-segment schedule and this DAG's own nearest DP
-        // boundary candidate -- computation and logging only, no dispatch
-        // action taken on it yet (the placeholder ClusteredEDF dispatch
-        // above is unaffected). Only meaningful for a task actually
+        // `dag_fluid::assign_segment_deadlines`'s own doc), log the
+        // resulting per-segment schedule, and register each segment's own
+        // absolute deadline with the system-wide DP-boundary tracker
+        // (`dag_sched::dp_partition`, Phase 2 -- measurement/logging only
+        // when a boundary actually fires, no dispatch action; see that
+        // module's own doc). The placeholder ClusteredEDF dispatch above
+        // is unaffected either way. Only meaningful for a task actually
         // decomposed into segments (`stats.volume > d_star`, i.e. the
         // `τ_paral` case, Section 4.1) -- a `τ_seq` task (whole DAG
-        // stretched into one sequential unit) has no segments to convert.
+        // stretched into one sequential unit) has no segments to convert
+        // or register.
         let d_star = crate::dag_fluid::virtual_deadline(period, relative_deadline, stats.critical_path);
         if stats.volume > d_star {
             if let Some(schedule) =
                 crate::dag_fluid::assign_segment_deadlines(&segments, stats.volume, d_star)
             {
                 let offsets = crate::dag_fluid::segment_release_offsets(&schedule);
+                // All of this DAG's own segments share one release-time
+                // baseline (see `dp_partition`'s own doc on why
+                // `Time::now()` at admission stands in for the papers'
+                // `r_i,j` anchor here).
+                let release = awkernel_lib::time::Time::now();
                 for (j, (seg, offset)) in schedule.iter().zip(offsets.iter()).enumerate() {
                     log::info!(
                         "DAG#{dag_id}: segment[{j}] l={} m={} r={offset:.3} d={:.3} theta={:.3}",
@@ -1363,24 +1371,12 @@ async fn build_dag_impl(dag_data: DagData) -> Result<Arc<Dag>, (u32, BuildDagErr
                         seg.relative_deadline,
                         seg.rate
                     );
-                }
-                // Nearest DP boundary candidate this DAG itself contributes:
-                // the earliest segment absolute deadline (r_i,j + d_i,j)
-                // relative to this DAG's own release time. A real
-                // system-wide DP-partition tracker (across every
-                // concurrently-admitted DAG-Fluid task, wired to
-                // `awkernel_lib::timer`'s `TimerRequestId::DpBoundary`) is
-                // out of scope for this phase -- see this crate's
-                // `dag_fluid.rs` module doc.
-                if let Some((j, boundary)) = schedule
-                    .iter()
-                    .zip(offsets.iter())
-                    .map(|(seg, offset)| offset + seg.relative_deadline)
-                    .enumerate()
-                    .min_by(|(_, a), (_, b)| a.total_cmp(b))
-                {
-                    log::info!(
-                        "DAG#{dag_id}: nearest DP boundary candidate at segment[{j}], t={boundary:.3} (relative to this DAG's own release)"
+                    awkernel_async_lib::dag_sched::dp_partition::register_segment(
+                        dag_id,
+                        j,
+                        release,
+                        *offset,
+                        seg.relative_deadline,
                     );
                 }
             }

@@ -107,6 +107,13 @@ pub fn dag_metrics_and_fluid_segments_from_yaml(
 pub async fn run() {
     wait_millisec(1000);
 
+    // DAG-Fluid Phase 2 (see `awkernel_async_lib::dag_sched::dp_partition`'s
+    // own module doc): install the DP-boundary callback before any DAG is
+    // admitted, so every segment `build_dag`'s `dagfluid` arm registers
+    // below has somewhere to land. A no-op for federated/laxity.
+    #[cfg(feature = "dagfluid")]
+    awkernel_async_lib::dag_sched::dp_partition::install();
+
     let dags_data = match parse_yaml::parse_dags(DAG_FILES) {
         Ok(data) => data,
         Err(e) => {
@@ -132,6 +139,12 @@ pub async fn run() {
         log::error!("Failed to build DAG");
         return;
     }
+
+    // Every DAG-Fluid segment across every admitted DAG is registered by
+    // now (admission is sequential and complete at this point); arm for
+    // the earliest one before dispatch starts.
+    #[cfg(feature = "dagfluid")]
+    awkernel_async_lib::dag_sched::dp_partition::arm_next();
 
     match finish_create_dags(&success_build_dags).await {
         Ok(_) => {

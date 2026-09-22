@@ -18,6 +18,10 @@
 //! - [`policy`]: one module per admission algorithm (currently just
 //!   [`policy::federated`]), each combining `metrics`/`resource`/`provision`
 //!   into that algorithm's own `admit_dag`.
+//! - [`dp_partition`]: system-wide Deadline-Partition boundary tracking for
+//!   DAG-Fluid's dynamic-dispatch measurement work (Phase 2) — a
+//!   measurement probe, not a scheduling mechanism; see its own module doc.
+pub mod dp_partition;
 pub mod metrics;
 pub mod policy;
 pub mod provision;
