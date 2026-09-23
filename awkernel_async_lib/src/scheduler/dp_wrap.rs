@@ -66,6 +66,7 @@ use array_macro::array;
 use awkernel_lib::{
     cpu::NUM_MAX_CPU,
     sync::mutex::{MCSNode, Mutex},
+    time::Time,
 };
 use core::{
     cmp::max,
@@ -363,7 +364,9 @@ impl DpWrapScheduler {
 /// every currently-active DAG-Fluid segment's own `(dag_id, concurrency,
 /// rate)` (`rate` = that segment's `theta_i,j`, `concurrency` = `m_i,j`
 /// interchangeable virtual threads -- see
-/// `rd_gen_to_dags::dag_fluid::SegmentSchedule`'s own doc), and apply it.
+/// `rd_gen_to_dags::dag_fluid::SegmentSchedule`'s own doc), and apply it
+/// for the Deadline Partition running from `dp_start` until `dp_end`
+/// (`None` if no further boundary is currently known -- see below).
 /// Called by `dag_sched::dp_partition` once a Deadline Partition boundary
 /// is actually acted on (its own completion-gate having been satisfied —
 /// see that module's own doc for why advancing is gated on real node
@@ -377,29 +380,41 @@ impl DpWrapScheduler {
 /// with two ready sibling nodes and two entitled CPUs runs both at once,
 /// each CPU independently popping one from the DAG's shared ready queue).
 ///
-/// # Scope: per-DP granularity, not per-migration-instant
-/// This applies one flat entitlement for the CPU for the *entire* current
-/// DP, rather than the paper's own intra-DP wrap-around switching
-/// (McNaughton's sub-slice migration points within a single DP) — doing
-/// that precisely would need a second, per-CPU-armed intra-DP timer/IPI
-/// channel, traded off (in design discussion) against reusing
-/// `dp_partition`'s existing once-per-DP-boundary signal for both lower
-/// total IPI traffic and no added measurement bias (an extra IPI hop's
-/// latency on every sub-slice switch would pollute the very
-/// theory-vs-reality latency numbers this project measures). A block
-/// [`wrap_blocks`] splits across two processors (a "migrating" block, in
-/// the paper's own terms) is approximated here by assigning the whole DP
-/// to whichever processor holds the *larger* of its two shares.
+/// # Intra-DP migration
+/// Every processor's own [`wrap_blocks`] output (not just its largest
+/// block) is converted into absolute-time [`SwitchPoint`]s by scaling
+/// each block's `(start_frac, end_frac)` by `L_j = dp_end - dp_start` (the
+/// paper's own "multiply each length 1 segment by Lj", Sect. 4.2) and
+/// adding `dp_start`, so a block [`wrap_blocks`] splits across two
+/// processors (a "migrating" block, in the paper's own terms) really does
+/// migrate: each processor gets its own slice at its own scheduled
+/// instant, not an approximation. The first point is applied immediately
+/// (task context, right here); the rest are queued in [`SWITCH_PLAN`] for
+/// [`tick_switch_plan`] to apply as their own times arrive.
+///
+/// If `dp_end` is `None` (no further segment boundary is currently
+/// pending -- e.g. every admitted DAG has exhausted its own segments) or
+/// the computed `L_j` is zero (defensive: `dp_start`/`dp_end` come from
+/// two separate reads of the clock/`PENDING` a caller took without a
+/// shared lock across both, so a same-instant race is possible even if
+/// unlikely), there is no meaningful interval to schedule migration
+/// within -- falls back to one flat entitlement for whichever block holds
+/// the *larger* of its shares, [`wrap_blocks`]'s own precondition-violation
+/// posture aside.
 ///
 /// # WCET note
 /// Bounded by `active.len()` (at most the number of currently-admitted
 /// DAG-Fluid DAGs) times each one's own `concurrency` for the `densities`
 /// build, then by `pool.len()` (at most `num_cpu()`) for [`wrap_blocks`]
-/// and the apply loop; allocates (`Vec`/`BinaryHeap` growth) but only ever
-/// from `dag_sched::dp_partition::on_dp_boundary`'s timer-interrupt
-/// context, not a per-task dispatch path — see that module's own "not
-/// WCET-proven" scope note, which this function shares.
-pub fn recompute_and_apply(active: &[(u32, u32, f64)]) {
+/// and the apply loop, each processor's own switch-point count further
+/// bounded by `densities.len()` (`wrap_blocks`' own contract); allocates
+/// (`Vec` growth), but only ever from `dag_sched::dp_partition`'s own
+/// `advance_due_segments` -- ordinary task context, never a timer-interrupt
+/// callback (see that module's own "Split design" doc for why that
+/// distinction matters here) -- so this shares that function's "not
+/// WCET-proven" scope note without the interrupt-context hazard its own
+/// history warns about.
+pub fn recompute_and_apply(active: &[(u32, u32, f64)], dp_start: Time, dp_end: Option<Time>) {
     let mut slot_table: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
     let mut densities: alloc::vec::Vec<(usize, f64)> = alloc::vec::Vec::new();
     for &(dag_id, concurrency, rate) in active {
@@ -417,14 +432,107 @@ pub fn recompute_and_apply(active: &[(u32, u32, f64)]) {
 
     let plan = wrap_blocks(&densities, pool.len());
 
+    let l_j = dp_end.and_then(|end| {
+        let d = end.saturating_duration_since(dp_start);
+        (!d.is_zero()).then_some(d)
+    });
+
     for (proc, &cpu_id) in pool.iter().enumerate() {
-        let winner = plan.get(proc).and_then(|blocks| {
-            blocks
-                .iter()
-                .max_by(|a, b| (a.2 - a.1).partial_cmp(&(b.2 - b.1)).unwrap_or(core::cmp::Ordering::Equal))
-        });
-        let new_dag = winner.map(|&(slot_idx, _, _)| slot_table[slot_idx]);
-        apply_entitlement(cpu_id, new_dag);
+        let blocks = plan.get(proc).cloned().unwrap_or_default();
+
+        let Some(duration) = l_j else {
+            // No known DP end, or zero-length -- flat entitlement for the
+            // larger of this processor's (at most two, per `wrap_blocks`'
+            // own contract) shares, same as before intra-DP migration
+            // existed.
+            let winner = blocks.iter().max_by(|a, b| {
+                (a.2 - a.1).partial_cmp(&(b.2 - b.1)).unwrap_or(core::cmp::Ordering::Equal)
+            });
+            let new_dag = winner.map(|&(slot_idx, _, _)| slot_table[slot_idx]);
+            if let Some(slot) = SWITCH_PLAN.get(cpu_id) {
+                let mut node = MCSNode::new();
+                slot.lock(&mut node).clear();
+            }
+            apply_entitlement(cpu_id, new_dag);
+            continue;
+        };
+
+        let mut switch_points: alloc::vec::Vec<SwitchPoint> = blocks
+            .iter()
+            .map(|&(slot_idx, start_frac, _end_frac)| SwitchPoint {
+                at: dp_start + duration.mul_f64(start_frac),
+                dag_id: slot_table[slot_idx],
+            })
+            .collect();
+
+        let first = if switch_points.is_empty() {
+            None
+        } else {
+            Some(switch_points.remove(0))
+        };
+
+        if let Some(slot) = SWITCH_PLAN.get(cpu_id) {
+            let mut node = MCSNode::new();
+            *slot.lock(&mut node) = switch_points;
+        }
+        apply_entitlement(cpu_id, first.map(|sp| sp.dag_id));
+    }
+}
+
+/// One planned entitlement change within the current Deadline Partition,
+/// in absolute time (`at`) -- see [`recompute_and_apply`]'s own doc.
+struct SwitchPoint {
+    at: Time,
+    dag_id: u32,
+}
+
+/// Per-CPU: this CPU's own remaining intra-DP switch points for the
+/// *current* Deadline Partition, soonest first ([`recompute_and_apply`]
+/// replaces the whole `Vec` wholesale on every recompute, so a stale
+/// entry from a previous DP can never linger). Like
+/// `dag_sched::dp_partition`'s own `PENDING`/`CURRENT`, only this module's
+/// own code (`recompute_and_apply`, [`tick_switch_plan`]) ever touches
+/// this -- never shared with ordinary DAG/task-graph code -- but unlike
+/// that reasoning matters for, this lock is only ever taken from ordinary
+/// task/kernel-loop context in the first place ([`tick_switch_plan`] is
+/// called from `scheduler::wake_task`'s own per-cpu loop, itself plain
+/// non-interrupt code running from the primary CPU's main loop -- see
+/// that function's own doc), so no interrupt-context hazard applies here
+/// regardless.
+static SWITCH_PLAN: [Mutex<alloc::vec::Vec<SwitchPoint>>; NUM_MAX_CPU] =
+    array![_ => Mutex::new(alloc::vec::Vec::new()); NUM_MAX_CPU];
+
+/// Apply `cpu_id`'s own next scheduled intra-DP entitlement switch
+/// ([`SWITCH_PLAN`]), if its time has arrived. Called once per
+/// `scheduler::wake_task` tick for every worker CPU (see that function's
+/// own per-cpu loop) -- ordinary, non-interrupt context, the same
+/// guarantee `dag_sched::dp_partition::advance_due_segments` relies on
+/// for its own DAG/task lookups (see that module's own "Split design"
+/// doc); [`apply_entitlement`]'s forced-preemption path is exactly as
+/// safe to run from here as it already is from `recompute_and_apply`.
+///
+/// WCET note: one `SWITCH_PLAN[cpu_id]` lock, O(1) front-check, and (only
+/// when due) an O(n) `Vec::remove(0)` bounded by that processor's own
+/// remaining switch-point count for the current DP (small in practice --
+/// bounded by the number of currently-active DAG-Fluid segments); no
+/// panic (`.get`/`.first()`, no direct indexing).
+pub(crate) fn tick_switch_plan(cpu_id: usize) {
+    let Some(slot) = SWITCH_PLAN.get(cpu_id) else {
+        return;
+    };
+
+    let due = {
+        let mut node = MCSNode::new();
+        let mut queue = slot.lock(&mut node);
+        let now = Time::now();
+        match queue.first() {
+            Some(sp) if sp.at <= now => Some(queue.remove(0)),
+            _ => None,
+        }
+    };
+
+    if let Some(sp) = due {
+        apply_entitlement(cpu_id, Some(sp.dag_id));
     }
 }
 
@@ -449,6 +557,10 @@ fn apply_entitlement(cpu_id: usize, new_dag: Option<u32>) {
     if old_dag == new_dag {
         return;
     }
+    log::info!(
+        "dp_wrap: CPU#{cpu_id} entitlement {old_dag:?} -> {new_dag:?} at {:?}",
+        Time::now()
+    );
     let Some(dag_id) = new_dag else {
         return;
     };

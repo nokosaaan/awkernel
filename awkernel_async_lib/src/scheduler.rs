@@ -613,6 +613,16 @@ pub fn wake_task() -> Option<Duration> {
         } else {
             active_vp::mark_idle(cpu_id);
         }
+
+        // DAG-Fluid's own intra-DP migration switch points (see
+        // `dp_wrap::tick_switch_plan`'s own doc): independent of whichever
+        // scheduler is currently running on `cpu_id` above -- entitlement
+        // can legitimately change out from under a task belonging to some
+        // *other* scheduler entirely (e.g. a regular-pool task happening
+        // to occupy what is, from DAG-Fluid's perspective, a DAG-pool
+        // core mid-switch), and `apply_entitlement`'s own forced-preemption
+        // path already only acts when a concrete DpWrap successor is ready.
+        dp_wrap::tick_switch_plan(cpu_id);
     }
 
     let mut node = MCSNode::new();

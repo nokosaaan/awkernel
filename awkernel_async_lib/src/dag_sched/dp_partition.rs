@@ -117,7 +117,18 @@ use core::{
 /// segment's measured "gate satisfied" latency stays close to the real
 /// completion time; long enough to be a plain periodic background task
 /// rather than a busy-poll.
-const ADVANCER_POLL_INTERVAL: Duration = Duration::from_millis(1);
+///
+/// 100us, not the original 1ms: this interval is a pure detection-latency
+/// tax paid once per segment transition (see [`advance_due_segments`]'s
+/// own doc), and with real DAGs commonly decomposing into dozens of
+/// segments (see `rd_gen_to_dags::dag_fluid::segment_completion_gates`'s
+/// own real-machine trace: 41 segments observed for one DAG), that tax
+/// compounds across the whole DAG's lifetime -- up to 1ms * segment count
+/// of pure polling overhead on top of the real completion-latency numbers
+/// this module measures. 100us keeps the same "plain periodic task, not a
+/// busy-poll" character (still a real sleep between polls, not a spin
+/// loop) while cutting that per-segment tax by 10x.
+const ADVANCER_POLL_INTERVAL: Duration = Duration::from_micros(100);
 
 /// One outstanding segment deadline, not yet advanced past.
 struct BoundaryEntry {
@@ -234,8 +245,20 @@ pub fn register_segment(
 /// Apply [`CURRENT`]'s present contents as the real per-CPU entitlement —
 /// call once after every DAG-Fluid DAG has been admitted (segment 0 of
 /// each already seeded [`CURRENT`] via [`register_segment`]), before
-/// dispatch begins, and again from [`on_dp_boundary`] whenever a segment
-/// actually advances.
+/// dispatch begins, and again from [`advance_due_segments`] whenever a
+/// segment actually advances.
+///
+/// `dp_start`/`dp_end` bound the Deadline Partition
+/// `scheduler::dp_wrap::recompute_and_apply` computes intra-DP migration
+/// switch points within: `dp_start` is simply `Time::now()` (this DP
+/// starts the moment its own entitlement is being computed, not the
+/// possibly-already-passed theoretical boundary time that triggered this
+/// call — see [`advance_due_segments`]'s own doc on why a segment's real
+/// completion can lag its theoretical deadline); `dp_end` is the
+/// earliest still-pending boundary left in [`PENDING`] after this
+/// update, i.e. the next point at which entitlement will need
+/// recomputing again, or `None` if nothing remains pending (every
+/// admitted DAG has exhausted its own segments).
 fn apply_current_entitlement() {
     let active: Vec<(u32, u32, f64)> = {
         let mut node = MCSNode::new();
@@ -245,7 +268,13 @@ fn apply_current_entitlement() {
             .map(|(&dag_id, &(concurrency, rate))| (dag_id, concurrency, rate))
             .collect()
     };
-    crate::scheduler::dp_wrap::recompute_and_apply(&active);
+    let dp_start = Time::now();
+    let dp_end = {
+        let mut node = MCSNode::new();
+        let pending = PENDING.lock(&mut node);
+        pending.iter().map(|e| e.scheduled).min()
+    };
+    crate::scheduler::dp_wrap::recompute_and_apply(&active, dp_start, dp_end);
 }
 
 /// Call once, after every DAG-Fluid DAG has been admitted and every
@@ -537,9 +566,21 @@ fn advance_due_segments() {
         removed
             .iter()
             .filter_map(|entry| {
+                // The entry with the *smallest* `segment_index`, not
+                // simply the first one `PENDING`'s own (post-swap_remove)
+                // order happens to yield -- `swap_remove` moves whatever
+                // was `PENDING`'s own last element into each freed slot,
+                // which can leave a *later* segment sitting at an earlier
+                // vec position than an untouched *earlier* one. Confirmed
+                // by direct QEMU observation: without `min_by_key` here,
+                // `CURRENT` could get stuck alternating between two
+                // segments that happened to share the same
+                // `(concurrency, rate)`, silently never actually reaching
+                // the real next segment in between them.
                 pending
                     .iter()
-                    .find(|e| e.dag_id == entry.dag_id)
+                    .filter(|e| e.dag_id == entry.dag_id)
+                    .min_by_key(|e| e.segment_index)
                     .map(|e| (entry.dag_id, (e.concurrency, e.rate)))
             })
             .collect()
@@ -566,6 +607,19 @@ fn advance_due_segments() {
 /// Spawn the background task that drives [`advance_due_segments`] on a
 /// fixed [`ADVANCER_POLL_INTERVAL`] cadence, forever. Call once at boot,
 /// after [`install`]/[`apply_initial_entitlement`]/[`arm_next`].
+///
+/// `PrioritizedFIFO(31)` (max, matching `kernel_main.rs`'s own auto-trace/
+/// auto-reboot background tasks), not `(0)`: this task's own scheduling
+/// delay is *itself* measurement error on top of the real
+/// theory-vs-reality numbers it exists to produce, not just an internal
+/// implementation detail -- confirmed directly on real hardware, where
+/// this task's very first poll after boot was delayed ~54ms behind
+/// segment 0's own theoretical deadline (competing for the regular pool
+/// with network-service/shell/auto-trace startup work at the original
+/// priority 0). Raising it doesn't change *when* `spawn_advancer` itself
+/// runs (that's this DAG's own admission order), only how promptly this
+/// task, once spawned, wins the regular pool's core against other
+/// regular-pool tasks contending for it at the same moment.
 pub fn spawn_advancer() {
     crate::task::spawn(
         "dp_wrap advancer".into(),
@@ -575,7 +629,7 @@ pub fn spawn_advancer() {
                 crate::sleep(ADVANCER_POLL_INTERVAL).await;
             }
         },
-        crate::scheduler::SchedulerType::PrioritizedFIFO(0),
+        crate::scheduler::SchedulerType::PrioritizedFIFO(31),
     );
 }
 
