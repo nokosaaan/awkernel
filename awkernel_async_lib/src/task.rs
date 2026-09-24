@@ -1580,12 +1580,33 @@ pub fn run_main() {
                 #[cfg(feature = "perf")]
                 let task_id = task.id;
 
-                // The period this task is *currently* about to process, read
-                // once here (not inside `trace::record`, which must stay
-                // lock-free) so both the start and end trace events of this
-                // poll get the same, correct label. `None` for non-DAG tasks.
+                // The period this task is about to process, read once here
+                // (not inside `trace::record`, which must stay lock-free)
+                // for the START trace event. `None` for non-DAG tasks.
+                //
+                // This is a snapshot, not ground truth for what the poll
+                // below actually ends up processing: for a DAG-Fluid/pub-
+                // sub reactor (`dag::spawn_reactor`/`spawn_sink_reactor`),
+                // the *real* period isn't known until `recv_all_with_
+                // period_index().await` resolves partway through
+                // `poll_unpin` itself, which then stores it into this same
+                // task's own `DagInfo::period_index` -- strictly after this
+                // read. Reusing this pre-poll value for the END event too
+                // (the previous design, "read once... so both the start and
+                // end trace events of this poll get the same, correct
+                // label") was confirmed wrong in practice (2026-09-25): it
+                // labels the slice doing a period's real work with the
+                // *previous* period's index, and -- if that slice is also
+                // preempted mid-poll -- `task::preempt::
+                // yield_preempted_and_wake_task`'s own pause/resume events
+                // (which DO re-read fresh at the moment of preemption) end
+                // up correctly labeled while this stale value, reused by
+                // this closure's own END record once the poll finally
+                // returns, contradicts them -- two swapped-looking slices
+                // for what was really one continuous span. See the END
+                // record below for the fix.
                 #[cfg(feature = "perf")]
-                let period_index: Option<u32> = {
+                let period_index_at_start: Option<u32> = {
                     let mut node = MCSNode::new();
                     let info = task.info.lock(&mut node);
                     info.get_dag_info()
@@ -1606,7 +1627,7 @@ pub fn run_main() {
                     perf::start_task();
 
                     #[cfg(feature = "perf")]
-                    trace::record(task_id, trace::KIND_START, period_index);
+                    trace::record(task_id, trace::KIND_START, period_index_at_start);
 
                     // Set strictly inside the trace S/E bracket so the
                     // preemption path never records a pause without a
@@ -1620,8 +1641,32 @@ pub fn run_main() {
                     // on; clear the flag where it actually ends.
                     POLLING[awkernel_lib::cpu::cpu_id()].store(0, Ordering::Relaxed);
 
+                    // Re-read fresh here, rather than reusing
+                    // `period_index_at_start`: by the time `poll_unpin` has
+                    // returned, any `DagInfo::period_index` store the
+                    // reactor body itself made during this exact poll (see
+                    // this function's own doc above) has already happened,
+                    // so this reflects the period this slice's real work
+                    // actually belongs to -- matching the same pattern
+                    // `task::perf`'s own `record_publish_timestamp`/
+                    // `record_subscribe_timestamp` already use (a
+                    // `period_index` threaded directly from the reactor's
+                    // own local variable at the point it's known, never
+                    // read back from this shared cell later) and matching
+                    // what `task::preempt::yield_preempted_and_wake_task`
+                    // already does for its own pause/resume pair. A non-DAG
+                    // task has no `DagInfo` either way, so this is `None`
+                    // for it same as `period_index_at_start`.
                     #[cfg(feature = "perf")]
-                    trace::record(task_id, trace::KIND_END, period_index);
+                    let period_index_at_end: Option<u32> = {
+                        let mut node = MCSNode::new();
+                        let info = task.info.lock(&mut node);
+                        info.get_dag_info()
+                            .map(|d| d.period_index.load(Ordering::Acquire))
+                    };
+
+                    #[cfg(feature = "perf")]
+                    trace::record(task_id, trace::KIND_END, period_index_at_end);
 
                     #[cfg(feature = "perf")]
                     perf::start_kernel();
