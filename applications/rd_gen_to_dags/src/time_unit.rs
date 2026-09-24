@@ -116,22 +116,26 @@ fn busy_work_for_millisec(ms: u64) {
 
 #[cfg(feature = "seconds")]
 pub(super) fn simulated_execution_time(duration: u64) {
-    busy_work_for_millisec(duration * 1000);
+    // busy_work_for_millisec(duration * 1000);
+    wait_millisec(duration * 1000);
 }
 
 #[cfg(feature = "milliseconds")]
 pub(super) fn simulated_execution_time(duration: u64) {
-    busy_work_for_millisec(duration);
+    // busy_work_for_millisec(duration);
+    wait_millisec(duration);
 }
 
 #[cfg(feature = "microseconds")]
 pub(super) fn simulated_execution_time(duration: u64) {
-    busy_work_for_millisec(duration / 1000);
+    // busy_work_for_millisec(duration / 1000);
+    wait_millisec(duration / 1000);
 }
 
 #[cfg(feature = "nanoseconds")]
 pub(super) fn simulated_execution_time(duration: u64) {
-    busy_work_for_millisec(duration / 1000000);
+    // busy_work_for_millisec(duration / 1000000);
+    wait_millisec(duration / 1000000);
 }
 
 // default
