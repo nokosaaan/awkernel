@@ -37,6 +37,19 @@ static CDC_SLOT:    AtomicU8    = AtomicU8::new(0);
 /// CDC write), skip rather than deadlock.
 static CDC_LOCK:    AtomicBool  = AtomicBool::new(false);
 
+/// DIAGNOSTIC (temporary): counts why `xhci_usb_serial_puts` dropped a line,
+/// to find why some early-boot log lines never reach the serial console --
+/// see kernel_main.rs's own print of these once past the affected window.
+static CDC_SKIPPED_LOCKED: AtomicUsize = AtomicUsize::new(0);
+static CDC_SKIPPED_NO_DEV: AtomicUsize = AtomicUsize::new(0);
+static CDC_WRITE_ERR: AtomicUsize = AtomicUsize::new(0);
+static CDC_WRITE_OK: AtomicUsize = AtomicUsize::new(0);
+
+pub fn cdc_skipped_locked() -> usize { CDC_SKIPPED_LOCKED.load(Ordering::Relaxed) }
+pub fn cdc_skipped_no_dev() -> usize { CDC_SKIPPED_NO_DEV.load(Ordering::Relaxed) }
+pub fn cdc_write_err() -> usize { CDC_WRITE_ERR.load(Ordering::Relaxed) }
+pub fn cdc_write_ok() -> usize { CDC_WRITE_OK.load(Ordering::Relaxed) }
+
 /// Incremented each time start_controller() succeeds.
 static XHCI_STARTED: AtomicUsize = AtomicUsize::new(0);
 /// Incremented for every port with CCS=1 seen across all boot_enumerate() calls.
@@ -173,13 +186,17 @@ pub fn xhci_usbsts_on_fail() -> Option<u32> {
 /// Skips silently on reentrant calls (e.g. log from within a CDC write path).
 pub fn xhci_usb_serial_puts(data: &str) {
     let ptr = CDC_DEV_PTR.load(Ordering::Acquire);
-    if ptr == 0 { return; }
+    if ptr == 0 {
+        CDC_SKIPPED_NO_DEV.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
 
     // Try to acquire the spinlock; skip if already held (reentrancy guard).
     if CDC_LOCK
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
+        CDC_SKIPPED_LOCKED.fetch_add(1, Ordering::Relaxed);
         return;
     }
 
@@ -188,12 +205,15 @@ pub fn xhci_usb_serial_puts(data: &str) {
     let dev = unsafe { &mut *(ptr as *mut XhciDevice) };
     let slot = CDC_SLOT.load(Ordering::Relaxed);
     if dev.cdcacm_write(slot, data.as_bytes()).is_err() {
+        CDC_WRITE_ERR.fetch_add(1, Ordering::Relaxed);
         // A failed bulk OUT leaves a pending TRB in the ring that would desynchronise
         // all future poll_xfer_completion calls.  Try to recover the ring; only
         // invalidate the pointer if recovery itself fails.
         if dev.reset_bulk_out_ep(slot).is_err() {
             CDC_DEV_PTR.store(0, Ordering::Release);
         }
+    } else {
+        CDC_WRITE_OK.fetch_add(1, Ordering::Relaxed);
     }
 
     CDC_LOCK.store(false, Ordering::Release);

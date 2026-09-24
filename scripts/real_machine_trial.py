@@ -66,7 +66,17 @@ ALGO_FEATURES = {
 # target's Windows display language, so we don't match on them -- only on the
 # GUID shape and on hint words that tend to survive localization (device/
 # protocol names such as "Network"/"IPv4" are usually not translated).
-BOOT_ENTRY_DESC_HINTS = ("efi network", "ipv4", "pxe", "network boot")
+#
+# Deliberately does NOT include "efi network": on hardware with a generic
+# "EFI Network" catch-all entry *and* a separate protocol-specific "EFI PXE
+# 0 for IPv4 (<mac>)" entry, that generic entry sits earlier in `bcdedit
+# /enum firmware`'s output and would match first, caching its GUID instead
+# of the specific one -- which, when set as bootsequence, drops the target
+# into an interactive "which network boot option" firmware menu instead of
+# booting straight to PXE (confirmed 2026-09-24: cached
+# {7863c0b7-...}/"EFI Network" instead of {7863c0b8-...}/"EFI PXE 0 for
+# IPv4"). "ipv4"/"pxe" alone already match the specific entry.
+BOOT_ENTRY_DESC_HINTS = ("ipv4", "pxe", "network boot")
 GUID_RE = re.compile(r"\{[0-9a-fA-F-]{8,}\}")
 
 
@@ -247,15 +257,28 @@ def stage_dag(src, staging_dir):
     return dst
 
 
-def load_trials_jsonl(path):
-    """Every record from acceptance_ratio.rs's --trials-jsonl output (one
-    per resampled trial; see its own doc comment for the schema), reordered
-    round-robin across u_norm levels -- one trial from the lowest level,
-    then one from the next, ... then back to the lowest level's next
-    trial, and so on -- instead of the file's own order (every trial of
-    one level before moving to the next). A batch of real-machine trials
-    that gets cut short this way still covers every u_norm level instead
-    of only ever reaching the lowest ones.
+def load_trials_jsonl(path, include_rejected=False):
+    """Every record from a --trials-jsonl file (one per resampled trial),
+    reordered round-robin across u_norm levels -- one trial from the lowest
+    level, then one from the next, ... then back to the lowest level's next
+    trial, and so on -- instead of the file's own order (every trial of one
+    level before moving to the next). A batch of real-machine trials that
+    gets cut short this way still covers every u_norm level instead of only
+    ever reaching the lowest ones.
+
+    Accepts either schema this file's own JSONL producers write: this
+    repo's newer `theory_vs_reality.rs` (`{"u_norm","trial","dags_dir",
+    "dags","accepted"}` -- one shared Federated-only `accepted` flag, and a
+    *per-record* `dags_dir` since that file's pools are one-per-u_norm-bin,
+    not a single shared pool like `acceptance_ratio.rs`'s own
+    `{"u_norm","trial","dags","federated_accepted","vfed_accepted",
+    "dag_fluid_accepted"}`, which has no `dags_dir` at all -- for that
+    schema, `--pool-dir` supplies the (single, shared) directory instead;
+    see `run_trial`. By default only ACCEPTed records are kept -- a
+    real-machine boot of a record this file's own offline prediction already
+    calls infeasible mostly just burns a trial slot -- pass
+    `include_rejected=True` (`--include-rejected`) to keep REJECTed ones too,
+    e.g. to spot-check that they really do fail admission on real hardware.
 
     Each record's position in this reordering (0-based) is what
     `select_next_group`/the state file's "trials_jsonl_line" index by --
@@ -271,10 +294,16 @@ def load_trials_jsonl(path):
                 record = json.loads(line)
             except json.JSONDecodeError as e:
                 raise RuntimeError(f"{path}:{line_no}: not valid JSON: {e}") from e
+            if not include_rejected:
+                accepted = record.get("accepted", record.get("federated_accepted", True))
+                if not accepted:
+                    continue
             by_u_norm.setdefault(record["u_norm"], []).append(record)
 
     if not by_u_norm:
-        raise RuntimeError(f"{path} has no trial records")
+        raise RuntimeError(
+            f"{path} has no {'trial' if include_rejected else 'ACCEPTed trial'} records"
+        )
 
     # Dict insertion order == ascending u_norm here, since
     # acceptance_ratio.rs sweeps u_norm_min -> u_norm_max and appends each
@@ -301,17 +330,17 @@ def select_next_group(trials, consumed_count):
     return consumed_count, trials[consumed_count]
 
 
-def stage_group(pool_dir, dag_names, staging_dir):
+def stage_group(dags_dir, dag_names, staging_dir):
     if staging_dir.exists():
         shutil.rmtree(staging_dir)
     staging_dir.mkdir(parents=True)
     staged = []
     for name in dag_names:
-        src = pool_dir / name
+        src = dags_dir / name
         if not src.exists():
             raise RuntimeError(
-                f"'{name}' (from trials.jsonl) not found under {pool_dir} -- "
-                "is --pool-dir the same RD-Gen pool the JSONL was generated from?"
+                f"'{name}' (from trials.jsonl) not found under {dags_dir} -- "
+                "is this the same RD-Gen pool the JSONL was generated from?"
             )
         dst = staging_dir / name
         shutil.copyfile(src, dst)
@@ -526,16 +555,21 @@ def run_trial(args, state, boot_cache_path, trials_jsonl):
         consumed = len({r["trials_jsonl_line"] for r in state if "trials_jsonl_line" in r})
         line_idx, trial_record = select_next_group(trials_jsonl, consumed)
         dag_names = trial_record["dags"]
-        stage_group(args.pool_dir, dag_names, args.staging_dir)
-        print(f"[dag] staged group #{line_idx + 1} (u_norm={trial_record.get('u_norm')}): "
-              f"{', '.join(dag_names)}")
+        # theory_vs_reality.rs's records carry their own bin directory
+        # (--pool-dir is one shared directory, doesn't apply); fall back to
+        # --pool-dir for acceptance_ratio.rs's older single-shared-pool
+        # schema, which has no "dags_dir" field at all.
+        dags_dir = Path(trial_record["dags_dir"]) if "dags_dir" in trial_record else args.pool_dir
+        stage_group(dags_dir, dag_names, args.staging_dir)
+        print(f"[dag] staged group #{line_idx + 1} (u_norm={trial_record.get('u_norm')}) "
+              f"from {dags_dir}: {', '.join(dag_names)}")
         selection_info = {
             "trials_jsonl_line": line_idx,
             "dag_files": dag_names,
+            "dags_dir": str(dags_dir),
             "u_norm": trial_record.get("u_norm"),
             "offline_trial": trial_record.get("trial"),
-            "offline_federated_accepted": trial_record.get("federated_accepted"),
-            "offline_vfed_accepted": trial_record.get("vfed_accepted"),
+            "offline_accepted": trial_record.get("accepted", trial_record.get("federated_accepted")),
         }
     else:
         dag_src = select_next_dag(args.pool_dir, {r["dag_file"] for r in state if "dag_file" in r})
@@ -569,8 +603,8 @@ def parse_args():
                         "-- so --trials N means N DAG selections, not N real-machine runs; the "
                         "actual run count is N * len(algorithms)")
     p.add_argument("--host", default="192.168.10.10")
-    p.add_argument("--user", default="azumiken-admin")
-    p.add_argument("--target-os", choices=["windows", "linux"], default="linux",
+    p.add_argument("--user", default="awkernel")
+    p.add_argument("--target-os", choices=["windows", "linux"], default="windows",
                     help="which one-shot-PXE-boot mechanism to drive over ssh: bcdedit+shutdown "
                          "(windows) or efibootmgr+reboot (linux)")
     p.add_argument("--target-mac", default="80:fa:5b:79:11:e1",
@@ -599,6 +633,10 @@ def parse_args():
                          "is what actually absorbs the wait until the target reboots back to "
                          "its normal OS on its own, so keep it above AUTO_REBOOT_SECS too")
     p.add_argument("--rediscover-boot-entry", action="store_true", help="force re-querying bcdedit instead of using the cached GUID")
+    p.add_argument("--include-rejected", action="store_true",
+                    help="--trials-jsonl mode only: also boot REJECTed records (default: ACCEPTed "
+                         "only), e.g. to spot-check that a REJECTed set really fails admission "
+                         "on real hardware too")
     p.add_argument("--no-smt-disable", action="store_true",
                     help="build without the kernel's smt_disable feature, i.e. leave HT sibling "
                          "APs woken (default: smt_disable is on -- the target's BIOS has no HT "
@@ -622,7 +660,11 @@ def main():
     state_path = args.log_dir / "dag_selection.json"
     boot_cache_path = args.log_dir / "real_machine_boot_entry.json"
     state = load_json(state_path, [])
-    trials_jsonl = load_trials_jsonl(args.trials_jsonl) if args.trials_jsonl is not None else None
+    trials_jsonl = (
+        load_trials_jsonl(args.trials_jsonl, args.include_rejected)
+        if args.trials_jsonl is not None
+        else None
+    )
 
     for i in range(args.trials):
         try:

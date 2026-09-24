@@ -353,10 +353,20 @@ fn kernel_main2(
     }
 
     let mut cpu_mapping = BTreeMap::<usize, usize>::new();
+    // DIAGNOSTIC (temporary): a copy of the same pairs kept around to re-log
+    // once the console is confirmed reachable (see below) -- `cpu_mapping`
+    // itself is moved into `set_raw_cpu_id_to_cpu_id` right after this loop,
+    // and logging inline here was confirmed (2026-09-24, via the
+    // cdc_skipped_no_dev counter) to be silently dropped: this early in boot
+    // the USB/PL2303 console device hasn't finished `attach()` yet
+    // (`CDC_DEV_PTR` is still 0), not a locking/timing race, so no amount of
+    // delay between these lines fixes it -- the write target doesn't exist
+    // yet, full stop.
+    let mut cpu_id_pairs = alloc::vec::Vec::new();
     for (cpu_id, raw_cpu_id) in non_primary_cpus.iter().enumerate() {
         let cpu_id = cpu_id + 1; // Non-primary CPU ID starts from 1.
         cpu_mapping.insert(*raw_cpu_id as usize, cpu_id);
-        log::info!("Raw CPU ID/CPU ID: {raw_cpu_id}/{cpu_id}");
+        cpu_id_pairs.push((*raw_cpu_id, cpu_id));
     }
     unsafe { awkernel_lib::arch::x86_64::cpu::set_raw_cpu_id_to_cpu_id(cpu_mapping) };
 
@@ -432,6 +442,25 @@ fn kernel_main2(
     unsafe { synchronize_tsc(non_primary_cpus.len() + 1) };
 
     log::info!("All CPUs are ready.");
+
+    // DIAGNOSTIC (temporary): report why some early-boot serial console lines
+    // (e.g. the "Raw CPU ID/CPU ID" lines above) never reach the host --
+    // console output is proven reliable by this point (this line and the ones
+    // right before it were captured), so this print itself should get through
+    // and tell us which failure mode dropped the earlier ones.
+    log::info!(
+        "USB console diag: ok={} skipped_locked={} skipped_no_dev={} write_err={}",
+        awkernel_drivers::pcie::usb::xhci::cdc_write_ok(),
+        awkernel_drivers::pcie::usb::xhci::cdc_skipped_locked(),
+        awkernel_drivers::pcie::usb::xhci::cdc_skipped_no_dev(),
+        awkernel_drivers::pcie::usb::xhci::cdc_write_err(),
+    );
+
+    // DIAGNOSTIC (temporary): re-log the raw-APIC-ID/awkernel-cpu_id pairs
+    // saved above, now that the console is confirmed reachable.
+    for (raw_cpu_id, cpu_id) in &cpu_id_pairs {
+        log::info!("Raw CPU ID/CPU ID: {raw_cpu_id}/{cpu_id}");
+    }
 
     let kernel_info = KernelInfo {
         info: Some(boot_info),

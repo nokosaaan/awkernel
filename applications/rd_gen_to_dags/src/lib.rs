@@ -107,6 +107,14 @@ pub fn dag_metrics_and_fluid_segments_from_yaml(
 pub async fn run() {
     wait_millisec(1000);
 
+    // Calibrate simulated_execution_time's busy-work loop here, once, before
+    // any DAG task is spawned -- this CPU is guaranteed quiet (no DAG work
+    // running yet, on this core or its SMT sibling), so the measurement is a
+    // clean uncontended baseline. See time_unit.rs's own doc comment for why
+    // this must be explicit rather than the loop calibrating itself lazily
+    // from inside a DAG task body.
+    time_unit::calibrate_busy_work();
+
     // DAG-Fluid Phase 2 (see `awkernel_async_lib::dag_sched::dp_partition`'s
     // own module doc): install the DP-boundary callback before any DAG is
     // admitted, so every segment `build_dag`'s `dagfluid` arm registers
@@ -183,6 +191,14 @@ pub async fn run() {
 #[cfg(feature = "vfed")]
 pub async fn run() {
     wait_millisec(1000);
+
+    // Calibrate simulated_execution_time's busy-work loop here, once, before
+    // any DAG task is spawned -- this CPU is guaranteed quiet (no DAG work
+    // running yet, on this core or its SMT sibling), so the measurement is a
+    // clean uncontended baseline. See time_unit.rs's own doc comment for why
+    // this must be explicit rather than the loop calibrating itself lazily
+    // from inside a DAG task body.
+    time_unit::calibrate_busy_work();
 
     // Pass 1: every DAG's `DagMetrics`, computed up front -- reparses
     // `DAG_FILES` independently of the `parse_yaml::parse_dags` call below
