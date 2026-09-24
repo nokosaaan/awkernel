@@ -21,27 +21,53 @@
 //! rejection sampling, no post-hoc rescaling of `C`/`T`.
 //!
 //! # Per-DAG prefilter
-//! Before resampling, every DAG in a bin whose own `classify_dag` comes back
-//! `Heavy { required_cores }` with `required_cores > real_cores` is dropped
-//! from that bin's pool: such a DAG could never be admitted under
-//! `real_cores`, alone or in any combination, so it would only waste trials.
-//! Also drops DAGs `classify_dag` already calls infeasible (`D <= L`), for
-//! the same reason.
+//! Before resampling, every DAG in a bin that `classify_dag` already calls
+//! infeasible (`D < L`) is dropped from that bin's pool: no scheduling
+//! policy, however parallel, can finish critical-path work faster than the
+//! critical path itself takes, so this is a universal, algorithm-agnostic
+//! disqualification -- unlike a plain `Heavy { required_cores }` DAG
+//! itself, whose `required_cores > real_cores` would only disqualify it
+//! under FEDERATED's own dedicated-cluster math specifically (an earlier
+//! version of this file also dropped those here, which biased the shared
+//! pool against V-Fed/DAG-Fluid's own, different core-requirement math --
+//! see "Per-algorithm admission" below for why the three now share one
+//! pool and one resampled draw per trial rather than each filtering its
+//! own).
 //!
-//! # What this file does *not* do
-//! No V-Fed/DAG-Fluid columns (unlike `acceptance_ratio.rs`) -- this study
-//! is about validating the one policy that actually runs on real hardware
-//! (`dag_sched::policy::federated`, the `rd_gen_to_dags` default). No file
-//! staging, no kernel build, no boot: `manifest_jsonl` records which pool
-//! directory and filenames each trial drew and whether it was predicted
-//! ACCEPT/REJECT; a separate script (see `run_realboot_evaluation.py`'s own
-//! pattern) reads it, stages the ACCEPTed trials' files, boots them for
-//! real, and compares the resulting measured deadline-miss rate against
-//! this file's own per-bin acceptance ratio.
+//! # Per-algorithm admission, not a Federated-only proxy
+//! Each trial's *same* resampled `dags_per_set`-DAG set (the same real-
+//! machine run would boot under any of `--algorithms federated,vfed,
+//! dagfluid,laxity`, see `real_machine_trial.py`) is checked against three
+//! independent theories, all fixed to the same `real_cores`: Federated's
+//! own static admission gate (`federated_batch_feasible`), V-Fed's own
+//! batch planner (`vfed::is_batch_feasible`), and DAG-Fluid's own fluid-
+//! capacity check (`dag_fluid::is_batch_feasible`) -- mirroring
+//! `acceptance_ratio.rs`'s own three-column CSV, just with `real_cores`
+//! fixed instead of a derived `m`. `manifest_jsonl` records all three
+//! per-trial booleans (`accepted`/`vfed_accepted`/`dag_fluid_accepted`),
+//! so a real-machine comparison can read the ONE column matching whichever
+//! algorithm it actually booted, instead of reusing Federated's own
+//! decision as a stand-in for every algorithm (which conflates "the real
+//! machine deviated from theory" with "this algorithm's own theory was
+//! never actually evaluated"). `laxity` has no admission test of its own
+//! here, same as in `acceptance_ratio.rs`: it reuses the SAME static gate
+//! as Federated (see `rd_gen_to_dags::build_dag`'s own `laxity` arm --
+//! only the in-batch node ordering differs, not the admission math), so
+//! `accepted` is the correct, non-proxy value for it too, not merely a
+//! stand-in.
+//!
+//! No file staging, no kernel build, no boot: `manifest_jsonl` records
+//! which pool directory and filenames each trial drew and whether it was
+//! predicted ACCEPT/REJECT under each theory; a separate script (see
+//! `run_realboot_evaluation.py`'s own pattern) reads it, stages the
+//! ACCEPTed trials' files, boots them for real under the matching
+//! algorithm, and compares the resulting measured deadline-miss rate
+//! against this file's own per-bin acceptance ratio.
 //!
 //! Usage: `theory_vs_reality <bins_root_dir> <real_cores> <dags_per_set>
-//! <trials_per_bin> <manifest_jsonl_path>`, prints `u_norm,acceptance_ratio`
-//! CSV to stdout (one row per discovered bin, ascending `u_norm`).
+//! <trials_per_bin> <manifest_jsonl_path>`, prints
+//! `u_norm,federated_ratio,vfed_ratio,dag_fluid_ratio` CSV to stdout (one
+//! row per discovered bin, ascending `u_norm`).
 
 use std::{
     env, fs,
@@ -52,9 +78,13 @@ use std::{
 
 use awkernel_async_lib::dag_sched::{
     metrics::DagMetrics,
-    policy::federated::{self, TaskClass as FedTaskClass},
+    policy::{
+        federated::{self, TaskClass as FedTaskClass},
+        vfed::{self, PackingStrategy},
+    },
 };
 use rand::seq::IndexedRandom;
+use rd_gen_to_dags::dag_fluid::{self, Segment};
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -116,10 +146,10 @@ fn main() -> ExitCode {
 
     let mut rng = rand::rng();
 
-    println!("u_norm,acceptance_ratio");
+    println!("u_norm,federated_ratio,vfed_ratio,dag_fluid_ratio");
     for (u_norm, bin_dir) in bins {
         let dags_dir = bin_dir.join("DAGs");
-        let (pool, dropped) = match load_and_prefilter_pool(&dags_dir, real_cores) {
+        let (pool, dropped) = match load_and_prefilter_pool(&dags_dir) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("u_norm={u_norm:.4}: {e}");
@@ -127,7 +157,7 @@ fn main() -> ExitCode {
             }
         };
         eprintln!(
-            "u_norm={u_norm:.4}: {} schedulable-by-itself DAGs, {dropped} dropped by prefilter",
+            "u_norm={u_norm:.4}: {} feasible-by-itself DAGs, {dropped} dropped by prefilter",
             pool.len(),
         );
         if pool.len() < dags_per_set {
@@ -137,22 +167,43 @@ fn main() -> ExitCode {
             continue;
         }
 
-        let mut accepted = 0usize;
+        let mut fed_accepted = 0usize;
+        let mut vfed_accepted = 0usize;
+        let mut dag_fluid_accepted = 0usize;
         for trial in 0..trials_per_bin {
-            let set: Vec<&(String, DagMetrics)> = pool.choose_multiple(&mut rng, dags_per_set).collect();
-            let metrics: Vec<DagMetrics> = set.iter().map(|(_, m)| *m).collect();
+            let set: Vec<&(String, DagMetrics, Vec<Segment>)> =
+                pool.choose_multiple(&mut rng, dags_per_set).collect();
+            let metrics: Vec<DagMetrics> = set.iter().map(|(_, m, _)| *m).collect();
 
-            let ok = federated_batch_feasible(&metrics, real_cores);
-            if ok {
-                accepted += 1;
+            let fed_ok = federated_batch_feasible(&metrics, real_cores);
+            if fed_ok {
+                fed_accepted += 1;
             }
+            let vfed_ok = vfed::is_batch_feasible(&metrics, real_cores, PackingStrategy::BestFit);
+            if vfed_ok {
+                vfed_accepted += 1;
+            }
+            let dag_fluid_entries: Vec<(u64, u64, u64, u64, &[Segment])> = set
+                .iter()
+                .map(|(_, m, segments)| (m.volume, m.period, m.critical_path, m.relative_deadline, segments.as_slice()))
+                .collect();
+            let dag_fluid_ok = dag_fluid::is_batch_feasible(&dag_fluid_entries, real_cores);
+            if dag_fluid_ok {
+                dag_fluid_accepted += 1;
+            }
+
             let u_sigma_actual: f64 = metrics.iter().map(|d| d.volume as f64 / d.period as f64).sum();
-            write_trial_record(&mut manifest, u_norm, trial, &dags_dir, &set, ok, u_sigma_actual, real_cores);
+            write_trial_record(
+                &mut manifest, u_norm, trial, &dags_dir, &set, fed_ok, vfed_ok, dag_fluid_ok,
+                u_sigma_actual, real_cores,
+            );
         }
 
         println!(
-            "{u_norm:.4},{:.2}",
-            100.0 * accepted as f64 / trials_per_bin as f64,
+            "{u_norm:.4},{:.2},{:.2},{:.2}",
+            100.0 * fed_accepted as f64 / trials_per_bin as f64,
+            100.0 * vfed_accepted as f64 / trials_per_bin as f64,
+            100.0 * dag_fluid_accepted as f64 / trials_per_bin as f64,
         );
     }
 
@@ -186,14 +237,14 @@ fn parse_u_norm_from_dir_name(name: &str) -> Option<f64> {
 /// 'Constrained' deadline mode already guarantees `D <= period` by
 /// construction (see this file's own module doc for why this file does NOT
 /// override deadline/period the way `acceptance_ratio.rs` does) -- then drop
-/// any DAG `classify_dag` already calls infeasible or that alone already
-/// needs more than `real_cores` dedicated cores (see this file's own
-/// "Per-DAG prefilter" doc). Returns the survivors paired with their
-/// filename, plus how many were dropped.
+/// any DAG `classify_dag` already calls infeasible (see this file's own
+/// "Per-DAG prefilter" doc for why only that case, not a plain
+/// `Heavy { required_cores }`, is dropped here). Returns the survivors
+/// paired with their filename and DAG-Fluid segment decomposition (needed
+/// for `dag_fluid::is_batch_feasible`), plus how many were dropped.
 fn load_and_prefilter_pool(
     dags_dir: &Path,
-    real_cores: u16,
-) -> Result<(Vec<(String, DagMetrics)>, usize), String> {
+) -> Result<(Vec<(String, DagMetrics, Vec<Segment>)>, usize), String> {
     let mut yaml_paths: Vec<_> = fs::read_dir(dags_dir)
         .map_err(|e| format!("cannot read directory '{}': {e}", dags_dir.display()))?
         .filter_map(|entry| entry.ok().map(|e| e.path()))
@@ -216,20 +267,17 @@ fn load_and_prefilter_pool(
         .collect::<Result<_, _>>()?;
     let yaml_refs: Vec<&str> = yaml_contents.iter().map(String::as_str).collect();
 
-    let configs = rd_gen_to_dags::dag_metrics_from_yaml(&yaml_refs)
+    let configs = rd_gen_to_dags::dag_metrics_and_fluid_segments_from_yaml(&yaml_refs)
         .map_err(|e| format!("failed to parse DAG pool in '{}': {e}", dags_dir.display()))?;
 
     let mut survivors = Vec::new();
     let mut dropped = 0usize;
-    for (name, config) in names.into_iter().zip(configs) {
+    for (name, (config, segments)) in names.into_iter().zip(configs) {
         match federated::classify_dag(&config) {
-            Ok(FedTaskClass::Heavy { required_cores }) if required_cores > real_cores => {
-                dropped += 1;
-            }
             Err(_) => {
                 dropped += 1;
             }
-            _ => survivors.push((name, config)),
+            _ => survivors.push((name, config, segments)),
         }
     }
     Ok((survivors, dropped))
@@ -237,7 +285,10 @@ fn load_and_prefilter_pool(
 
 /// Appends one JSON-Lines record for a single resampled trial: which pool
 /// directory and *distinct* filenames (in draw order) were drawn, whether
-/// the whole set was predicted ACCEPT under `real_cores`, and this
+/// whether the whole set was predicted ACCEPT under `real_cores` by each of
+/// the three independent theories (`accepted` = Federated's own gate, also
+/// the correct value for `laxity` -- see this file's module doc;
+/// `vfed_accepted`/`dag_fluid_accepted` = that algorithm's own), and this
 /// particular draw's own *actual* `U_Sigma`/`u_norm` (`u_norm_actual =
 /// u_sigma_actual / real_cores`) -- the bin's own `u_norm` is only the
 /// generation-time *target* (see this file's module doc), so a caller that
@@ -245,26 +296,32 @@ fn load_and_prefilter_pool(
 /// rather than the bin label they were drawn from, reads these two instead.
 /// A real-machine run reads `dags_dir`/`dags` to know exactly which files to
 /// stage for an ACCEPTed trial (and, for calibration, may also boot a
-/// sample of REJECTed ones to confirm they really fail admission).
+/// sample of REJECTed ones to confirm they really fail admission), and
+/// should read the ONE `*_accepted` column matching whichever algorithm it
+/// actually boots.
+#[allow(clippy::too_many_arguments)]
 fn write_trial_record(
     out: &mut fs::File,
     u_norm: f64,
     trial: usize,
     dags_dir: &Path,
-    set: &[&(String, DagMetrics)],
+    set: &[&(String, DagMetrics, Vec<Segment>)],
     accepted: bool,
+    vfed_accepted: bool,
+    dag_fluid_accepted: bool,
     u_sigma_actual: f64,
     real_cores: u16,
 ) {
     let dags = set
         .iter()
-        .map(|(name, _)| format!("\"{name}\""))
+        .map(|(name, _, _)| format!("\"{name}\""))
         .collect::<Vec<_>>()
         .join(",");
     let u_norm_actual = u_sigma_actual / real_cores as f64;
     let line = format!(
         "{{\"u_norm\":{u_norm:.4},\"trial\":{trial},\"dags_dir\":\"{}\",\"dags\":[{dags}],\
-         \"accepted\":{accepted},\"u_sigma_actual\":{u_sigma_actual:.6},\
+         \"accepted\":{accepted},\"vfed_accepted\":{vfed_accepted},\
+         \"dag_fluid_accepted\":{dag_fluid_accepted},\"u_sigma_actual\":{u_sigma_actual:.6},\
          \"u_norm_actual\":{u_norm_actual:.6}}}\n",
         dags_dir.display(),
     );
