@@ -167,6 +167,10 @@ pub static SCHEDULER: ClusteredEDFScheduler = ClusteredEDFScheduler {
 
 impl ClusteredEDFScheduler {
     fn invoke_preemption(&self, task: Arc<Task>) -> bool {
+        if !PREEMPTION_ENABLED {
+            return false;
+        }
+
         let cpu_set = task.cpu_set.expect("Task has no CPU set");
 
         // Find the CPU whose target (running or pending-preemption) task has
