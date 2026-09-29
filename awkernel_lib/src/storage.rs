@@ -7,8 +7,6 @@ use alloc::{
 };
 use storage_device::{StorageDevError, StorageDevice, StorageDeviceType};
 
-pub mod disk_adapter;
-pub mod ramdisk;
 pub mod storage_device;
 
 #[derive(Debug)]
