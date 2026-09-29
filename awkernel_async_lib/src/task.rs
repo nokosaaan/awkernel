@@ -483,8 +483,11 @@ impl Tasks {
                         normalized_active.iter().next().unwrap_or(leading_cpu)
                     };
                     let masked_passive = masked_workers(passive_set, num_cpu());
-                    scheduler_type =
-                        SchedulerType::MixedVp(normalized_active, normalized_leading, masked_passive);
+                    scheduler_type = SchedulerType::MixedVp(
+                        normalized_active,
+                        normalized_leading,
+                        masked_passive,
+                    );
                     Some(normalized_active.union(masked_passive))
                 } else {
                     None
@@ -852,6 +855,7 @@ pub mod perf {
     /// new recording window starts with an empty table instead of carrying
     /// over data (possibly stale, possibly from a different workload) from
     /// whenever recording last ran.
+    #[cfg(feature = "period-index-propagation")]
     pub(crate) fn reset_pubsub_tables() {
         let mut node = MCSNode::new();
         *PUBLISH.lock(&mut node) = None;
@@ -1197,6 +1201,7 @@ pub mod perf {
     /// `TRACE_PUBSUB,<dag_id>,<node_id>,<period>,<publish_ns|->,<subscribe_ns|->`
     /// Timestamps are already absolute uptime nanoseconds (`Time::now()`),
     /// so unlike `TRACE_EV` no calibration conversion is needed on the host.
+    #[cfg(feature = "period-index-propagation")]
     pub(crate) fn dump_pubsub_to_console() {
         use awkernel_lib::console;
 
@@ -1230,8 +1235,8 @@ pub mod perf {
                     .and_then(|table| table.timestamps.iter().find_map(|m| m.get(&key).copied()))
             };
 
-            let publish_ns = lookup(&*publish_opt);
-            let subscribe_ns = lookup(&*subscribe_opt);
+            let publish_ns = lookup(&publish_opt);
+            let subscribe_ns = lookup(&subscribe_opt);
 
             let fmt = |ts: Option<u64>| match ts {
                 Some(ts) => alloc::format!("{ts}"),

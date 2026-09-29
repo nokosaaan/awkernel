@@ -127,7 +127,12 @@ fn main() -> ExitCode {
     // Show the worst few offenders by name, for spot-checking.
     let mut named: Vec<(String, u32)> = pool
         .iter()
-        .map(|(name, segments)| (name.clone(), segments.iter().map(|s| s.concurrency).max().unwrap_or(0)))
+        .map(|(name, segments)| {
+            (
+                name.clone(),
+                segments.iter().map(|s| s.concurrency).max().unwrap_or(0),
+            )
+        })
         .collect();
     named.sort_by(|a, b| b.1.cmp(&a.1));
     println!("worst 5 by max concurrency:");

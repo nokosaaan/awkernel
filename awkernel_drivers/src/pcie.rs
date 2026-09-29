@@ -40,6 +40,7 @@ pub mod nvme;
 pub mod pcie_class;
 pub mod pcie_id;
 pub mod raspi;
+#[cfg(feature = "xhci")]
 pub mod usb;
 pub mod virtio;
 
@@ -1129,7 +1130,9 @@ impl PCIeInfo {
         // controllers are handled regardless of which silicon vendor made them.
         #[cfg(feature = "xhci")]
         if matches!(self.pcie_class, pcie_class::PCIeClass::SerialBusController) {
-            let cls = self.config_space.read_u32(registers::CLASS_CODE_REVISION_ID);
+            let cls = self
+                .config_space
+                .read_u32(registers::CLASS_CODE_REVISION_ID);
             let sub_class = ((cls >> 16) & 0xff) as u8;
             let prog_if = ((cls >> 8) & 0xff) as u8;
             if sub_class == 0x03 && prog_if == 0x30 {

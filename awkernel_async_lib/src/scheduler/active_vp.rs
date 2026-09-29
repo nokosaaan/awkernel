@@ -34,13 +34,13 @@
 
 use super::{
     get_priority, peek_preemption_pending, push_preemption_pending, ClusteredTask, Scheduler,
-    SchedulerType, Task, GLOBAL_WAKE_GET_MUTEX,
+    SchedulerType, Task, GLOBAL_WAKE_GET_MUTEX, PREEMPTION_ENABLED,
 };
+use crate::atomic_u64::AtomicU64;
 use crate::{
     dag::{calculate_and_update_dag_deadline, is_job_release_wake},
     task::{
-        get_task, get_task_running, set_current_task, set_need_preemption, State,
-        MAX_TASK_PRIORITY,
+        get_task, get_task_running, set_current_task, set_need_preemption, State, MAX_TASK_PRIORITY,
     },
 };
 use affinity_btree_queue::{AffinityBTreeQueue, DEFAULT_MIN_DEGREE};
@@ -50,7 +50,7 @@ use awkernel_lib::{
     cpu::{masked_workers, num_cpu, CpuSet, CPU_SET_WORDS, NUM_MAX_CPU},
     sync::mutex::{MCSNode, Mutex},
 };
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Sentinel `LEADING_OF` value meaning "this core is not currently part of
 /// any active-VP group." Not a valid cpu id (bounded well below
@@ -64,7 +64,8 @@ const NO_GROUP: usize = usize::MAX;
 /// waking task's own `SchedulerType::ActiveVp`, so it never drifts from
 /// what admission decided) rather than a separate admission-time setter,
 /// so this module has a single place that writes it.
-static LEADING_OF: [AtomicUsize; NUM_MAX_CPU] = array![_ => AtomicUsize::new(NO_GROUP); NUM_MAX_CPU];
+static LEADING_OF: [AtomicUsize; NUM_MAX_CPU] =
+    array![_ => AtomicUsize::new(NO_GROUP); NUM_MAX_CPU];
 
 /// The leading core of `cpu`'s active-VP group, or `None` if `cpu` is not
 /// currently part of one.
@@ -175,7 +176,9 @@ pub(crate) fn release_budget(cpu: usize) {
 /// release (see [`is_job_release_wake`]).
 pub(crate) fn replenish(cpu_set: CpuSet) {
     for cpu in cpu_set.iter() {
-        if let (Some(initial), Some(remaining)) = (INITIAL_BUDGET.get(cpu), BUDGET_REMAINING.get(cpu)) {
+        if let (Some(initial), Some(remaining)) =
+            (INITIAL_BUDGET.get(cpu), BUDGET_REMAINING.get(cpu))
+        {
             remaining.store(initial.load(Ordering::Relaxed), Ordering::Relaxed);
         }
     }
@@ -271,8 +274,12 @@ pub(crate) fn tick_budget(cpu_id: usize) {
 /// task's own vertices does not affect correctness here (the paper does
 /// not restrict it), but reusing the identical key avoids a second,
 /// pointlessly-different comparator.
-type ActiveVpQueue =
-    AffinityBTreeQueue<(u64, u64, u64), ClusteredTask<Arc<Task>>, DEFAULT_MIN_DEGREE, CPU_SET_WORDS>;
+type ActiveVpQueue = AffinityBTreeQueue<
+    (u64, u64, u64),
+    ClusteredTask<Arc<Task>>,
+    DEFAULT_MIN_DEGREE,
+    CPU_SET_WORDS,
+>;
 
 pub struct ActiveVpScheduler {
     data: Mutex<Option<ActiveVpQueue>>,
@@ -304,7 +311,13 @@ impl Scheduler for ActiveVpScheduler {
                         .update_priority_info(self.priority, MAX_TASK_PRIORITY - absolute_deadline);
                     info.update_absolute_deadline(absolute_deadline);
 
-                    (wake_time, absolute_deadline, node_priority, cpu_set, leading_cpu)
+                    (
+                        wake_time,
+                        absolute_deadline,
+                        node_priority,
+                        cpu_set,
+                        leading_cpu,
+                    )
                 }
                 _ => unreachable!(),
             }
@@ -421,6 +434,10 @@ impl ActiveVpScheduler {
     /// — via `PriorityInfo`'s packed scheduler-class tier, but the
     /// comparison is kept general rather than hard-coded to that fact.
     fn invoke_preemption(&self, task: Arc<Task>) -> bool {
+        if !PREEMPTION_ENABLED {
+            return false;
+        }
+
         let cpu_set = task.cpu_set.expect("Task has no CPU set");
 
         let mut victim: Option<(usize, Arc<Task>)> = None;

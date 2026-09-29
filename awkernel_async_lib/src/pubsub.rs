@@ -1126,14 +1126,122 @@ impl_async_receiver_for_tuple!(
     (T6, v6, p6),
     (T7, v7, p7)
 );
-impl_async_receiver_for_tuple!((T0, v0, p0), (T1, v1, p1), (T2, v2, p2), (T3, v3, p3), (T4, v4, p4), (T5, v5, p5), (T6, v6, p6), (T7, v7, p7), (T8, v8, p8));
-impl_async_receiver_for_tuple!((T0, v0, p0), (T1, v1, p1), (T2, v2, p2), (T3, v3, p3), (T4, v4, p4), (T5, v5, p5), (T6, v6, p6), (T7, v7, p7), (T8, v8, p8), (T9, v9, p9));
-impl_async_receiver_for_tuple!((T0, v0, p0), (T1, v1, p1), (T2, v2, p2), (T3, v3, p3), (T4, v4, p4), (T5, v5, p5), (T6, v6, p6), (T7, v7, p7), (T8, v8, p8), (T9, v9, p9), (T10, v10, p10));
-impl_async_receiver_for_tuple!((T0, v0, p0), (T1, v1, p1), (T2, v2, p2), (T3, v3, p3), (T4, v4, p4), (T5, v5, p5), (T6, v6, p6), (T7, v7, p7), (T8, v8, p8), (T9, v9, p9), (T10, v10, p10), (T11, v11, p11));
-impl_async_receiver_for_tuple!((T0, v0, p0), (T1, v1, p1), (T2, v2, p2), (T3, v3, p3), (T4, v4, p4), (T5, v5, p5), (T6, v6, p6), (T7, v7, p7), (T8, v8, p8), (T9, v9, p9), (T10, v10, p10), (T11, v11, p11), (T12, v12, p12));
-impl_async_receiver_for_tuple!((T0, v0, p0), (T1, v1, p1), (T2, v2, p2), (T3, v3, p3), (T4, v4, p4), (T5, v5, p5), (T6, v6, p6), (T7, v7, p7), (T8, v8, p8), (T9, v9, p9), (T10, v10, p10), (T11, v11, p11), (T12, v12, p12), (T13, v13, p13));
-impl_async_receiver_for_tuple!((T0, v0, p0), (T1, v1, p1), (T2, v2, p2), (T3, v3, p3), (T4, v4, p4), (T5, v5, p5), (T6, v6, p6), (T7, v7, p7), (T8, v8, p8), (T9, v9, p9), (T10, v10, p10), (T11, v11, p11), (T12, v12, p12), (T13, v13, p13), (T14, v14, p14));
-impl_async_receiver_for_tuple!((T0, v0, p0), (T1, v1, p1), (T2, v2, p2), (T3, v3, p3), (T4, v4, p4), (T5, v5, p5), (T6, v6, p6), (T7, v7, p7), (T8, v8, p8), (T9, v9, p9), (T10, v10, p10), (T11, v11, p11), (T12, v12, p12), (T13, v13, p13), (T14, v14, p14), (T15, v15, p15));
+impl_async_receiver_for_tuple!(
+    (T0, v0, p0),
+    (T1, v1, p1),
+    (T2, v2, p2),
+    (T3, v3, p3),
+    (T4, v4, p4),
+    (T5, v5, p5),
+    (T6, v6, p6),
+    (T7, v7, p7),
+    (T8, v8, p8)
+);
+impl_async_receiver_for_tuple!(
+    (T0, v0, p0),
+    (T1, v1, p1),
+    (T2, v2, p2),
+    (T3, v3, p3),
+    (T4, v4, p4),
+    (T5, v5, p5),
+    (T6, v6, p6),
+    (T7, v7, p7),
+    (T8, v8, p8),
+    (T9, v9, p9)
+);
+impl_async_receiver_for_tuple!(
+    (T0, v0, p0),
+    (T1, v1, p1),
+    (T2, v2, p2),
+    (T3, v3, p3),
+    (T4, v4, p4),
+    (T5, v5, p5),
+    (T6, v6, p6),
+    (T7, v7, p7),
+    (T8, v8, p8),
+    (T9, v9, p9),
+    (T10, v10, p10)
+);
+impl_async_receiver_for_tuple!(
+    (T0, v0, p0),
+    (T1, v1, p1),
+    (T2, v2, p2),
+    (T3, v3, p3),
+    (T4, v4, p4),
+    (T5, v5, p5),
+    (T6, v6, p6),
+    (T7, v7, p7),
+    (T8, v8, p8),
+    (T9, v9, p9),
+    (T10, v10, p10),
+    (T11, v11, p11)
+);
+impl_async_receiver_for_tuple!(
+    (T0, v0, p0),
+    (T1, v1, p1),
+    (T2, v2, p2),
+    (T3, v3, p3),
+    (T4, v4, p4),
+    (T5, v5, p5),
+    (T6, v6, p6),
+    (T7, v7, p7),
+    (T8, v8, p8),
+    (T9, v9, p9),
+    (T10, v10, p10),
+    (T11, v11, p11),
+    (T12, v12, p12)
+);
+impl_async_receiver_for_tuple!(
+    (T0, v0, p0),
+    (T1, v1, p1),
+    (T2, v2, p2),
+    (T3, v3, p3),
+    (T4, v4, p4),
+    (T5, v5, p5),
+    (T6, v6, p6),
+    (T7, v7, p7),
+    (T8, v8, p8),
+    (T9, v9, p9),
+    (T10, v10, p10),
+    (T11, v11, p11),
+    (T12, v12, p12),
+    (T13, v13, p13)
+);
+impl_async_receiver_for_tuple!(
+    (T0, v0, p0),
+    (T1, v1, p1),
+    (T2, v2, p2),
+    (T3, v3, p3),
+    (T4, v4, p4),
+    (T5, v5, p5),
+    (T6, v6, p6),
+    (T7, v7, p7),
+    (T8, v8, p8),
+    (T9, v9, p9),
+    (T10, v10, p10),
+    (T11, v11, p11),
+    (T12, v12, p12),
+    (T13, v13, p13),
+    (T14, v14, p14)
+);
+impl_async_receiver_for_tuple!(
+    (T0, v0, p0),
+    (T1, v1, p1),
+    (T2, v2, p2),
+    (T3, v3, p3),
+    (T4, v4, p4),
+    (T5, v5, p5),
+    (T6, v6, p6),
+    (T7, v7, p7),
+    (T8, v8, p8),
+    (T9, v9, p9),
+    (T10, v10, p10),
+    (T11, v11, p11),
+    (T12, v12, p12),
+    (T13, v13, p13),
+    (T14, v14, p14),
+    (T15, v15, p15)
+);
 
 #[cfg(test)]
 mod tests {

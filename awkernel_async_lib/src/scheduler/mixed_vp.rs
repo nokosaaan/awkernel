@@ -46,11 +46,13 @@
 
 use super::{
     active_vp, get_priority, passive_vp, peek_preemption_pending, push_preemption_pending,
-    ClusteredTask, Scheduler, SchedulerType, Task, GLOBAL_WAKE_GET_MUTEX,
+    ClusteredTask, Scheduler, SchedulerType, Task, GLOBAL_WAKE_GET_MUTEX, PREEMPTION_ENABLED,
 };
 use crate::{
     dag::{calculate_and_update_dag_deadline, is_job_release_wake},
-    task::{get_task, get_task_running, set_current_task, set_need_preemption, State, MAX_TASK_PRIORITY},
+    task::{
+        get_task, get_task_running, set_current_task, set_need_preemption, State, MAX_TASK_PRIORITY,
+    },
 };
 use affinity_btree_queue::{AffinityBTreeQueue, DEFAULT_MIN_DEGREE};
 use alloc::{sync::Arc, vec::Vec};
@@ -59,8 +61,15 @@ use awkernel_lib::{
     sync::mutex::{MCSNode, Mutex},
 };
 
-type MixedVpQueue =
-    AffinityBTreeQueue<(u64, u64, u64), ClusteredTask<Arc<Task>>, DEFAULT_MIN_DEGREE, CPU_SET_WORDS>;
+type MixedVpQueue = AffinityBTreeQueue<
+    (u64, u64, u64),
+    ClusteredTask<Arc<Task>>,
+    DEFAULT_MIN_DEGREE,
+    CPU_SET_WORDS,
+>;
+
+/// A popped queue entry held aside by `get_next`: `(key, cpu_set, task)`.
+type DeferredEntry = ((u64, u64, u64), CpuSet, ClusteredTask<Arc<Task>>);
 
 pub struct MixedVpScheduler {
     data: Mutex<Option<MixedVpQueue>>,
@@ -97,7 +106,14 @@ impl Scheduler for MixedVpScheduler {
                     info.update_absolute_deadline(absolute_deadline);
 
                     let cpu_set = active_set.union(passive_set);
-                    (wake_time, absolute_deadline, node_priority, active_set, leading_cpu, cpu_set)
+                    (
+                        wake_time,
+                        absolute_deadline,
+                        node_priority,
+                        active_set,
+                        leading_cpu,
+                        cpu_set,
+                    )
                 }
                 _ => unreachable!(),
             }
@@ -142,7 +158,7 @@ impl Scheduler for MixedVpScheduler {
         // before this call returns, so they remain available to whichever
         // cpu (possibly this same one, next time) they're actually eligible
         // for.
-        let mut deferred: Vec<((u64, u64, u64), CpuSet, ClusteredTask<Arc<Task>>)> = Vec::new();
+        let mut deferred: Vec<DeferredEntry> = Vec::new();
 
         let dispatched = loop {
             let Some((key, entry_cpu_set, mut entry)) = queue.pop_for_cpu(cpu_id) else {
@@ -233,6 +249,10 @@ impl MixedVpScheduler {
     /// from ever being true when `target_task` is that core's true
     /// active-VP owner.
     fn invoke_preemption(&self, task: Arc<Task>) -> bool {
+        if !PREEMPTION_ENABLED {
+            return false;
+        }
+
         let cpu_set = task.cpu_set.expect("Task has no CPU set");
 
         let mut victim: Option<(usize, Arc<Task>)> = None;

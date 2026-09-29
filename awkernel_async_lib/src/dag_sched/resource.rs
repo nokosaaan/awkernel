@@ -290,9 +290,10 @@ pub fn dagfluid_pool_cpu_set() -> CpuSet {
     let mut node = MCSNode::new();
     let pool = POOL.lock(&mut node);
     let mut set = CpuSet::empty();
-    for cpu in (1..num_cpu()).filter(|&cpu| is_dag_pool_core(cpu) && !pool.claimed_cores.contains(cpu)) {
+    for cpu in
+        (1..num_cpu()).filter(|&cpu| is_dag_pool_core(cpu) && !pool.claimed_cores.contains(cpu))
+    {
         set.insert(cpu);
     }
     set
 }
-

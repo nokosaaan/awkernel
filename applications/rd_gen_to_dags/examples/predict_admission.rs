@@ -48,7 +48,10 @@ fn main() -> ExitCode {
         }
     };
 
-    println!("# {} DAGs from '{dag_dir}', num_cores={num_cores}", configs.len());
+    println!(
+        "# {} DAGs from '{dag_dir}', num_cores={num_cores}",
+        configs.len()
+    );
     for (i, config) in configs.iter().enumerate() {
         let fed = federated::classify_dag(config);
         let v = vfed::classify(config);
@@ -77,11 +80,7 @@ fn main() -> ExitCode {
 }
 
 fn verdict(ok: bool) -> &'static str {
-    if ok {
-        "ACCEPT"
-    } else {
-        "REJECT"
-    }
+    if ok { "ACCEPT" } else { "REJECT" }
 }
 
 fn load_configs(dag_dir: &str) -> Result<(Vec<DagMetrics>, Vec<DagGraph>), String> {

@@ -1,3 +1,6 @@
+// Mass-storage / FAT32 / CDC-ACM paths are not wired into `attach` yet.
+#![allow(dead_code)]
+
 /// Command Block Wrapper — USB MSC BOT §5.1. Always 31 bytes on the wire.
 #[repr(C, packed)]
 #[derive(Copy, Clone)]

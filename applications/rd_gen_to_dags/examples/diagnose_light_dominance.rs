@@ -24,7 +24,7 @@ use awkernel_async_lib::dag_sched::{
         vfed::{self, PackingStrategy, TaskClass as VFedTaskClass},
     },
 };
-use rand::{seq::IndexedRandom, Rng};
+use rand::{Rng, seq::IndexedRandom};
 
 const DAGS_PER_SET: usize = 8;
 const ALPHA: f64 = 0.3;
@@ -160,7 +160,10 @@ fn main() -> ExitCode {
     let mut checked = 0usize;
     for (config, _) in &pool {
         checked += 1;
-        let fed_heavy = matches!(federated::classify_dag(config), Ok(FedTaskClass::Heavy { .. }));
+        let fed_heavy = matches!(
+            federated::classify_dag(config),
+            Ok(FedTaskClass::Heavy { .. })
+        );
         let vfed_heavy = matches!(vfed::classify(config), Ok(VFedTaskClass::Heavy { .. }));
         if fed_heavy != vfed_heavy {
             vfed_heavy_mismatch += 1;
@@ -216,7 +219,10 @@ fn override_deadline(config: DagMetrics, rng: &mut impl Rng) -> DagMetrics {
     let l = config.critical_path as f64;
     let d = l + rng.random_range(0.0..=1.0) * (l / ALPHA - l);
     let d = (d as u64).max(1);
-    DagMetrics { relative_deadline: d, ..config }
+    DagMetrics {
+        relative_deadline: d,
+        ..config
+    }
 }
 
 fn override_period(config: DagMetrics, rng: &mut impl Rng) -> DagMetrics {
@@ -231,6 +237,8 @@ fn assign_max_parallelism(config: DagMetrics, rng: &mut impl Rng) -> DagMetrics 
     };
     let lo = m.div_ceil(2);
     let max_parallelism = if lo >= m { m } else { rng.random_range(lo..=m) };
-    DagMetrics { max_parallelism, ..config }
+    DagMetrics {
+        max_parallelism,
+        ..config
+    }
 }
-

@@ -89,12 +89,7 @@
 //! pool-load time and carried alongside each `DagMetrics` through every
 //! later resample.
 
-use std::{
-    env, fs,
-    io::Write,
-    path::Path,
-    process::ExitCode,
-};
+use std::{env, fs, io::Write, path::Path, process::ExitCode};
 
 use awkernel_async_lib::dag_sched::{
     metrics::DagMetrics,
@@ -103,7 +98,7 @@ use awkernel_async_lib::dag_sched::{
         vfed::{self, PackingStrategy},
     },
 };
-use rand::{seq::IndexedRandom, Rng};
+use rand::{Rng, seq::IndexedRandom};
 use rd_gen_to_dags::dag_fluid::{self, Segment};
 
 /// One pool DAG: filename, metrics (deadline/period overridden), DAG-Fluid
@@ -123,14 +118,24 @@ const ALPHA: f64 = 0.3;
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
-    let (pool_dir, u_norm_min, u_norm_max, u_norm_step, trials_jsonl_path) = match args.as_slice()
-    {
+    let (pool_dir, u_norm_min, u_norm_max, u_norm_step, trials_jsonl_path) = match args.as_slice() {
         [_, pool_dir, u_norm_min, u_norm_max, u_norm_step] => {
             (pool_dir, u_norm_min, u_norm_max, u_norm_step, None)
         }
-        [_, pool_dir, u_norm_min, u_norm_max, u_norm_step, trials_jsonl_path] => {
-            (pool_dir, u_norm_min, u_norm_max, u_norm_step, Some(trials_jsonl_path))
-        }
+        [
+            _,
+            pool_dir,
+            u_norm_min,
+            u_norm_max,
+            u_norm_step,
+            trials_jsonl_path,
+        ] => (
+            pool_dir,
+            u_norm_min,
+            u_norm_max,
+            u_norm_step,
+            Some(trials_jsonl_path),
+        ),
         _ => {
             eprintln!(
                 "usage: acceptance_ratio <pool_dir> <u_norm_min> <u_norm_max> <u_norm_step> [trials_jsonl_path]"
@@ -138,17 +143,20 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let (u_norm_min, u_norm_max, u_norm_step) =
-        match (parse_positive_f64(u_norm_min), parse_positive_f64(u_norm_max), parse_positive_f64(u_norm_step)) {
-            (Some(a), Some(b), Some(c)) if a <= b => (a, b, c),
-            _ => {
-                eprintln!(
-                    "u_norm_min/u_norm_max/u_norm_step must be positive numbers with min <= max, \
+    let (u_norm_min, u_norm_max, u_norm_step) = match (
+        parse_positive_f64(u_norm_min),
+        parse_positive_f64(u_norm_max),
+        parse_positive_f64(u_norm_step),
+    ) {
+        (Some(a), Some(b), Some(c)) if a <= b => (a, b, c),
+        _ => {
+            eprintln!(
+                "u_norm_min/u_norm_max/u_norm_step must be positive numbers with min <= max, \
                      got '{u_norm_min}', '{u_norm_max}', '{u_norm_step}'"
-                );
-                return ExitCode::from(2);
-            }
-        };
+            );
+            return ExitCode::from(2);
+        }
+    };
 
     let pool = match load_pool(Path::new(pool_dir)) {
         Ok(p) if !p.is_empty() => p,
@@ -181,11 +189,13 @@ fn main() -> ExitCode {
         let mut dag_fluid_accepted = 0usize;
 
         for trial in 0..TRIALS_PER_LEVEL {
-            let set: Vec<&PoolEntry> =
-                pool.choose_multiple(&mut rng, DAGS_PER_SET).collect();
+            let set: Vec<&PoolEntry> = pool.choose_multiple(&mut rng, DAGS_PER_SET).collect();
             let metrics: Vec<DagMetrics> = set.iter().map(|(_, m, _, _)| *m).collect();
 
-            let u_sigma: f64 = metrics.iter().map(|d| d.volume as f64 / d.period as f64).sum();
+            let u_sigma: f64 = metrics
+                .iter()
+                .map(|d| d.volume as f64 / d.period as f64)
+                .sum();
             // u_sigma > 0 always (every WCET is >= 1), so this is never 0/0;
             // ceil() can still round down to 0 when u_norm is large enough
             // that a fractional core would suffice, which we round up to 1
@@ -340,7 +350,10 @@ fn override_deadline(config: DagMetrics, rng: &mut impl Rng) -> DagMetrics {
     let l = config.critical_path as f64;
     let d = l + rng.random_range(0.0..=1.0) * (l / ALPHA - l);
     let d = (d as u64).max(1);
-    DagMetrics { relative_deadline: d, ..config }
+    DagMetrics {
+        relative_deadline: d,
+        ..config
+    }
 }
 
 /// The paper's own generation order for its constrained-deadline figures
@@ -372,6 +385,8 @@ fn assign_max_parallelism(config: DagMetrics, rng: &mut impl Rng) -> DagMetrics 
     };
     let lo = m.div_ceil(2);
     let max_parallelism = if lo >= m { m } else { rng.random_range(lo..=m) };
-    DagMetrics { max_parallelism, ..config }
+    DagMetrics {
+        max_parallelism,
+        ..config
+    }
 }
-

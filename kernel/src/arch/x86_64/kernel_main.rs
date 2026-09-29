@@ -1015,9 +1015,11 @@ fn init_dma(
 /// No-ops silently if the framebuffer is absent or already consumed.
 fn draw_boot_bar(boot_info: &mut BootInfo, bar_index: usize, r: u8, g: u8, b: u8) {
     use bootloader_api::info::PixelFormat;
-    let Some(fb) = boot_info.framebuffer.as_mut() else { return };
+    let Some(fb) = boot_info.framebuffer.as_mut() else {
+        return;
+    };
     let info = fb.info();
-    let buf  = fb.buffer_mut();
+    let buf = fb.buffer_mut();
     const BAR_H: usize = 16;
     let y0 = bar_index * BAR_H;
     let y1 = (y0 + BAR_H).min(info.height);
@@ -1025,10 +1027,20 @@ fn draw_boot_bar(boot_info: &mut BootInfo, bar_index: usize, r: u8, g: u8, b: u8
         for x in 0..info.width {
             // stride is in pixels (bootloader_api spec)
             let off = (y * info.stride + x) * info.bytes_per_pixel;
-            if off + 3 > buf.len() { break; }
+            if off + 3 > buf.len() {
+                break;
+            }
             match info.pixel_format {
-                PixelFormat::Rgb => { buf[off]=r; buf[off+1]=g; buf[off+2]=b; }
-                PixelFormat::Bgr => { buf[off]=b; buf[off+1]=g; buf[off+2]=r; }
+                PixelFormat::Rgb => {
+                    buf[off] = r;
+                    buf[off + 1] = g;
+                    buf[off + 2] = b;
+                }
+                PixelFormat::Bgr => {
+                    buf[off] = b;
+                    buf[off + 1] = g;
+                    buf[off + 2] = r;
+                }
                 _ => {
                     let luma = ((r as u16 + g as u16 + b as u16) / 3) as u8;
                     buf[off] = luma;

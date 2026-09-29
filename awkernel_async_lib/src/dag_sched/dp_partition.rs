@@ -208,6 +208,7 @@ fn millis_f64_to_duration(ms: f64) -> Duration {
 /// to advance past. `Vec::push`/`BTreeMap` insertion (possibly
 /// reallocating) is fine here: this only ever runs during boot admission,
 /// never from [`on_dp_boundary`].
+#[allow(clippy::too_many_arguments)]
 pub fn register_segment(
     dag_id: u32,
     segment_index: usize,
@@ -375,7 +376,11 @@ pub fn arm_next() {
     let next = {
         let mut node = MCSNode::new();
         let pending = PENDING.lock(&mut node);
-        pending.iter().filter(|e| !e.logged).map(|e| e.scheduled).min()
+        pending
+            .iter()
+            .filter(|e| !e.logged)
+            .map(|e| e.scheduled)
+            .min()
     };
     if let Some(deadline) = next {
         log::info!(
@@ -428,7 +433,11 @@ fn on_dp_boundary() {
             entry.logged = true;
         }
     }
-    let next = pending.iter().filter(|e| !e.logged).map(|e| e.scheduled).min();
+    let next = pending
+        .iter()
+        .filter(|e| !e.logged)
+        .map(|e| e.scheduled)
+        .min();
     drop(pending);
 
     if let Some(deadline) = next {
@@ -440,6 +449,10 @@ fn on_dp_boundary() {
         timer::request_at(TimerRequestId::DpBoundary, deadline);
     }
 }
+
+/// A due boundary snapshotted by [`advance_due_segments`]: `(pending index,
+/// dag_id, segment_index, gate_nodes, gate_period_indices)`.
+type DueEntry = (usize, u32, usize, Vec<u32>, Vec<Option<Arc<AtomicU32>>>);
 
 /// Poll [`PENDING`] once for boundaries whose scheduled time has arrived,
 /// and actually advance the ones whose completion gate
@@ -469,7 +482,7 @@ fn advance_due_segments() {
     // DAG/task state, which takes other locks of its own). `gate_nodes`
     // and `gate_period_indices` are cheap to clone (small `Vec`, and
     // `Option<Arc<_>>` clones are just refcount bumps).
-    let due: Vec<(usize, u32, usize, Vec<u32>, Vec<Option<Arc<AtomicU32>>>)> = {
+    let due: Vec<DueEntry> = {
         let mut node = MCSNode::new();
         let pending = PENDING.lock(&mut node);
         pending

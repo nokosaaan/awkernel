@@ -317,8 +317,9 @@ pub fn list_schedule_makespan(graph: &DagGraph, processors: u16) -> Option<u64> 
         return None;
     }
     let mut remaining_preds = graph.in_degree.clone();
-    let mut ready: alloc::collections::BTreeSet<usize> =
-        (0..graph.len()).filter(|&v| remaining_preds[v] == 0).collect();
+    let mut ready: alloc::collections::BTreeSet<usize> = (0..graph.len())
+        .filter(|&v| remaining_preds[v] == 0)
+        .collect();
     let mut running: Vec<(u64, usize)> = Vec::new(); // (finish time, node)
     let mut free = processors as usize;
     let mut now = 0u64;
@@ -878,7 +879,7 @@ mod tests {
     fn test_list_schedule_makespan_date15_fig1() {
         let g = date15_fig1_graph();
         assert_eq!(list_schedule_makespan(&g, 1), Some(9)); // = vol
-        // 2 procs: {0,1} -> 2 starts at 2, ends 4 -> {3,4} 4..5 -> 5 5..7.
+                                                            // 2 procs: {0,1} -> 2 starts at 2, ends 4 -> {3,4} 4..5 -> 5 5..7.
         assert_eq!(list_schedule_makespan(&g, 2), Some(7));
         assert_eq!(list_schedule_makespan(&g, 3), Some(6)); // = len
         assert_eq!(list_schedule_makespan(&g, 0), None);
@@ -931,8 +932,14 @@ mod tests {
             metrics: DagMetrics::from_static(40, 10, 100, 20),
             graph: &g,
         };
-        assert_eq!(min_procs(FederatedVariant::BaruahConstrained, &task, 16), Some(2));
-        assert_eq!(min_procs(FederatedVariant::BaruahConstrained, &task, 1), None);
+        assert_eq!(
+            min_procs(FederatedVariant::BaruahConstrained, &task, 16),
+            Some(2)
+        );
+        assert_eq!(
+            min_procs(FederatedVariant::BaruahConstrained, &task, 1),
+            None
+        );
     }
 
     #[test]
@@ -945,7 +952,10 @@ mod tests {
             metrics: DagMetrics::from_static(30, 5, 10, 25),
             graph: &g,
         };
-        assert_eq!(min_procs(FederatedVariant::BaruahArbitrary, &task, 16), Some(4));
+        assert_eq!(
+            min_procs(FederatedVariant::BaruahArbitrary, &task, 16),
+            Some(4)
+        );
         assert_eq!(min_procs(FederatedVariant::BaruahArbitrary, &task, 3), None);
     }
 

@@ -147,6 +147,7 @@ pub struct Segment {
 /// - `Σ duration == critical_path` (segments partition the *entire*
 ///   infinite-processor timeline end to end, and that timeline's total span
 ///   is, by definition, the longest path's own length).
+///
 /// Shared "infinite processors" timing computation (see [`decompose_segments`]'s
 /// own doc): per-node `start`/`finish` in that idealized model, plus the
 /// sorted, deduplicated timeline of every distinct start/finish instant.
@@ -253,6 +254,7 @@ pub(crate) fn decompose_segments(dag_data: &DagData) -> Vec<Segment> {
 /// points), but harmless if it ever did: that node's completion would then
 /// never gate anything, same as if this function were never consulted for
 /// it.
+#[cfg_attr(not(feature = "dagfluid"), allow(dead_code))]
 pub(crate) fn segment_completion_gates(dag_data: &DagData) -> Vec<Vec<u32>> {
     let (start, finish, events) = segment_timeline(dag_data);
 
@@ -286,6 +288,8 @@ pub(crate) fn segment_completion_gates(dag_data: &DagData) -> Vec<Vec<u32>> {
 /// are `T_i`/`D_i`/`L_i`. Always returns `deadline` (row 1) when `period >=
 /// deadline` (constrained deadline, `T_i/D_i >= 1`) — the only case this
 /// crate's own generated pools ever exercise.
+// One branch per row of the paper's table, even where rows share a value.
+#[allow(clippy::if_same_then_else)]
 pub(crate) fn virtual_deadline(period: u64, deadline: u64, critical_path: u64) -> u64 {
     let t = period as f64;
     let d = deadline as f64;
@@ -582,11 +586,26 @@ mod tests {
     #[test]
     fn test_assign_segment_deadlines_matches_paper_worked_example() {
         let segments = [
-            Segment { duration: 10, concurrency: 1 },
-            Segment { duration: 10, concurrency: 2 },
-            Segment { duration: 20, concurrency: 3 },
-            Segment { duration: 10, concurrency: 2 },
-            Segment { duration: 10, concurrency: 1 },
+            Segment {
+                duration: 10,
+                concurrency: 1,
+            },
+            Segment {
+                duration: 10,
+                concurrency: 2,
+            },
+            Segment {
+                duration: 20,
+                concurrency: 3,
+            },
+            Segment {
+                duration: 10,
+                concurrency: 2,
+            },
+            Segment {
+                duration: 10,
+                concurrency: 1,
+            },
         ];
         let volume = 120;
         let d_star = virtual_deadline(90, 80, 60);
@@ -597,7 +616,10 @@ mod tests {
         assert_eq!(deadlines, alloc::vec![10.0, 12.0, 36.0, 12.0, 10.0]);
 
         let rates: Vec<f64> = schedule.iter().map(|s| s.rate).collect();
-        assert_eq!(rates, alloc::vec![1.0, 10.0 / 12.0, 20.0 / 36.0, 10.0 / 12.0, 1.0]);
+        assert_eq!(
+            rates,
+            alloc::vec![1.0, 10.0 / 12.0, 20.0 / 36.0, 10.0 / 12.0, 1.0]
+        );
         // Paper's own Definition 4.1 states the light-segment rate as
         // exactly 5/6 and 5/9 -- confirm the fractions reduce to those.
         assert!((rates[1] - 5.0 / 6.0).abs() < 1e-9);
@@ -633,7 +655,10 @@ nodes:
         let segments = decompose_segments(&dags[0]);
         assert!(segments.iter().all(|s| s.concurrency == 1));
         let total_duration: u64 = segments.iter().map(|s| s.duration).sum();
-        let total_work: u64 = segments.iter().map(|s| s.duration * s.concurrency as u64).sum();
+        let total_work: u64 = segments
+            .iter()
+            .map(|s| s.duration * s.concurrency as u64)
+            .sum();
         let stats = compute_dag_stats(&dags[0]);
         assert_eq!(total_duration, stats.critical_path);
         assert_eq!(total_work, stats.volume);
@@ -673,15 +698,30 @@ nodes:
         assert_eq!(
             segments,
             alloc::vec![
-                Segment { duration: 10, concurrency: 1 },
-                Segment { duration: 5, concurrency: 2 },
-                Segment { duration: 25, concurrency: 1 },
-                Segment { duration: 5, concurrency: 1 },
+                Segment {
+                    duration: 10,
+                    concurrency: 1
+                },
+                Segment {
+                    duration: 5,
+                    concurrency: 2
+                },
+                Segment {
+                    duration: 25,
+                    concurrency: 1
+                },
+                Segment {
+                    duration: 5,
+                    concurrency: 1
+                },
             ]
         );
 
         let total_duration: u64 = segments.iter().map(|s| s.duration).sum();
-        let total_work: u64 = segments.iter().map(|s| s.duration * s.concurrency as u64).sum();
+        let total_work: u64 = segments
+            .iter()
+            .map(|s| s.duration * s.concurrency as u64)
+            .sum();
         let stats = compute_dag_stats(&dags[0]);
         assert_eq!(total_duration, stats.critical_path); // 45
         assert_eq!(total_work, stats.volume); // 50
@@ -792,11 +832,23 @@ nodes:
         // C^H_i=6, D^H_i=5 (order-independent: both concurrency=1 segments
         // get peeled before the concurrency=2 one is ever tested).
         let segments = [
-            Segment { duration: 5, concurrency: 1 },
-            Segment { duration: 3, concurrency: 2 },
-            Segment { duration: 4, concurrency: 1 },
+            Segment {
+                duration: 5,
+                concurrency: 1,
+            },
+            Segment {
+                duration: 3,
+                concurrency: 2,
+            },
+            Segment {
+                duration: 4,
+                concurrency: 1,
+            },
         ];
-        assert_eq!(heavy_capacity_and_deadline(&segments, 15, 14), Some((6.0, 5.0)));
+        assert_eq!(
+            heavy_capacity_and_deadline(&segments, 15, 14),
+            Some((6.0, 5.0))
+        );
     }
 
     #[test]
@@ -804,8 +856,14 @@ nodes:
         // Single segment (10, concurrency=1), volume=10, virtual_deadline=20:
         // 10/(20*1)=0.5<=1 -> stop immediately, nothing peeled. Heavy = the
         // whole (single) segment set.
-        let segments = [Segment { duration: 10, concurrency: 1 }];
-        assert_eq!(heavy_capacity_and_deadline(&segments, 10, 20), Some((10.0, 20.0)));
+        let segments = [Segment {
+            duration: 10,
+            concurrency: 1,
+        }];
+        assert_eq!(
+            heavy_capacity_and_deadline(&segments, 10, 20),
+            Some((10.0, 20.0))
+        );
     }
 
     #[test]
@@ -815,7 +873,10 @@ nodes:
         // no heavy segment remains (a degenerate input Lemma 5.2 says can't
         // arise from a real volume > virtual_deadline task, but the
         // function guards it defensively regardless).
-        let segments = [Segment { duration: 10, concurrency: 1 }];
+        let segments = [Segment {
+            duration: 10,
+            concurrency: 1,
+        }];
         assert_eq!(heavy_capacity_and_deadline(&segments, 10, 5), None);
     }
 
@@ -824,7 +885,10 @@ nodes:
         // period=20, deadline=10 -> ratio=2>=1 -> row 1, D*_i=10.
         // volume=8<=D*_i=10 -> tau_seq, rate=8/10=0.8.
         // concurrent_jobs=ceil(D*_i/T_i)=ceil(10/20)=1.
-        let segments = [Segment { duration: 5, concurrency: 1 }];
+        let segments = [Segment {
+            duration: 5,
+            concurrency: 1,
+        }];
         let got = required_capacity(8, 20, 5, 10, &segments).unwrap();
         assert!((got - 0.8).abs() < 1e-9);
     }
@@ -837,9 +901,18 @@ nodes:
         // tau_paral). C^H_i/D^H_i=6/5=1.2.
         // concurrent_jobs=ceil(14/20)=1.
         let segments = [
-            Segment { duration: 5, concurrency: 1 },
-            Segment { duration: 3, concurrency: 2 },
-            Segment { duration: 4, concurrency: 1 },
+            Segment {
+                duration: 5,
+                concurrency: 1,
+            },
+            Segment {
+                duration: 3,
+                concurrency: 2,
+            },
+            Segment {
+                duration: 4,
+                concurrency: 1,
+            },
         ];
         let got = required_capacity(15, 20, 12, 14, &segments).unwrap();
         assert!((got - 1.2).abs() < 1e-9);
@@ -847,18 +920,33 @@ nodes:
 
     #[test]
     fn test_required_capacity_none_when_critical_path_exceeds_deadline() {
-        let segments = [Segment { duration: 50, concurrency: 2 }];
+        let segments = [Segment {
+            duration: 50,
+            concurrency: 2,
+        }];
         assert!(required_capacity(10, 100, 50, 40, &segments).is_none());
     }
 
     #[test]
     fn test_is_batch_feasible_sums_required_capacity() {
         // The tau_seq (0.8) and tau_paral (1.2) examples above sum to 2.0.
-        let seq_segments = [Segment { duration: 5, concurrency: 1 }];
+        let seq_segments = [Segment {
+            duration: 5,
+            concurrency: 1,
+        }];
         let paral_segments = [
-            Segment { duration: 5, concurrency: 1 },
-            Segment { duration: 3, concurrency: 2 },
-            Segment { duration: 4, concurrency: 1 },
+            Segment {
+                duration: 5,
+                concurrency: 1,
+            },
+            Segment {
+                duration: 3,
+                concurrency: 2,
+            },
+            Segment {
+                duration: 4,
+                concurrency: 1,
+            },
         ];
         let entries: [(u64, u64, u64, u64, &[Segment]); 2] = [
             (8, 20, 5, 10, &seq_segments),
@@ -870,8 +958,14 @@ nodes:
 
     #[test]
     fn test_is_batch_feasible_rejects_when_any_entry_is_infeasible() {
-        let ok_segments = [Segment { duration: 5, concurrency: 1 }];
-        let bad_segments = [Segment { duration: 50, concurrency: 2 }];
+        let ok_segments = [Segment {
+            duration: 5,
+            concurrency: 1,
+        }];
+        let bad_segments = [Segment {
+            duration: 50,
+            concurrency: 2,
+        }];
         let entries: [(u64, u64, u64, u64, &[Segment]); 2] = [
             (8, 20, 5, 10, &ok_segments),
             (10, 100, 50, 40, &bad_segments), // critical_path > deadline

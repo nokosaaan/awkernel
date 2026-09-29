@@ -9,6 +9,7 @@ extern crate alloc;
 mod accepter;
 pub mod action;
 mod anydict;
+pub(crate) mod atomic_u64;
 pub mod channel;
 pub mod dag;
 pub mod dag_sched;

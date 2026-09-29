@@ -5,6 +5,8 @@ use crate::parse_yaml::{DagData, NodeData};
 use crate::time_unit::{convert_duration, simulated_execution_time};
 
 use alloc::{borrow::Cow, collections::BTreeMap, format, sync::Arc, vec::Vec};
+#[cfg(feature = "laxity")]
+use awkernel_async_lib::dag_sched::metrics::DagMetrics;
 #[cfg(not(feature = "vfed"))]
 use awkernel_async_lib::dag_sched::policy::federated::FederatedAssignment;
 #[cfg(feature = "vfed")]
@@ -12,12 +14,10 @@ use awkernel_async_lib::dag_sched::policy::vfed::{self, VFedError};
 #[cfg(feature = "dagfluid")]
 use awkernel_async_lib::dag_sched::resource::{self, ResourceError};
 use awkernel_async_lib::{
-    dag::{create_dag, record_build_failure, Dag},
+    dag::{Dag, create_dag, record_build_failure},
     dag_sched::policy::federated::FederatedError,
     scheduler::SchedulerType,
 };
-#[cfg(feature = "laxity")]
-use awkernel_async_lib::dag_sched::metrics::DagMetrics;
 
 #[cfg(any(
     all(feature = "vfed", feature = "laxity"),
@@ -249,8 +249,12 @@ async fn register_source_node(
         4 => register_source!(dag, node_data, sched_type, u64, u64, u64, u64),
         5 => register_source!(dag, node_data, sched_type, u64, u64, u64, u64, u64),
         6 => register_source!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64),
-        7 => register_source!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64),
-        8 => register_source!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64),
+        7 => register_source!(
+            dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64
+        ),
+        8 => register_source!(
+            dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64
+        ),
         9 => register_source!(
             dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64
         ),
@@ -302,9 +306,9 @@ macro_rules! register_sink {
             let execution_time = registration_info.execution_time;
             $dag.register_sink_reactor::<_, ($($T_in,)*)>(
                 reactor_name.clone(),
-                move |inputs: ($($T_in,)*)| {
+                move |_inputs: ($($T_in,)*)| {
                     simulated_execution_time(execution_time);
-                    // log::debug!("name: {reactor_name}, inputs: {inputs:?}");
+                    // log::debug!("name: {reactor_name}, inputs: {_inputs:?}");
                 },
                 sub_topics,
                 $sched_type,
@@ -332,10 +336,16 @@ async fn register_sink_node(
         4 => register_sink!(dag, node_data, sched_type, u64, u64, u64, u64),
         5 => register_sink!(dag, node_data, sched_type, u64, u64, u64, u64, u64),
         6 => register_sink!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64),
-        7 => register_sink!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64),
-        8 => register_sink!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64),
+        7 => register_sink!(
+            dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64
+        ),
+        8 => register_sink!(
+            dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64
+        ),
         9 => {
-            register_sink!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+            register_sink!(
+                dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64
+            )
         }
         10 => register_sink!(
             dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64
@@ -395,10 +405,10 @@ macro_rules! register_intermediate {
             let reactor_name = registration_info.reactor_name;
             $dag.register_reactor::<_, ($($T_in,)*), ($($T_out,)*)>(
                 reactor_name.clone(),
-                move |inputs: ($($T_in,)*)| -> ($($T_out,)*) {
+                move |_inputs: ($($T_in,)*)| -> ($($T_out,)*) {
                     simulated_execution_time(execution_time);
                     let outputs = ($(execution_time as $T_out,)*);
-                    // log::debug!("name: {reactor_name}, inputs: {inputs:?}, outputs: {outputs:?}");
+                    // log::debug!("name: {reactor_name}, inputs: {_inputs:?}, outputs: {outputs:?}");
                     outputs
                 },
                 sub_topics,

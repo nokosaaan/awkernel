@@ -134,7 +134,10 @@ impl SchedulerType {
         matches!(
             (self, other),
             (SchedulerType::ActiveVp(_, _), SchedulerType::ActiveVp(_, _))
-                | (SchedulerType::MixedVp(_, _, _), SchedulerType::MixedVp(_, _, _))
+                | (
+                    SchedulerType::MixedVp(_, _, _),
+                    SchedulerType::MixedVp(_, _, _)
+                )
                 | (SchedulerType::GEDF(_), SchedulerType::GEDF(_))
                 | (SchedulerType::DpWrap(_), SchedulerType::DpWrap(_))
                 | (
@@ -620,11 +623,18 @@ pub fn wake_task() -> Option<Duration> {
     // Check whether each running task exceeds the time quantum (RR) or its
     // active-VP budget (V-Fed) — see `active_vp`'s WCET contract for the
     // bound on this loop's per-cpu work.
+    //
+    // Only the RR quantum check preempts, so only it is skipped when
+    // preemption is disabled. The active-VP budget accounting and the
+    // DAG-Fluid switch plan below never send an IPI themselves, and
+    // `get_next` gating relies on them either way.
     for cpu_id in 1..num_cpu() {
         if let Some(task_id) = get_current_task(cpu_id) {
             match get_scheduler_type_by_task_id(task_id) {
                 Some(SchedulerType::PrioritizedRR(_)) => {
-                    prioritized_rr::SCHEDULER.invoke_preemption_tick(cpu_id, task_id)
+                    if PREEMPTION_ENABLED {
+                        prioritized_rr::SCHEDULER.invoke_preemption_tick(cpu_id, task_id)
+                    }
                 }
                 Some(SchedulerType::ActiveVp(_, _)) => active_vp::tick_budget(cpu_id),
                 // Only while running as this group's own active-VP work —
@@ -638,18 +648,6 @@ pub fn wake_task() -> Option<Duration> {
                 }
                 _ => active_vp::mark_idle(cpu_id),
             }
-        }
-    }
-    // Check whether each running task exceeds the time quantum.
-    if PREEMPTION_ENABLED {
-        for cpu_id in 1..num_cpu() {
-            if let Some(task_id) = get_current_task(cpu_id) {
-                if let Some(SchedulerType::PrioritizedRR(_)) =
-                    get_scheduler_type_by_task_id(task_id)
-                {
-                    prioritized_rr::SCHEDULER.invoke_preemption_tick(cpu_id, task_id)
-                }
-            }
         } else {
             active_vp::mark_idle(cpu_id);
         }
@@ -661,7 +659,8 @@ pub fn wake_task() -> Option<Duration> {
         // *other* scheduler entirely (e.g. a regular-pool task happening
         // to occupy what is, from DAG-Fluid's perspective, a DAG-pool
         // core mid-switch), and `apply_entitlement`'s own forced-preemption
-        // path already only acts when a concrete DpWrap successor is ready.
+        // path already only acts when a concrete DpWrap successor is ready
+        // and preemption is enabled.
         dp_wrap::tick_switch_plan(cpu_id);
     }
 

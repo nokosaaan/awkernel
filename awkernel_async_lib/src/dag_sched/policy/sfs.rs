@@ -93,8 +93,11 @@ impl Target {
     }
 
     fn edf_ok_with(&self, extra: (u64, u64, u64)) -> bool {
-        let mut tasks: Vec<(u64, u64, u64)> =
-            self.pieces.iter().map(|p| (p.wcet, p.deadline, p.period)).collect();
+        let mut tasks: Vec<(u64, u64, u64)> = self
+            .pieces
+            .iter()
+            .map(|p| (p.wcet, p.deadline, p.period))
+            .collect();
         tasks.push(extra);
         edf_schedulable(&tasks)
     }
@@ -157,7 +160,13 @@ struct Interval {
 
 /// Algorithm 1 for one segment starting at `base`: returns its length and
 /// appends its intervals. `rem[v]` is node `v`'s (remaining) WCET.
-fn flatten_segment(nodes: &[usize], rem: &[u64], m: usize, base: u64, out: &mut Vec<Interval>) -> u64 {
+fn flatten_segment(
+    nodes: &[usize],
+    rem: &[u64],
+    m: usize,
+    base: u64,
+    out: &mut Vec<Interval>,
+) -> u64 {
     let work: u64 = nodes.iter().map(|&v| rem[v]).sum();
     if work == 0 {
         return 0;
@@ -173,12 +182,24 @@ fn flatten_segment(nodes: &[usize], rem: &[u64], m: usize, base: u64, out: &mut 
         let start = offset;
         let end = (offset + c - 1) % len + 1; // line 18
         if end > start {
-            out.push(Interval { node: v, start: base + start, end: base + end });
+            out.push(Interval {
+                node: v,
+                start: base + start,
+                end: base + end,
+            });
             offset = if end == len { 0 } else { end }; // lines 22-26
         } else {
             // Lines 29-32: the tail on the next processor runs first in time.
-            out.push(Interval { node: v, start: base + start, end: base + len });
-            out.push(Interval { node: v, start: base, end: base + end });
+            out.push(Interval {
+                node: v,
+                start: base + start,
+                end: base + len,
+            });
+            out.push(Interval {
+                node: v,
+                start: base,
+                end: base + end,
+            });
             offset = end;
         }
     }
@@ -209,7 +230,11 @@ fn flattened_length(segs: &[Vec<usize>], rem: &[u64], m: usize) -> u64 {
 /// Algorithm 2: the smallest `m'` whose flattened schedule fits in
 /// `deadline` (with `min(D, T) = deadline` under constrained deadlines),
 /// and that schedule's length. `None` = FAILURE (lines 2-6).
-pub fn feasibly_max_flatten(segs: &[Vec<usize>], rem: &[u64], deadline: u64) -> Option<(usize, u64)> {
+pub fn feasibly_max_flatten(
+    segs: &[Vec<usize>],
+    rem: &[u64],
+    deadline: u64,
+) -> Option<(usize, u64)> {
     let lb: u64 = segs
         .iter()
         .map(|seg| seg.iter().map(|&v| rem[v]).max().unwrap_or(0))
@@ -353,7 +378,14 @@ pub fn edf_schedulable(tasks: &[(u64, u64, u64)]) -> bool {
                 .map(|&(c, d, p)| (p - d) as f64 * c as f64 / p as f64)
                 .sum::<f64>()
                 / (1.0 - u);
-            dmax.max(la.ceil() as u64 + 1)
+            // Manual ceil: `f64::ceil` needs `std`/`libm`. `la >= 0` since `D <= T`.
+            let truncated = la as u64;
+            let la_ceil = if (truncated as f64) < la {
+                truncated + 1
+            } else {
+                truncated
+            };
+            dmax.max(la_ceil + 1)
         }
         None => return false,
     };
@@ -473,7 +505,10 @@ pub fn plan(tasks: &[SfsTask<'_>], m: u16) -> Option<SfsPlan> {
                 bin.pieces.push(piece);
                 // Deviation 1: Algorithm 4 line 20 `break` -> next DAG task.
             } else if m_empty > 0 {
-                targets.push(Target { processors: 1, pieces: vec![piece] });
+                targets.push(Target {
+                    processors: 1,
+                    pieces: vec![piece],
+                });
                 m_empty -= 1;
             } else {
                 unassigned.push(i);
@@ -484,7 +519,10 @@ pub fn plan(tasks: &[SfsTask<'_>], m: u16) -> Option<SfsPlan> {
     // Second pass (Algorithm 5). Processors left empty are single-processor
     // targets (see the module doc).
     for _ in 0..m_empty {
-        targets.push(Target { processors: 1, pieces: Vec::new() });
+        targets.push(Target {
+            processors: 1,
+            pieces: Vec::new(),
+        });
     }
     let split_dags = unassigned.len();
     for &i in &unassigned {
@@ -502,7 +540,10 @@ pub fn plan(tasks: &[SfsTask<'_>], m: u16) -> Option<SfsPlan> {
                     !used[k]
                         && !excluded[k]
                         && targets[k].processors >= need
-                        && !targets[k].pieces.iter().any(|x| x.zero_laxity && x.dag != i)
+                        && !targets[k]
+                            .pieces
+                            .iter()
+                            .any(|x| x.zero_laxity && x.dag != i)
                 })
                 .min_by(|&x, &y| {
                     targets[x]
@@ -554,7 +595,10 @@ pub fn plan(tasks: &[SfsTask<'_>], m: u16) -> Option<SfsPlan> {
         }
     }
 
-    Some(SfsPlan { targets, split_dags })
+    Some(SfsPlan {
+        targets,
+        split_dags,
+    })
 }
 
 #[cfg(test)]
@@ -594,7 +638,10 @@ mod tests {
     #[test]
     fn test_segments_match_fig1() {
         let segs = segments(&fig1()).unwrap();
-        assert_eq!(segs, vec![vec![0], vec![1, 2, 3], vec![4, 5], vec![6, 7, 8], vec![9]]);
+        assert_eq!(
+            segs,
+            vec![vec![0], vec![1, 2, 3], vec![4, 5], vec![6, 7, 8], vec![9]]
+        );
     }
 
     #[test]
@@ -610,8 +657,11 @@ mod tests {
         assert_eq!(got, wcets(&g));
         // At most 2 nodes run at any time and no node runs twice at once.
         for t in 0..len {
-            let running: Vec<usize> =
-                ivs.iter().filter(|iv| iv.start <= t && t < iv.end).map(|iv| iv.node).collect();
+            let running: Vec<usize> = ivs
+                .iter()
+                .filter(|iv| iv.start <= t && t < iv.end)
+                .map(|iv| iv.node)
+                .collect();
             assert!(running.len() <= 2, "t={t}: {running:?}");
             let mut dedup = running.clone();
             dedup.dedup();
@@ -637,7 +687,11 @@ mod tests {
     fn test_fig3_prefers_graham_fallback() {
         // Two chains 1 -> 49 and 49 -> 1: flattening needs 49 + 49 = 98.
         let g = DagGraph::new(vec![1, 49, 49, 1], &[(0, 2), (1, 3)]).unwrap();
-        let task = SfsTask { graph: &g, period: 80, deadline: 80 };
+        let task = SfsTask {
+            graph: &g,
+            period: 80,
+            deadline: 80,
+        };
         let prep = Prepared {
             graph: &g,
             period: 80,
@@ -667,7 +721,13 @@ mod tests {
     fn test_sensitivity_is_largest_feasible_budget() {
         let t = Target {
             processors: 1,
-            pieces: vec![Piece { dag: 0, wcet: 4, deadline: 10, period: 10, zero_laxity: false }],
+            pieces: vec![Piece {
+                dag: 0,
+                wcet: 4,
+                deadline: 10,
+                period: 10,
+                zero_laxity: false,
+            }],
         };
         let c = sensitivity(&t, 100, 10);
         assert!(t.edf_ok_with((c, c, 10)));
@@ -693,11 +753,20 @@ mod tests {
                 }
             } else {
                 let task = (work, t.deadline, t.period);
-                let piece = Piece { dag: i, wcet: work, deadline: t.deadline, period: t.period, zero_laxity: false };
+                let piece = Piece {
+                    dag: i,
+                    wcet: work,
+                    deadline: t.deadline,
+                    period: t.period,
+                    zero_laxity: false,
+                };
                 if let Some(b) = bins.iter_mut().find(|b| b.edf_ok_with(task)) {
                     b.pieces.push(piece);
                 } else if m_empty > 0 {
-                    bins.push(Target { processors: 1, pieces: vec![piece] });
+                    bins.push(Target {
+                        processors: 1,
+                        pieces: vec![piece],
+                    });
                     m_empty -= 1;
                 } else {
                     return false;
@@ -710,7 +779,9 @@ mod tests {
     fn random_dag(rng: &mut impl Rng) -> DagGraph {
         // Layered: 2..6 layers of 1..5 nodes, edges between consecutive
         // layers with probability 0.5 (every node keeps a predecessor).
-        let layers: Vec<usize> = (0..rng.random_range(2..=6)).map(|_| rng.random_range(1..=5)).collect();
+        let layers: Vec<usize> = (0..rng.random_range(2..=6))
+            .map(|_| rng.random_range(1..=5))
+            .collect();
         let mut wcet = Vec::new();
         let mut edges = Vec::new();
         let mut prev: Vec<usize> = Vec::new();
@@ -742,7 +813,9 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(7);
         let (mut fs_ok, mut sfs_only) = (0, 0);
         for _ in 0..3000 {
-            let graphs: Vec<DagGraph> = (0..rng.random_range(2..=8)).map(|_| random_dag(&mut rng)).collect();
+            let graphs: Vec<DagGraph> = (0..rng.random_range(2..=8))
+                .map(|_| random_dag(&mut rng))
+                .collect();
             let tasks: Vec<SfsTask<'_>> = graphs
                 .iter()
                 .map(|g| {
@@ -750,7 +823,11 @@ mod tests {
                     let w: u64 = wcets(g).iter().sum();
                     let d = rng.random_range(l..=w.max(l) * 2);
                     let t = rng.random_range(d..=d * 2);
-                    SfsTask { graph: g, period: t, deadline: d }
+                    SfsTask {
+                        graph: g,
+                        period: t,
+                        deadline: d,
+                    }
                 })
                 .collect();
             let m = rng.random_range(2..=8u16);
@@ -762,7 +839,10 @@ mod tests {
                 sfs_only += 1;
             }
         }
-        assert!(fs_ok > 100 && sfs_only > 0, "fs_ok={fs_ok} sfs_only={sfs_only}");
+        assert!(
+            fs_ok > 100 && sfs_only > 0,
+            "fs_ok={fs_ok} sfs_only={sfs_only}"
+        );
     }
 
     #[test]
@@ -770,29 +850,49 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(11);
         let mut splits = 0;
         for _ in 0..2000 {
-            let graphs: Vec<DagGraph> = (0..rng.random_range(3..=8)).map(|_| random_dag(&mut rng)).collect();
+            let graphs: Vec<DagGraph> = (0..rng.random_range(3..=8))
+                .map(|_| random_dag(&mut rng))
+                .collect();
             let tasks: Vec<SfsTask<'_>> = graphs
                 .iter()
                 .map(|g| {
                     let l = critical_path(g);
                     let w: u64 = wcets(g).iter().sum();
                     let d = rng.random_range(l..=w.max(l) * 2);
-                    SfsTask { graph: g, period: d, deadline: d }
+                    SfsTask {
+                        graph: g,
+                        period: d,
+                        deadline: d,
+                    }
                 })
                 .collect();
-            let Some(plan) = plan(&tasks, rng.random_range(2..=8)) else { continue };
+            let Some(plan) = plan(&tasks, rng.random_range(2..=8)) else {
+                continue;
+            };
             splits += plan.split_dags;
             for t in &plan.targets {
-                let v: Vec<(u64, u64, u64)> = t.pieces.iter().map(|p| (p.wcet, p.deadline, p.period)).collect();
+                let v: Vec<(u64, u64, u64)> = t
+                    .pieces
+                    .iter()
+                    .map(|p| (p.wcet, p.deadline, p.period))
+                    .collect();
                 assert!(edf_schedulable(&v));
             }
             // The pieces of each split DAG add up to within its deadline.
             for i in 0..tasks.len() {
-                let pieces: Vec<&Piece> =
-                    plan.targets.iter().flat_map(|t| &t.pieces).filter(|p| p.dag == i).collect();
+                let pieces: Vec<&Piece> = plan
+                    .targets
+                    .iter()
+                    .flat_map(|t| &t.pieces)
+                    .filter(|p| p.dag == i)
+                    .collect();
                 assert!(!pieces.is_empty());
                 if pieces.len() > 1 {
-                    let zl: u64 = pieces.iter().filter(|p| p.zero_laxity).map(|p| p.wcet).sum();
+                    let zl: u64 = pieces
+                        .iter()
+                        .filter(|p| p.zero_laxity)
+                        .map(|p| p.wcet)
+                        .sum();
                     let last = pieces.iter().find(|p| !p.zero_laxity).unwrap();
                     assert_eq!(zl + last.deadline, tasks[i].deadline);
                 }

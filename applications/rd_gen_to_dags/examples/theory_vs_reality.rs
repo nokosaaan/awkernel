@@ -231,7 +231,10 @@ fn main() -> ExitCode {
         let mut dag_fluid_accepted = 0usize;
         let mut sfs_accepted = 0usize;
         for trial in 0..trials_per_bin {
-            let set: Vec<&PoolEntry> = window.choose_multiple(&mut rng, dags_per_set).copied().collect();
+            let set: Vec<&PoolEntry> = window
+                .choose_multiple(&mut rng, dags_per_set)
+                .copied()
+                .collect();
             let metrics: Vec<DagMetrics> = set.iter().map(|e| e.metrics).collect();
 
             let fed_tasks: Vec<FedTask<'_>> = set
@@ -254,7 +257,13 @@ fn main() -> ExitCode {
                 .iter()
                 .map(|e| {
                     let m = &e.metrics;
-                    (m.volume, m.period, m.critical_path, m.relative_deadline, e.segments.as_slice())
+                    (
+                        m.volume,
+                        m.period,
+                        m.critical_path,
+                        m.relative_deadline,
+                        e.segments.as_slice(),
+                    )
                 })
                 .collect();
             let dag_fluid_ok = dag_fluid::is_batch_feasible(&dag_fluid_entries, real_cores);
@@ -276,8 +285,18 @@ fn main() -> ExitCode {
 
             let u_sigma_actual: f64 = set.iter().map(|e| e.utilization).sum();
             write_trial_record(
-                &mut manifest, u_norm, trial, &dags_dir, &set, fed_variant, fed_ok, vfed_ok,
-                dag_fluid_ok, sfs_ok, u_sigma_actual, real_cores,
+                &mut manifest,
+                u_norm,
+                trial,
+                &dags_dir,
+                &set,
+                fed_variant,
+                fed_ok,
+                vfed_ok,
+                dag_fluid_ok,
+                sfs_ok,
+                u_sigma_actual,
+                real_cores,
             );
         }
 

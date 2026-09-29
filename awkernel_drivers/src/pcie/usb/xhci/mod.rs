@@ -1,11 +1,12 @@
 use alloc::{borrow::Cow, boxed::Box, format, string::String, sync::Arc};
-use awkernel_lib::{addr::{virt_addr::VirtAddr, Addr}, dma_pool::DMAPool};
+use awkernel_lib::{
+    addr::{virt_addr::VirtAddr, Addr},
+    dma_pool::DMAPool,
+};
 
 // super       = crate::pcie::usb
 // super::super = crate::pcie  (where PCIeDevice, PCIeDeviceErr, PCIeInfo, base_address live)
-use super::super::{
-    base_address::BaseAddress, PCIeDevice, PCIeDeviceErr, PCIeInfo,
-};
+use super::super::{base_address::BaseAddress, PCIeDevice, PCIeDeviceErr, PCIeInfo};
 
 mod cdc_acm;
 mod fat32;
@@ -32,10 +33,10 @@ use ring::{CommandRing, Dcbaa, EventRing, TransferRing, Trb};
 // ---------------------------------------------------------------------------
 
 static CDC_DEV_PTR: AtomicUsize = AtomicUsize::new(0);
-static CDC_SLOT:    AtomicU8    = AtomicU8::new(0);
+static CDC_SLOT: AtomicU8 = AtomicU8::new(0);
 /// Spinlock + reentrancy guard: if already held (recursive log call inside a
 /// CDC write), skip rather than deadlock.
-static CDC_LOCK:    AtomicBool  = AtomicBool::new(false);
+static CDC_LOCK: AtomicBool = AtomicBool::new(false);
 
 /// DIAGNOSTIC (temporary): counts why `xhci_usb_serial_puts` dropped a line,
 /// to find why some early-boot log lines never reach the serial console --
@@ -45,10 +46,18 @@ static CDC_SKIPPED_NO_DEV: AtomicUsize = AtomicUsize::new(0);
 static CDC_WRITE_ERR: AtomicUsize = AtomicUsize::new(0);
 static CDC_WRITE_OK: AtomicUsize = AtomicUsize::new(0);
 
-pub fn cdc_skipped_locked() -> usize { CDC_SKIPPED_LOCKED.load(Ordering::Relaxed) }
-pub fn cdc_skipped_no_dev() -> usize { CDC_SKIPPED_NO_DEV.load(Ordering::Relaxed) }
-pub fn cdc_write_err() -> usize { CDC_WRITE_ERR.load(Ordering::Relaxed) }
-pub fn cdc_write_ok() -> usize { CDC_WRITE_OK.load(Ordering::Relaxed) }
+pub fn cdc_skipped_locked() -> usize {
+    CDC_SKIPPED_LOCKED.load(Ordering::Relaxed)
+}
+pub fn cdc_skipped_no_dev() -> usize {
+    CDC_SKIPPED_NO_DEV.load(Ordering::Relaxed)
+}
+pub fn cdc_write_err() -> usize {
+    CDC_WRITE_ERR.load(Ordering::Relaxed)
+}
+pub fn cdc_write_ok() -> usize {
+    CDC_WRITE_OK.load(Ordering::Relaxed)
+}
 
 /// Incremented each time start_controller() succeeds.
 static XHCI_STARTED: AtomicUsize = AtomicUsize::new(0);
@@ -61,20 +70,20 @@ static XHCI_LAST_VID: AtomicU32 = AtomicU32::new(0);
 /// PID of the last device whose Device Descriptor was successfully read.
 static XHCI_LAST_PID: AtomicU32 = AtomicU32::new(0);
 /// Set when try_setup_pl2303() sees VID:PID 067b:23xx (PL2303 chip identified).
-static XHCI_PL2303_VID_SEEN:  AtomicBool = AtomicBool::new(false);
+static XHCI_PL2303_VID_SEEN: AtomicBool = AtomicBool::new(false);
 /// Set after get_config_descriptor() succeeds inside try_setup_pl2303().
-static XHCI_PL2303_GOT_CFG:   AtomicBool = AtomicBool::new(false);
+static XHCI_PL2303_GOT_CFG: AtomicBool = AtomicBool::new(false);
 /// Set after find_bulk_endpoints() finds IN+OUT pair inside try_setup_pl2303().
-static XHCI_PL2303_GOT_EPS:   AtomicBool = AtomicBool::new(false);
+static XHCI_PL2303_GOT_EPS: AtomicBool = AtomicBool::new(false);
 /// Set after set_configuration() succeeds inside try_setup_pl2303().
-static XHCI_PL2303_SET_CFG:   AtomicBool = AtomicBool::new(false);
+static XHCI_PL2303_SET_CFG: AtomicBool = AtomicBool::new(false);
 /// Set after configure_bulk_endpoints() (CONFIGURE_EP) succeeds.
-static XHCI_PL2303_CFG_EPS:   AtomicBool = AtomicBool::new(false);
+static XHCI_PL2303_CFG_EPS: AtomicBool = AtomicBool::new(false);
 /// Set after pl2303_init_seq() completes successfully.
-static XHCI_PL2303_INIT_SEQ:  AtomicBool = AtomicBool::new(false);
+static XHCI_PL2303_INIT_SEQ: AtomicBool = AtomicBool::new(false);
 /// Set after the first 9-byte control_transfer_in in get_config_descriptor succeeds
 /// (only meaningful when called from try_setup_pl2303; MSC/CDC calls are skipped for PL2303).
-static XHCI_PL2303_CFG_P1_OK:    AtomicBool = AtomicBool::new(false);
+static XHCI_PL2303_CFG_P1_OK: AtomicBool = AtomicBool::new(false);
 /// Set if wTotalLength parsed from the first-pass config descriptor is non-zero
 /// (indicates DMA buffer was actually written; not a cache-coherency ghost).
 static XHCI_PL2303_CFG_TOTAL_OK: AtomicBool = AtomicBool::new(false);
@@ -118,25 +127,45 @@ pub fn xhci_any_device_seen() -> bool {
     XHCI_CCS_SEEN.load(Ordering::Relaxed) > 0
 }
 /// Total number of ports with CCS=1 seen at boot.
-pub fn xhci_ccs_count() -> usize { XHCI_CCS_SEEN.load(Ordering::Relaxed) }
+pub fn xhci_ccs_count() -> usize {
+    XHCI_CCS_SEEN.load(Ordering::Relaxed)
+}
 /// Total number of successful port resets.
-pub fn xhci_port_reset_count() -> usize { XHCI_PORT_RESET_OK.load(Ordering::Relaxed) }
+pub fn xhci_port_reset_count() -> usize {
+    XHCI_PORT_RESET_OK.load(Ordering::Relaxed)
+}
 /// Total number of Enable Slot successes.
-pub fn xhci_slot_count() -> usize { XHCI_SLOT_ENABLED.load(Ordering::Relaxed) }
+pub fn xhci_slot_count() -> usize {
+    XHCI_SLOT_ENABLED.load(Ordering::Relaxed)
+}
 /// Total number of successful Address Device commands inside enumerate_port.
-pub fn xhci_addr_dev_ok() -> usize { XHCI_ADDR_DEV_OK.load(Ordering::Relaxed) }
+pub fn xhci_addr_dev_ok() -> usize {
+    XHCI_ADDR_DEV_OK.load(Ordering::Relaxed)
+}
 /// Failure code from last failed Address Device (0=none, 0xFFFF=timeout, else xHCI code).
-pub fn xhci_addr_dev_fail() -> u32 { XHCI_ADDR_DEV_FAIL.load(Ordering::Relaxed) }
+pub fn xhci_addr_dev_fail() -> u32 {
+    XHCI_ADDR_DEV_FAIL.load(Ordering::Relaxed)
+}
 /// Total number of successful get_device_descriptor() calls.
-pub fn xhci_gdesc_ok() -> usize { XHCI_GDESC_OK.load(Ordering::Relaxed) }
+pub fn xhci_gdesc_ok() -> usize {
+    XHCI_GDESC_OK.load(Ordering::Relaxed)
+}
 /// Failure code from last failed get_device_descriptor (0=none, 0xFFFF=timeout, else xHCI).
-pub fn xhci_gdesc_fail_code() -> u32 { XHCI_GDESC_FAIL_CODE.load(Ordering::Relaxed) }
+pub fn xhci_gdesc_fail_code() -> u32 {
+    XHCI_GDESC_FAIL_CODE.load(Ordering::Relaxed)
+}
 /// Total number of successful enumerate_port() calls.
-pub fn xhci_enum_count() -> usize { XHCI_ENUM_OK.load(Ordering::Relaxed) }
+pub fn xhci_enum_count() -> usize {
+    XHCI_ENUM_OK.load(Ordering::Relaxed)
+}
 /// VID of the last device whose Device Descriptor was successfully read (0 = none yet).
-pub fn xhci_last_vid() -> u16 { XHCI_LAST_VID.load(Ordering::Relaxed) as u16 }
+pub fn xhci_last_vid() -> u16 {
+    XHCI_LAST_VID.load(Ordering::Relaxed) as u16
+}
 /// PID of the last device whose Device Descriptor was successfully read (0 = none yet).
-pub fn xhci_last_pid() -> u16 { XHCI_LAST_PID.load(Ordering::Relaxed) as u16 }
+pub fn xhci_last_pid() -> u16 {
+    XHCI_LAST_PID.load(Ordering::Relaxed) as u16
+}
 
 /// Returns true if at least one port reset completed (PRC=1 seen).
 pub fn xhci_any_port_reset_ok() -> bool {
@@ -154,18 +183,38 @@ pub fn xhci_any_enum_ok() -> bool {
 }
 
 /// Returns true if PL2303 VID:PID (067b:23xx) was matched during setup.
-pub fn xhci_pl2303_vid_seen()     -> bool { XHCI_PL2303_VID_SEEN.load(Ordering::Relaxed) }
-pub fn xhci_pl2303_cfg_p1_ok()    -> bool { XHCI_PL2303_CFG_P1_OK.load(Ordering::Relaxed) }
-pub fn xhci_pl2303_cfg_total_ok() -> bool { XHCI_PL2303_CFG_TOTAL_OK.load(Ordering::Relaxed) }
+pub fn xhci_pl2303_vid_seen() -> bool {
+    XHCI_PL2303_VID_SEEN.load(Ordering::Relaxed)
+}
+pub fn xhci_pl2303_cfg_p1_ok() -> bool {
+    XHCI_PL2303_CFG_P1_OK.load(Ordering::Relaxed)
+}
+pub fn xhci_pl2303_cfg_total_ok() -> bool {
+    XHCI_PL2303_CFG_TOTAL_OK.load(Ordering::Relaxed)
+}
 /// 0 = no failure, 0xFFFF = timeout, 0xFFFE = SP-retry exhausted, else xHCI completion code.
-pub fn xhci_ctrl_fail_code() -> u32 { XHCI_CTRL_FAIL_CODE.load(Ordering::Relaxed) }
+pub fn xhci_ctrl_fail_code() -> u32 {
+    XHCI_CTRL_FAIL_CODE.load(Ordering::Relaxed)
+}
 /// wTotalLength (capped to 255) from first-pass config descriptor; 0 = not set yet.
-pub fn xhci_cfg_fetch() -> u8 { XHCI_CFG_FETCH.load(Ordering::Relaxed) }
-pub fn xhci_pl2303_got_cfg()      -> bool { XHCI_PL2303_GOT_CFG.load(Ordering::Relaxed) }
-pub fn xhci_pl2303_got_eps()      -> bool { XHCI_PL2303_GOT_EPS.load(Ordering::Relaxed) }
-pub fn xhci_pl2303_set_cfg()      -> bool { XHCI_PL2303_SET_CFG.load(Ordering::Relaxed) }
-pub fn xhci_pl2303_cfg_eps()      -> bool { XHCI_PL2303_CFG_EPS.load(Ordering::Relaxed) }
-pub fn xhci_pl2303_init_seq()     -> bool { XHCI_PL2303_INIT_SEQ.load(Ordering::Relaxed) }
+pub fn xhci_cfg_fetch() -> u8 {
+    XHCI_CFG_FETCH.load(Ordering::Relaxed)
+}
+pub fn xhci_pl2303_got_cfg() -> bool {
+    XHCI_PL2303_GOT_CFG.load(Ordering::Relaxed)
+}
+pub fn xhci_pl2303_got_eps() -> bool {
+    XHCI_PL2303_GOT_EPS.load(Ordering::Relaxed)
+}
+pub fn xhci_pl2303_set_cfg() -> bool {
+    XHCI_PL2303_SET_CFG.load(Ordering::Relaxed)
+}
+pub fn xhci_pl2303_cfg_eps() -> bool {
+    XHCI_PL2303_CFG_EPS.load(Ordering::Relaxed)
+}
+pub fn xhci_pl2303_init_seq() -> bool {
+    XHCI_PL2303_INIT_SEQ.load(Ordering::Relaxed)
+}
 
 /// 0 = not attempted, 1 = success, 2 = fail/timeout
 pub fn xhci_noop_result() -> u32 {
@@ -178,7 +227,11 @@ pub fn xhci_bus_master_ok() -> bool {
 /// Returns the USBSTS value captured at the first Enable Slot timeout, if any.
 pub fn xhci_usbsts_on_fail() -> Option<u32> {
     let v = XHCI_USBSTS_ON_SLOT_FAIL.load(Ordering::Relaxed);
-    if v == u32::MAX { None } else { Some(v) }
+    if v == u32::MAX {
+        None
+    } else {
+        Some(v)
+    }
 }
 
 /// Write `data` to the CDC-ACM USB serial adapter if one has been configured.
@@ -223,10 +276,11 @@ pub struct XhciDevice {
     name: String,
 
     // Mapped register region bases (identity-mapped MMIO, virt == phys)
+    #[allow(dead_code)]
     cap_base: VirtAddr, // BAR[0]
-    op_base: VirtAddr,  // BAR[0] + CAPLENGTH
-    rt_base: VirtAddr,  // BAR[0] + RTSOFF
-    db_base: VirtAddr,  // BAR[0] + DBOFF
+    op_base: VirtAddr, // BAR[0] + CAPLENGTH
+    rt_base: VirtAddr, // BAR[0] + RTSOFF
+    db_base: VirtAddr, // BAR[0] + DBOFF
 
     // Controller parameters decoded from HCSPARAMS1
     pub max_slots: u8,
@@ -256,18 +310,18 @@ pub struct XhciDevice {
     // Phase 4: bulk endpoint rings and metadata (set after CONFIGURE_EP).
     bulk_in_ring: Option<TransferRing>,
     bulk_out_ring: Option<TransferRing>,
-    bulk_in_ep_id: u8,    // xHCI DCI for bulk IN doorbell
-    bulk_out_ep_id: u8,   // xHCI DCI for bulk OUT doorbell
-    dev_speed: u8,        // PORTSC speed field cached from enumerate_port
-    dev_port: u8,         // 1-based port number cached from enumerate_port
-    msc_tag: u32,         // monotonic BOT transaction tag
+    bulk_in_ep_id: u8,  // xHCI DCI for bulk IN doorbell
+    bulk_out_ep_id: u8, // xHCI DCI for bulk OUT doorbell
+    dev_speed: u8,      // PORTSC speed field cached from enumerate_port
+    dev_port: u8,       // 1-based port number cached from enumerate_port
+    msc_tag: u32,       // monotonic BOT transaction tag
 
     // Phase 5: mounted FAT32 volume state (set after fat32_mount).
     fat32: Option<fat32::Fat32>,
 
     // Phase 6: CDC-ACM serial adapter state (set after try_setup_cdcacm succeeds).
     is_cdcacm: bool,
-    cdcacm_ctrl_if: u8,  // bInterfaceNumber of CDC Communication interface (wIndex for class reqs)
+    cdcacm_ctrl_if: u8, // bInterfaceNumber of CDC Communication interface (wIndex for class reqs)
     cdcacm_max_pkt: u16, // wMaxPacketSize of the CDC data bulk endpoints
 
     // Phase 8: pre-allocated DMA buffer for console TX (avoids per-write DMA allocation).
@@ -279,11 +333,11 @@ pub struct XhciDevice {
 
     // Device descriptor cache — populated during get_device_descriptor() so that
     // subsequent try_setup_pl2303() can identify the chip type without re-reading.
-    dev_vid:      u16,
-    dev_pid:      u16,
-    dev_bcd:      u16, // bcdDevice
-    dev_class:    u8,
-    dev_max_pkt0: u8,  // bMaxPacketSize0
+    dev_vid: u16,
+    dev_pid: u16,
+    dev_bcd: u16, // bcdDevice
+    dev_class: u8,
+    dev_max_pkt0: u8, // bMaxPacketSize0
 }
 
 impl PCIeDevice for XhciDevice {
@@ -305,7 +359,8 @@ pub(super) fn attach(
     log::info!("xHCI: attaching {}", info);
 
     // Map the MMIO region(s) declared in BARs.
-    info.map_bar().map_err(|_| PCIeDeviceErr::PageTableFailure)?;
+    info.map_bar()
+        .map_err(|_| PCIeDeviceErr::PageTableFailure)?;
     info.read_capability();
     info.disable_legacy_interrupt();
 
@@ -341,16 +396,18 @@ pub(super) fn attach(
     // start_controller() so the controller can DMA to the event ring.
     info.enable_bus_master();
     // Read back to verify BUS_MASTER actually stuck (some controllers reset it on HCRST).
-    if info.read_status_command().contains(
-        super::super::registers::StatusCommand::BUS_MASTER,
-    ) {
+    if info
+        .read_status_command()
+        .contains(super::super::registers::StatusCommand::BUS_MASTER)
+    {
         XHCI_BUS_MASTER_OK.store(true, Ordering::Relaxed);
         log::info!("xHCI: {}: BUS_MASTER confirmed set", dev.name);
     } else {
         log::error!("xHCI: {}: BUS_MASTER NOT set — DMA will fail!", dev.name);
     }
     dev.program_rings();
-    dev.init_scratchpad().map_err(|_| PCIeDeviceErr::InitFailure)?;
+    dev.init_scratchpad()
+        .map_err(|_| PCIeDeviceErr::InitFailure)?;
 
     // Capture MMIO base values for the interrupt handler closure.
     let op_base_val = dev.op_base.as_usize();
@@ -373,8 +430,7 @@ pub(super) fn attach(
                     );
                     // Clear IMAN.IP (RW1C).
                     let ir_base = rt_base_val + regs::ir::BASE;
-                    let iman =
-                        core::ptr::read_volatile((ir_base + regs::ir::IMAN) as *const u32);
+                    let iman = core::ptr::read_volatile((ir_base + regs::ir::IMAN) as *const u32);
                     core::ptr::write_volatile(
                         (ir_base + regs::ir::IMAN) as *mut u32,
                         iman | regs::ir::IMAN_IP,
@@ -440,8 +496,7 @@ impl XhciDevice {
         // HCSPARAMS2 scratchpad count (§5.3.4):
         //   Hi = bits[25:21], Lo = bits[31:27]; total = (Hi << 5) | Lo
         // (FreeBSD/Linux both use this order; reversed is a common mistake.)
-        let max_scratchpad =
-            (((hcsparams2 >> 21) & 0x1f) << 5) | ((hcsparams2 >> 27) & 0x1f);
+        let max_scratchpad = (((hcsparams2 >> 21) & 0x1f) << 5) | ((hcsparams2 >> 27) & 0x1f);
         // CSZ bit (bit 2) of HCCPARAMS1: 0 = 32-byte contexts, 1 = 64-byte contexts.
         let ctx_size: usize = if hccparams1 & (1 << 2) != 0 { 64 } else { 32 };
 
@@ -616,7 +671,11 @@ impl XhciDevice {
 
         log::info!(
             "xHCI: {}: dcbaa={:#018x} crcr={:#018x} erst={:#018x} erdp={:#018x}",
-            self.name, dcbaa, crcr, erst, erdp,
+            self.name,
+            dcbaa,
+            crcr,
+            erst,
+            erdp,
         );
     }
 
@@ -631,13 +690,17 @@ impl XhciDevice {
 
         // Allocate the pointer array (up to 512 entries × 8 bytes fits in one 4 KiB page).
         let mut array = DMAPool::<[u8; 4096]>::new(0, 1).ok_or(PCIeDeviceErr::InitFailure)?;
-        for b in array.as_mut().iter_mut() { *b = 0; }
+        for b in array.as_mut().iter_mut() {
+            *b = 0;
+        }
 
         // Allocate N scratchpad pages; store each physical address into the array.
         let mut bufs: alloc::vec::Vec<DMAPool<[u8; 4096]>> = alloc::vec::Vec::new();
         for i in 0..n {
             let mut buf = DMAPool::<[u8; 4096]>::new(0, 1).ok_or(PCIeDeviceErr::InitFailure)?;
-            for b in buf.as_mut().iter_mut() { *b = 0; }
+            for b in buf.as_mut().iter_mut() {
+                *b = 0;
+            }
             let phys = buf.get_phy_addr().as_usize() as u64;
             let off = i * 8;
             array.as_mut()[off..off + 8].copy_from_slice(&phys.to_le_bytes());
@@ -647,7 +710,11 @@ impl XhciDevice {
         // Write array physical address into DCBAA[0].
         let array_phys = array.get_phy_addr().as_usize() as u64;
         self.dcbaa.mem.as_mut()[0] = array_phys;
-        log::info!("xHCI: {}: scratchpad array phys={:#018x}", self.name, array_phys);
+        log::info!(
+            "xHCI: {}: scratchpad array phys={:#018x}",
+            self.name,
+            array_phys
+        );
 
         self.scratchpad_array = Some(array);
         self.scratchpad_bufs = bufs;
@@ -655,18 +722,24 @@ impl XhciDevice {
     }
 
     fn start_controller(&mut self, interrupt_enable: bool) -> Result<(), PCIeDeviceErr> {
-        let mut cmd =
-            self.read_op(regs::op::USBCMD) | regs::op::CMD_RUN_STOP | regs::op::CMD_HSEE;
+        let mut cmd = self.read_op(regs::op::USBCMD) | regs::op::CMD_RUN_STOP | regs::op::CMD_HSEE;
         if interrupt_enable {
             cmd |= regs::op::CMD_INTE;
         }
         self.write_op(regs::op::USBCMD, cmd);
         // HCHalted must deassert once the controller is running.
         if !self.poll_usbsts(regs::op::STS_HCH, 0, 1_000_000) {
-            log::error!("xHCI: {}: controller did not start (HCH stuck set)", self.name);
+            log::error!(
+                "xHCI: {}: controller did not start (HCH stuck set)",
+                self.name
+            );
             return Err(PCIeDeviceErr::InitFailure);
         }
-        log::info!("xHCI: {}: controller running (INTE={})", self.name, interrupt_enable);
+        log::info!(
+            "xHCI: {}: controller running (INTE={})",
+            self.name,
+            interrupt_enable
+        );
         Ok(())
     }
 
@@ -692,11 +765,7 @@ impl XhciDevice {
     /// Returns the number of events processed.
     pub fn process_events(&mut self) -> usize {
         let mut count = 0;
-        loop {
-            let trb = match self.evt_ring.dequeue() {
-                Some(t) => t,
-                None => break,
-            };
+        while let Some(trb) = self.evt_ring.dequeue() {
             count += 1;
 
             let trb_type = (trb.ctrl >> regs::TRB_TYPE_SHIFT) & 0x3f;
@@ -718,7 +787,12 @@ impl XhciDevice {
     fn on_cmd_completion(&self, trb: &Trb) {
         let code = (trb.status >> 24) & 0xff;
         let slot = (trb.ctrl >> 24) as u8;
-        log::info!("xHCI: {}: CMD_COMPLETION code={} slot={}", self.name, code, slot);
+        log::info!(
+            "xHCI: {}: CMD_COMPLETION code={} slot={}",
+            self.name,
+            code,
+            slot
+        );
     }
 
     fn on_port_status_change(&mut self, trb: &Trb) {
@@ -732,21 +806,27 @@ impl XhciDevice {
         let portsc = self.read_portsc(port);
         log::info!(
             "xHCI: {}: PORT_STATUS_CHANGE port={} PORTSC={:#010x}",
-            self.name, port, portsc,
+            self.name,
+            port,
+            portsc,
         );
 
         // Clear RW1CS change bits; avoid accidentally disabling the port (PED) or
         // re-triggering a port reset (PR).
-        let write_val = (portsc & !(regs::port::PED | regs::port::PR))
-            | (portsc & regs::port::CHANGE_BITS);
+        let write_val =
+            (portsc & !(regs::port::PED | regs::port::PR)) | (portsc & regs::port::CHANGE_BITS);
         self.write_portsc(port, write_val);
 
         if portsc & regs::port::CSC != 0 {
             if portsc & regs::port::CCS != 0 {
                 // Device just connected — issue a port reset to start enumeration.
-                log::info!("xHCI: {}: port {} connected, issuing port reset", self.name, port);
-                let reset_val = (portsc & !(regs::port::PED | regs::port::CHANGE_BITS))
-                    | regs::port::PR;
+                log::info!(
+                    "xHCI: {}: port {} connected, issuing port reset",
+                    self.name,
+                    port
+                );
+                let reset_val =
+                    (portsc & !(regs::port::PED | regs::port::CHANGE_BITS)) | regs::port::PR;
                 self.write_portsc(port, reset_val);
             } else {
                 log::info!("xHCI: {}: port {} disconnected", self.name, port);
@@ -757,7 +837,8 @@ impl XhciDevice {
             // Port reset completed — ready to issue Enable Slot command (Phase 3b).
             log::info!(
                 "xHCI: {}: port {} reset complete, ready to enumerate",
-                self.name, port,
+                self.name,
+                port,
             );
         }
     }
@@ -799,7 +880,10 @@ impl XhciDevice {
             self.ring_cmd_doorbell();
             log::info!("xHCI: {}: ENABLE_SLOT command enqueued", self.name);
         } else {
-            log::warn!("xHCI: {}: command ring full, ENABLE_SLOT dropped", self.name);
+            log::warn!(
+                "xHCI: {}: command ring full, ENABLE_SLOT dropped",
+                self.name
+            );
         }
     }
 
@@ -821,11 +905,7 @@ impl XhciDevice {
     /// Directly drain the Event Ring without any side-effects.
     /// Used to flush initial port-power-on events before the main enumeration loop.
     fn drain_events(&mut self) {
-        loop {
-            let trb = match self.evt_ring.dequeue() {
-                Some(t) => t,
-                None => break,
-            };
+        while let Some(trb) = self.evt_ring.dequeue() {
             let t = (trb.ctrl >> regs::TRB_TYPE_SHIFT) & 0x3f;
             log::debug!("xHCI: {}: drain_events: type={}", self.name, t);
             let erdp = self.evt_ring.dequeue_phys();
@@ -901,7 +981,13 @@ impl XhciDevice {
     /// Sends Address Device, then retrieves the USB Device Descriptor.
     fn enumerate_port(&mut self, port: usize, slot: u8) -> Result<(), PCIeDeviceErr> {
         let ctx = self.ctx_size;
-        log::info!("xHCI: {}: enumerating port={} slot={} ctx_size={}", self.name, port, slot, ctx);
+        log::info!(
+            "xHCI: {}: enumerating port={} slot={} ctx_size={}",
+            self.name,
+            port,
+            slot,
+            ctx
+        );
 
         // Allocate a fresh Transfer Ring for EP0.
         let mut ep0_ring = TransferRing::new(0).ok_or(PCIeDeviceErr::InitFailure)?;
@@ -910,18 +996,22 @@ impl XhciDevice {
 
         // Allocate Device Context (must persist; written to DCBAA[slot]).
         let mut dev_ctx = DMAPool::<[u8; 4096]>::new(0, 1).ok_or(PCIeDeviceErr::InitFailure)?;
-        for b in dev_ctx.as_mut().iter_mut() { *b = 0; }
+        for b in dev_ctx.as_mut().iter_mut() {
+            *b = 0;
+        }
         let dev_ctx_phys = dev_ctx.get_phy_addr().as_usize() as u64;
         self.dcbaa.mem.as_mut()[slot as usize] = dev_ctx_phys;
 
         // Allocate Input Context (transient; hardware only needs it during Address Device).
         let mut input_ctx = DMAPool::<[u8; 4096]>::new(0, 1).ok_or(PCIeDeviceErr::InitFailure)?;
         let input_bytes = input_ctx.as_mut();
-        for b in input_bytes.iter_mut() { *b = 0; }
+        for b in input_bytes.iter_mut() {
+            *b = 0;
+        }
 
         // Input Control Context: Add A0 (slot) + A1 (EP1 = EP0).
-        ctx_write32(input_bytes, 0, 0);      // Drop flags = 0
-        ctx_write32(input_bytes, 4, 0b11);   // Add A0 + A1
+        ctx_write32(input_bytes, 0, 0); // Drop flags = 0
+        ctx_write32(input_bytes, 4, 0b11); // Add A0 + A1
 
         // Slot Context (at offset ctx): Speed, ContextEntries=1, RootHubPort.
         let portsc = self.read_portsc(port);
@@ -929,14 +1019,14 @@ impl XhciDevice {
         self.dev_speed = speed as u8;
         self.dev_port = port as u8;
         ctx_write32(input_bytes, ctx, (speed << 20) | (1 << 27)); // Speed, CtxEntries=1
-        ctx_write32(input_bytes, ctx + 4, (port as u32) << 16);   // RootHubPort
+        ctx_write32(input_bytes, ctx + 4, (port as u32) << 16); // RootHubPort
 
         // EP1 (EP0) Context (at offset ctx*2): EPType=4, ErrorCount=3, MaxPacketSize, TR ptr.
         let ep0_ctx = ctx * 2;
         let max_pkt: u32 = match speed {
-            2 => 8,        // Low Speed — EP0 MaxPacketSize0 is always 8
-            3 => 64,       // High Speed — EP0 MaxPacketSize0 is always 64
-            4 | 5 => 512,  // SuperSpeed / SuperSpeed Plus
+            2 => 8,       // Low Speed — EP0 MaxPacketSize0 is always 8
+            3 => 64,      // High Speed — EP0 MaxPacketSize0 is always 64
+            4 | 5 => 512, // SuperSpeed / SuperSpeed Plus
             // Full Speed (1) or unknown: USB spec allows 8/16/32/64 for FS EP0.
             // Using 64 avoids Babble Detected (code=3) on FS devices whose actual
             // MaxPacketSize0 is 64 (e.g. PL2303HX/HXN, many HS-capable devices).
@@ -945,7 +1035,11 @@ impl XhciDevice {
             _ => 64,
         };
         // DW1: ErrorCount[2:1]=3, EPType[5:3]=4 (Control), MaxPacketSize[31:16]
-        ctx_write32(input_bytes, ep0_ctx + 4, (3 << 1) | (4 << 3) | (max_pkt << 16));
+        ctx_write32(
+            input_bytes,
+            ep0_ctx + 4,
+            (3 << 1) | (4 << 3) | (max_pkt << 16),
+        );
         // TR Dequeue Pointer (DCS=1 matches initial cycle_bit=1)
         ctx_write32(input_bytes, ep0_ctx + 8, ep0_phys as u32 | 1);
         ctx_write32(input_bytes, ep0_ctx + 12, (ep0_phys >> 32) as u32);
@@ -959,12 +1053,21 @@ impl XhciDevice {
         match self.poll_cmd_completion(2_000_000) {
             None => {
                 XHCI_ADDR_DEV_FAIL.store(0xFFFF, Ordering::Relaxed);
-                log::error!("xHCI: {}: Address Device timeout (slot={})", self.name, slot);
+                log::error!(
+                    "xHCI: {}: Address Device timeout (slot={})",
+                    self.name,
+                    slot
+                );
                 return Err(PCIeDeviceErr::InitFailure);
             }
             Some((code, _)) if code != 1 => {
                 XHCI_ADDR_DEV_FAIL.store(code as u32, Ordering::Relaxed);
-                log::error!("xHCI: {}: Address Device failed (code={} slot={})", self.name, code, slot);
+                log::error!(
+                    "xHCI: {}: Address Device failed (code={} slot={})",
+                    self.name,
+                    code,
+                    slot
+                );
                 return Err(PCIeDeviceErr::InitFailure);
             }
             Some(_) => {}
@@ -973,7 +1076,11 @@ impl XhciDevice {
         // input_ctx no longer needed after Address Device completes.
         drop(input_ctx);
 
-        log::info!("xHCI: {}: slot {} addressed (USB addr assigned)", self.name, slot);
+        log::info!(
+            "xHCI: {}: slot {} addressed (USB addr assigned)",
+            self.name,
+            slot
+        );
 
         // Persist EP0 ring and Device Context.
         // IMPORTANT: leak the previous slot's DMA buffers rather than dropping them.
@@ -981,8 +1088,12 @@ impl XhciDevice {
         //   freeing it would cause xHCI to read freed memory on any future EP0 transfer.
         // - dev_ctx: DCBAA[prev_slot] still points to it; freeing it is a UAF.
         // Each leaked buffer is 4 KiB (one DMA page); ~5 leaks at boot = ~20 KiB total.
-        if let Some(old) = self.ep0_ring.take() { core::mem::forget(old); }
-        if let Some(old) = self.dev_ctx.take()  { core::mem::forget(old); }
+        if let Some(old) = self.ep0_ring.take() {
+            core::mem::forget(old);
+        }
+        if let Some(old) = self.dev_ctx.take() {
+            core::mem::forget(old);
+        }
         self.ep0_ring = Some(ep0_ring);
         self.dev_ctx = Some(dev_ctx);
         self.dev_slot = Some(slot);
@@ -1006,7 +1117,9 @@ impl XhciDevice {
             // device's enumeration.  We only care about PL2303 here.
             log::info!(
                 "xHCI: {}: non-PL2303 {:04x}:{:04x}, skipping MSC/CDC probe",
-                self.name, self.dev_vid, self.dev_pid,
+                self.name,
+                self.dev_vid,
+                self.dev_pid,
             );
         }
 
@@ -1022,7 +1135,9 @@ impl XhciDevice {
     fn get_device_descriptor(&mut self, slot: u8) -> Result<(), PCIeDeviceErr> {
         // Allocate a 64-byte DMA buffer for the incoming descriptor.
         let mut desc_buf = DMAPool::<[u8; 64]>::new(0, 1).ok_or(PCIeDeviceErr::InitFailure)?;
-        for b in desc_buf.as_mut().iter_mut() { *b = 0; }
+        for b in desc_buf.as_mut().iter_mut() {
+            *b = 0;
+        }
         let desc_phys = desc_buf.get_phy_addr().as_usize() as u64;
 
         let ep0_ring = self.ep0_ring.as_mut().ok_or(PCIeDeviceErr::InitFailure)?;
@@ -1032,29 +1147,26 @@ impl XhciDevice {
             param: (0x80u64)         // bmRequestType = 0x80 (D→H, Std, Device)
                 | (6u64 << 8)        // bRequest = GET_DESCRIPTOR
                 | (0x0100u64 << 16)  // wValue   = 0x0100 (Device Descriptor)
-                | (0u64 << 32)       // wIndex   = 0
-                | (18u64 << 48),     // wLength  = 18
-            status: 8,               // TRB Transfer Length = 8 (setup packet size)
+                | (18u64 << 48), // wLength  = 18 (wIndex = 0)
+            status: 8, // TRB Transfer Length = 8 (setup packet size)
             ctrl: (regs::trb_type::SETUP_STAGE << regs::TRB_TYPE_SHIFT)
                 | (1 << 6)           // IDT = 1 (setup packet in param)
-                | (3 << 16),         // TRT = 3 (IN Data Stage follows)
+                | (3 << 16), // TRT = 3 (IN Data Stage follows)
         });
 
         // Data Stage TRB: receive 18 bytes into desc_buf. DIR=1 (IN). No IOC here.
         ep0_ring.enqueue(Trb {
             param: desc_phys,
             status: 18,
-            ctrl: (regs::trb_type::DATA_STAGE << regs::TRB_TYPE_SHIFT)
-                | (1 << 16),         // DIR = 1 (IN)
+            ctrl: (regs::trb_type::DATA_STAGE << regs::TRB_TYPE_SHIFT) | (1 << 16), // DIR = 1 (IN)
         });
 
         // Status Stage TRB: OUT direction (opposite of IN data stage). IOC=1.
         ep0_ring.enqueue(Trb {
             param: 0,
             status: 0,
-            ctrl: (regs::trb_type::STATUS_STAGE << regs::TRB_TYPE_SHIFT)
-                | (1 << 5),          // IOC = 1
-                                     // DIR = 0 (OUT status for an IN data stage)
+            ctrl: (regs::trb_type::STATUS_STAGE << regs::TRB_TYPE_SHIFT) | (1 << 5), // IOC = 1
+                                                                                     // DIR = 0 (OUT status for an IN data stage)
         });
 
         // Ring EP0 doorbell: endpoint_id=1 (EP0 / default control pipe).
@@ -1067,50 +1179,72 @@ impl XhciDevice {
                 Some(c) => c,
                 None => {
                     XHCI_GDESC_FAIL_CODE.store(0xFFFF, Ordering::Relaxed);
-                    log::error!("xHCI: {}: GET_DESCRIPTOR timeout (slot={})", self.name, slot);
+                    log::error!(
+                        "xHCI: {}: GET_DESCRIPTOR timeout (slot={})",
+                        self.name,
+                        slot
+                    );
                     return Err(PCIeDeviceErr::InitFailure);
                 }
             };
-            if code == 1 { break; }
-            if code == 13 { continue; }
+            if code == 1 {
+                break;
+            }
+            if code == 13 {
+                continue;
+            }
             XHCI_GDESC_FAIL_CODE.store(code as u32, Ordering::Relaxed);
-            log::error!("xHCI: {}: GET_DESCRIPTOR error code={} slot={}", self.name, code, slot);
+            log::error!(
+                "xHCI: {}: GET_DESCRIPTOR error code={} slot={}",
+                self.name,
+                code,
+                slot
+            );
             return Err(PCIeDeviceErr::InitFailure);
         }
 
         // Parse the Device Descriptor (18 bytes, §9.6.1 of USB 3.2 spec).
         let d = desc_buf.as_mut();
-        let bcd_usb    = u16::from_le_bytes([d[2], d[3]]);
-        let dev_class  = d[4];
-        let dev_sub    = d[5];
-        let dev_proto  = d[6];
-        let max_pkt0   = d[7];
-        let id_vendor  = u16::from_le_bytes([d[8], d[9]]);
+        let bcd_usb = u16::from_le_bytes([d[2], d[3]]);
+        let dev_class = d[4];
+        let dev_sub = d[5];
+        let dev_proto = d[6];
+        let max_pkt0 = d[7];
+        let id_vendor = u16::from_le_bytes([d[8], d[9]]);
         let id_product = u16::from_le_bytes([d[10], d[11]]);
-        let bcd_dev    = u16::from_le_bytes([d[12], d[13]]);
+        let bcd_dev = u16::from_le_bytes([d[12], d[13]]);
 
         // Cache fields needed by try_setup_pl2303() later.
-        self.dev_vid      = id_vendor;
-        self.dev_pid      = id_product;
+        self.dev_vid = id_vendor;
+        self.dev_pid = id_product;
         XHCI_LAST_VID.store(id_vendor as u32, Ordering::Relaxed);
         XHCI_LAST_PID.store(id_product as u32, Ordering::Relaxed);
         XHCI_GDESC_OK.fetch_add(1, Ordering::Relaxed);
-        self.dev_bcd      = bcd_dev;
-        self.dev_class    = dev_class;
+        self.dev_bcd = bcd_dev;
+        self.dev_class = dev_class;
         self.dev_max_pkt0 = max_pkt0;
 
         log::info!(
             "xHCI: {}: slot {} — USB {}.{:02} VID={:#06x} PID={:#06x} \
              class={:#04x}/{:#04x}/{:#04x} bcdDevice={:#06x}",
-            self.name, slot,
-            bcd_usb >> 8, bcd_usb & 0xff,
-            id_vendor, id_product,
-            dev_class, dev_sub, dev_proto,
+            self.name,
+            slot,
+            bcd_usb >> 8,
+            bcd_usb & 0xff,
+            id_vendor,
+            id_product,
+            dev_class,
+            dev_sub,
+            dev_proto,
             bcd_dev,
         );
 
         if dev_class == 0x00 && dev_sub == 0x00 {
-            log::info!("xHCI: {}: slot {} — class defined per interface (check config desc)", self.name, slot);
+            log::info!(
+                "xHCI: {}: slot {} — class defined per interface (check config desc)",
+                self.name,
+                slot
+            );
         }
         Ok(())
     }
@@ -1143,15 +1277,23 @@ impl XhciDevice {
         // If NOOP times out, all Enable Slot attempts will also fail — report early.
         self.send_noop_cmd();
         match self.poll_cmd_completion(2_000_000) {
-            Some((code, _)) if code == 1 => {
+            Some((1, _)) => {
                 XHCI_NOOP_RESULT.store(1, Ordering::Relaxed);
-                log::info!("xHCI: {}: NOOP command OK — command ring is alive", self.name);
+                log::info!(
+                    "xHCI: {}: NOOP command OK — command ring is alive",
+                    self.name
+                );
             }
             Some((code, _)) => {
                 XHCI_NOOP_RESULT.store(2, Ordering::Relaxed);
                 let usbsts = self.read_op(regs::op::USBSTS);
                 XHCI_USBSTS_ON_SLOT_FAIL.store(usbsts, Ordering::Relaxed);
-                log::debug!("xHCI: {}: NOOP failed (code={}) USBSTS={:#010x}", self.name, code, usbsts);
+                log::debug!(
+                    "xHCI: {}: NOOP failed (code={}) USBSTS={:#010x}",
+                    self.name,
+                    code,
+                    usbsts
+                );
                 return;
             }
             None => {
@@ -1160,7 +1302,8 @@ impl XhciDevice {
                 XHCI_USBSTS_ON_SLOT_FAIL.store(usbsts, Ordering::Relaxed);
                 log::error!(
                     "xHCI: {}: NOOP timeout — command ring dead. USBSTS={:#010x}",
-                    self.name, usbsts,
+                    self.name,
+                    usbsts,
                 );
                 return; // No point resetting ports if commands don't complete.
             }
@@ -1194,9 +1337,7 @@ impl XhciDevice {
             let portsc = self.read_portsc(port);
             self.write_portsc(
                 port,
-                (portsc & !regs::port::PED)
-                    | (portsc & regs::port::CHANGE_BITS)
-                    | regs::port::PR,
+                (portsc & !regs::port::PED) | (portsc & regs::port::CHANGE_BITS) | regs::port::PR,
             );
             if !self.poll_portsc(port, regs::port::PRC, regs::port::PRC, 2_000_000) {
                 log::error!("xHCI: {}: port {} reset timeout", self.name, port);
@@ -1207,8 +1348,7 @@ impl XhciDevice {
             let portsc = self.read_portsc(port);
             self.write_portsc(
                 port,
-                (portsc & !(regs::port::PED | regs::port::PR))
-                    | (portsc & regs::port::CHANGE_BITS),
+                (portsc & !(regs::port::PED | regs::port::PR)) | (portsc & regs::port::CHANGE_BITS),
             );
             self.drain_events();
 
@@ -1221,20 +1361,37 @@ impl XhciDevice {
                     XHCI_USBSTS_ON_SLOT_FAIL.store(usbsts, Ordering::Relaxed);
                     log::error!(
                         "xHCI: {}: Enable Slot timeout port={} USBSTS={:#010x}",
-                        self.name, port, usbsts,
+                        self.name,
+                        port,
+                        usbsts,
                     );
                     continue;
                 }
             };
             if code != 1 {
-                log::error!("xHCI: {}: Enable Slot failed (code={}) on port {}", self.name, code, port);
+                log::error!(
+                    "xHCI: {}: Enable Slot failed (code={}) on port {}",
+                    self.name,
+                    code,
+                    port
+                );
                 continue;
             }
             XHCI_SLOT_ENABLED.fetch_add(1, Ordering::Relaxed);
-            log::info!("xHCI: {}: slot {} assigned for port {}", self.name, slot, port);
+            log::info!(
+                "xHCI: {}: slot {} assigned for port {}",
+                self.name,
+                slot,
+                port
+            );
 
             if let Err(e) = self.enumerate_port(port, slot) {
-                log::error!("xHCI: {}: port {} enumerate_port failed: {:?}", self.name, port, e);
+                log::error!(
+                    "xHCI: {}: port {} enumerate_port failed: {:?}",
+                    self.name,
+                    port,
+                    e
+                );
                 // Drain any stale TRANSFER_EVENTs left by failed control transfers
                 // before attempting the next port.
                 self.drain_events();
@@ -1258,24 +1415,34 @@ impl XhciDevice {
     /// DMA allocations are intentionally leaked — the xHCI controller retains a
     /// reference through the DCBAA and the slot cannot be safely disabled here.
     fn abandon_dev_state(&mut self) {
-        if let Some(ctx)  = self.dev_ctx.take()        { core::mem::forget(ctx); }
-        if let Some(r)    = self.ep0_ring.take()        { core::mem::forget(r); }
-        if let Some(r)    = self.bulk_in_ring.take()    { core::mem::forget(r); }
-        if let Some(r)    = self.bulk_out_ring.take()   { core::mem::forget(r); }
-        if let Some(dma)  = self.cdcacm_tx_dma.take()  { core::mem::forget(dma); }
-        self.dev_slot       = None;
-        self.is_pl2303      = false;
-        self.is_cdcacm      = false;
-        self.dev_vid        = 0;
-        self.dev_pid        = 0;
-        self.dev_bcd        = 0;
-        self.dev_class      = 0;
-        self.dev_max_pkt0   = 0;
-        self.dev_speed      = 0;
-        self.dev_port       = 0;
+        if let Some(ctx) = self.dev_ctx.take() {
+            core::mem::forget(ctx);
+        }
+        if let Some(r) = self.ep0_ring.take() {
+            core::mem::forget(r);
+        }
+        if let Some(r) = self.bulk_in_ring.take() {
+            core::mem::forget(r);
+        }
+        if let Some(r) = self.bulk_out_ring.take() {
+            core::mem::forget(r);
+        }
+        if let Some(dma) = self.cdcacm_tx_dma.take() {
+            core::mem::forget(dma);
+        }
+        self.dev_slot = None;
+        self.is_pl2303 = false;
+        self.is_cdcacm = false;
+        self.dev_vid = 0;
+        self.dev_pid = 0;
+        self.dev_bcd = 0;
+        self.dev_class = 0;
+        self.dev_max_pkt0 = 0;
+        self.dev_speed = 0;
+        self.dev_port = 0;
         self.cdcacm_ctrl_if = 0;
         self.cdcacm_max_pkt = 0;
-        self.bulk_in_ep_id  = 0;
+        self.bulk_in_ep_id = 0;
         self.bulk_out_ep_id = 0;
     }
     // -------------------------------------------------------------------------
@@ -1284,8 +1451,11 @@ impl XhciDevice {
 
     /// IN control transfer: Setup(TRT=3) + Data(DIR=IN) + Status(DIR=OUT, IOC).
     fn control_transfer_in(
-        &mut self, slot: u8,
-        setup_param: u64, data_phys: u64, data_len: usize,
+        &mut self,
+        slot: u8,
+        setup_param: u64,
+        data_phys: u64,
+        data_len: usize,
     ) -> Result<(), PCIeDeviceErr> {
         {
             let r = self.ep0_ring.as_mut().ok_or(PCIeDeviceErr::InitFailure)?;
@@ -1299,14 +1469,12 @@ impl XhciDevice {
             r.enqueue(Trb {
                 param: data_phys,
                 status: data_len as u32,
-                ctrl: (regs::trb_type::DATA_STAGE << regs::TRB_TYPE_SHIFT)
-                    | (1 << 16), // DIR=IN
+                ctrl: (regs::trb_type::DATA_STAGE << regs::TRB_TYPE_SHIFT) | (1 << 16), // DIR=IN
             });
             r.enqueue(Trb {
                 param: 0,
                 status: 0,
-                ctrl: (regs::trb_type::STATUS_STAGE << regs::TRB_TYPE_SHIFT)
-                    | (1 << 5), // IOC; DIR=OUT (0) for an IN transfer
+                ctrl: (regs::trb_type::STATUS_STAGE << regs::TRB_TYPE_SHIFT) | (1 << 5), // IOC; DIR=OUT (0) for an IN transfer
             });
         }
         self.write_slot_doorbell(slot, 1);
@@ -1318,8 +1486,12 @@ impl XhciDevice {
                 XHCI_CTRL_FAIL_CODE.store(0xFFFF, Ordering::Relaxed);
                 return Err(PCIeDeviceErr::InitFailure);
             };
-            if code == 1 { return Ok(()); }
-            if code == 13 { continue; }
+            if code == 1 {
+                return Ok(());
+            }
+            if code == 13 {
+                continue;
+            }
             log::error!("xHCI: control_transfer_in: code={}", code);
             XHCI_CTRL_FAIL_CODE.store(code as u32, Ordering::Relaxed);
             return Err(PCIeDeviceErr::InitFailure);
@@ -1329,16 +1501,13 @@ impl XhciDevice {
     }
 
     /// OUT control transfer with no data stage: Setup(TRT=0) + Status(DIR=IN, IOC).
-    fn control_transfer_out(
-        &mut self, slot: u8, setup_param: u64,
-    ) -> Result<(), PCIeDeviceErr> {
+    fn control_transfer_out(&mut self, slot: u8, setup_param: u64) -> Result<(), PCIeDeviceErr> {
         {
             let r = self.ep0_ring.as_mut().ok_or(PCIeDeviceErr::InitFailure)?;
             r.enqueue(Trb {
                 param: setup_param,
                 status: 8,
-                ctrl: (regs::trb_type::SETUP_STAGE << regs::TRB_TYPE_SHIFT)
-                    | (1 << 6), // IDT; TRT=0 (no data stage)
+                ctrl: (regs::trb_type::SETUP_STAGE << regs::TRB_TYPE_SHIFT) | (1 << 6), // IDT; TRT=0 (no data stage)
             });
             r.enqueue(Trb {
                 param: 0,
@@ -1349,7 +1518,8 @@ impl XhciDevice {
             });
         }
         self.write_slot_doorbell(slot, 1);
-        let code = self.poll_xfer_completion(2_000_000)
+        let code = self
+            .poll_xfer_completion(2_000_000)
             .ok_or(PCIeDeviceErr::InitFailure)?;
         if code != 1 {
             log::error!("xHCI: control_transfer_out: code={}", code);
@@ -1365,7 +1535,11 @@ impl XhciDevice {
     /// OUT control transfer WITH an outbound data stage.
     /// Flow: Setup(TRT=2) → Data Stage(DIR=OUT) → Status Stage(DIR=IN, IOC).
     fn control_transfer_out_with_data(
-        &mut self, slot: u8, setup_param: u64, data_phys: u64, data_len: usize,
+        &mut self,
+        slot: u8,
+        setup_param: u64,
+        data_phys: u64,
+        data_len: usize,
     ) -> Result<(), PCIeDeviceErr> {
         {
             let r = self.ep0_ring.as_mut().ok_or(PCIeDeviceErr::InitFailure)?;
@@ -1392,10 +1566,15 @@ impl XhciDevice {
         }
         self.write_slot_doorbell(slot, 1);
         for _ in 0..3 {
-            let code = self.poll_xfer_completion(2_000_000)
+            let code = self
+                .poll_xfer_completion(2_000_000)
                 .ok_or(PCIeDeviceErr::InitFailure)?;
-            if code == 1 { return Ok(()); }
-            if code == 13 { continue; }
+            if code == 1 {
+                return Ok(());
+            }
+            if code == 13 {
+                continue;
+            }
             log::error!("xHCI: control_transfer_out_with_data: code={}", code);
             return Err(PCIeDeviceErr::InitFailure);
         }
@@ -1409,13 +1588,20 @@ impl XhciDevice {
     /// `parity`    — 0 = None, 1 = Odd, 2 = Even, 3 = Mark, 4 = Space
     /// `data_bits` — 5 / 6 / 7 / 8 / 16
     fn cdcacm_set_line_coding(
-        &mut self, slot: u8, ctrl_if: u8,
-        baud: u32, stop_bits: u8, parity: u8, data_bits: u8,
+        &mut self,
+        slot: u8,
+        ctrl_if: u8,
+        baud: u32,
+        stop_bits: u8,
+        parity: u8,
+        data_bits: u8,
     ) -> Result<(), PCIeDeviceErr> {
         let mut buf = DMAPool::<[u8; 16]>::new(0, 1).ok_or(PCIeDeviceErr::InitFailure)?;
         {
             let b = buf.as_mut();
-            for x in b.iter_mut() { *x = 0; }
+            for x in b.iter_mut() {
+                *x = 0;
+            }
             b[0..4].copy_from_slice(&baud.to_le_bytes());
             b[4] = stop_bits;
             b[5] = parity;
@@ -1425,11 +1611,7 @@ impl XhciDevice {
 
         // bmRequestType=0x21 (OUT, Class, Interface)  bRequest=0x20 (SET_LINE_CODING)
         // wValue=0  wIndex=ctrl_if  wLength=7
-        let setup: u64 = 0x21u64
-            | (0x20u64 << 8)
-            | (0u64    << 16)
-            | ((ctrl_if as u64) << 32)
-            | (7u64    << 48);
+        let setup: u64 = 0x21u64 | (0x20u64 << 8) | ((ctrl_if as u64) << 32) | (7u64 << 48);
 
         self.control_transfer_out_with_data(slot, setup, phys, 7)
     }
@@ -1438,16 +1620,16 @@ impl XhciDevice {
     ///
     /// wValue bit 0 = DTR, bit 1 = RTS.  No data stage.
     fn cdcacm_set_control_line_state(
-        &mut self, slot: u8, ctrl_if: u8, dtr: bool, rts: bool,
+        &mut self,
+        slot: u8,
+        ctrl_if: u8,
+        dtr: bool,
+        rts: bool,
     ) -> Result<(), PCIeDeviceErr> {
         let wvalue: u64 = (if dtr { 1 } else { 0 }) | (if rts { 2 } else { 0 });
         // bmRequestType=0x21 (OUT, Class, Interface)  bRequest=0x22 (SET_CONTROL_LINE_STATE)
         // wValue=DTR|RTS  wIndex=ctrl_if  wLength=0
-        let setup: u64 = 0x21u64
-            | (0x22u64 << 8)
-            | (wvalue  << 16)
-            | ((ctrl_if as u64) << 32)
-            | (0u64    << 48);
+        let setup: u64 = 0x21u64 | (0x22u64 << 8) | (wvalue << 16) | ((ctrl_if as u64) << 32);
 
         self.control_transfer_out(slot, setup)
     }
@@ -1469,7 +1651,7 @@ impl XhciDevice {
     fn reset_ep0_after_stall(&mut self, slot: u8) -> Result<(), PCIeDeviceErr> {
         // Step 1: RESET_EP for EP0 (DCI = 1).
         let trb = Trb {
-            param:  0,
+            param: 0,
             status: 0,
             ctrl: (regs::trb_type::RESET_EP << regs::TRB_TYPE_SHIFT)
                 | (1u32 << 16)           // EPID = 1 (EP0)
@@ -1484,7 +1666,12 @@ impl XhciDevice {
                 return Err(PCIeDeviceErr::InitFailure);
             }
             Some((code, _)) if code != 1 => {
-                log::warn!("xHCI: {}: RESET_EP code={} (slot={})", self.name, code, slot);
+                log::warn!(
+                    "xHCI: {}: RESET_EP code={} (slot={})",
+                    self.name,
+                    code,
+                    slot
+                );
                 // Non-fatal: attempt SET_TR_DEQUEUE_POINTER anyway.
             }
             Some(_) => {}
@@ -1498,7 +1685,7 @@ impl XhciDevice {
             (addr, r.cycle_bit)
         };
         let trb = Trb {
-            param:  deq_phys | (dcs as u64), // bit 0 = DCS (Dequeue Cycle State)
+            param: deq_phys | (dcs as u64), // bit 0 = DCS (Dequeue Cycle State)
             status: 0,
             ctrl: (regs::trb_type::SET_TR_DEQUEUE_POINTER << regs::TRB_TYPE_SHIFT)
                 | (1u32 << 16)           // EPID = 1 (EP0)
@@ -1509,17 +1696,30 @@ impl XhciDevice {
         }
         match self.poll_cmd_completion(2_000_000) {
             None => {
-                log::error!("xHCI: {}: SET_TR_DEQUEUE_POINTER timeout (slot={})", self.name, slot);
+                log::error!(
+                    "xHCI: {}: SET_TR_DEQUEUE_POINTER timeout (slot={})",
+                    self.name,
+                    slot
+                );
                 return Err(PCIeDeviceErr::InitFailure);
             }
             Some((code, _)) if code != 1 => {
-                log::error!("xHCI: {}: SET_TR_DEQUEUE_POINTER code={} (slot={})", self.name, code, slot);
+                log::error!(
+                    "xHCI: {}: SET_TR_DEQUEUE_POINTER code={} (slot={})",
+                    self.name,
+                    code,
+                    slot
+                );
                 return Err(PCIeDeviceErr::InitFailure);
             }
             Some(_) => {}
         }
 
-        log::info!("xHCI: {}: EP0 STALL cleared — ready for next transfer (slot={})", self.name, slot);
+        log::info!(
+            "xHCI: {}: EP0 STALL cleared — ready for next transfer (slot={})",
+            self.name,
+            slot
+        );
         Ok(())
     }
 
@@ -1547,20 +1747,31 @@ impl XhciDevice {
         // STOP_ENDPOINT: moves endpoint from Running → Stopped.
         // Code 19 (Context State Error) means it was already Stopped or is Halted.
         let trb = Trb {
-            param:  0,
+            param: 0,
             status: 0,
             ctrl: (regs::trb_type::STOP_EP << regs::TRB_TYPE_SHIFT)
                 | (ep_dci << 16)
                 | ((slot as u32) << 24),
         };
-        if self.cmd_ring.enqueue(trb) { self.ring_cmd_doorbell(); }
+        if self.cmd_ring.enqueue(trb) {
+            self.ring_cmd_doorbell();
+        }
         let stop_code = match self.poll_cmd_completion(2_000_000) {
             None => {
-                log::warn!("xHCI: {}: bulk OUT STOP_EP timeout (slot={})", self.name, slot);
+                log::warn!(
+                    "xHCI: {}: bulk OUT STOP_EP timeout (slot={})",
+                    self.name,
+                    slot
+                );
                 return Err(PCIeDeviceErr::InitFailure);
             }
             Some((code, _)) if code != 1 && code != 19 => {
-                log::warn!("xHCI: {}: bulk OUT STOP_EP code={} (slot={})", self.name, code, slot);
+                log::warn!(
+                    "xHCI: {}: bulk OUT STOP_EP code={} (slot={})",
+                    self.name,
+                    code,
+                    slot
+                );
                 return Err(PCIeDeviceErr::InitFailure);
             }
             Some((code, _)) => code,
@@ -1573,20 +1784,31 @@ impl XhciDevice {
         // Stopped (not Halted), which is fine.
         if stop_code == 19 {
             let trb = Trb {
-                param:  0,
+                param: 0,
                 status: 0,
                 ctrl: (regs::trb_type::RESET_EP << regs::TRB_TYPE_SHIFT)
                     | (ep_dci << 16)
                     | ((slot as u32) << 24),
             };
-            if self.cmd_ring.enqueue(trb) { self.ring_cmd_doorbell(); }
+            if self.cmd_ring.enqueue(trb) {
+                self.ring_cmd_doorbell();
+            }
             match self.poll_cmd_completion(2_000_000) {
                 None => {
-                    log::warn!("xHCI: {}: bulk OUT RESET_EP timeout (slot={})", self.name, slot);
+                    log::warn!(
+                        "xHCI: {}: bulk OUT RESET_EP timeout (slot={})",
+                        self.name,
+                        slot
+                    );
                     return Err(PCIeDeviceErr::InitFailure);
                 }
                 Some((code, _)) if code != 1 && code != 19 => {
-                    log::warn!("xHCI: {}: bulk OUT RESET_EP code={} (slot={})", self.name, code, slot);
+                    log::warn!(
+                        "xHCI: {}: bulk OUT RESET_EP code={} (slot={})",
+                        self.name,
+                        code,
+                        slot
+                    );
                     return Err(PCIeDeviceErr::InitFailure);
                 }
                 Some(_) => {}
@@ -1596,31 +1818,49 @@ impl XhciDevice {
         // SET_TR_DEQUEUE_POINTER: advance xHC's dequeue pointer to the current
         // software enqueue position, skipping any stale pending TRBs.
         let (deq_phys, dcs) = {
-            let r = self.bulk_out_ring.as_ref().ok_or(PCIeDeviceErr::InitFailure)?;
+            let r = self
+                .bulk_out_ring
+                .as_ref()
+                .ok_or(PCIeDeviceErr::InitFailure)?;
             let addr = r.phys_base() + (r.enqueue_idx as u64) * 16;
             (addr, r.cycle_bit)
         };
         let trb = Trb {
-            param:  deq_phys | (dcs as u64),
+            param: deq_phys | (dcs as u64),
             status: 0,
             ctrl: (regs::trb_type::SET_TR_DEQUEUE_POINTER << regs::TRB_TYPE_SHIFT)
                 | (ep_dci << 16)
                 | ((slot as u32) << 24),
         };
-        if self.cmd_ring.enqueue(trb) { self.ring_cmd_doorbell(); }
+        if self.cmd_ring.enqueue(trb) {
+            self.ring_cmd_doorbell();
+        }
         match self.poll_cmd_completion(2_000_000) {
             None => {
-                log::warn!("xHCI: {}: bulk OUT SET_TR_DEQ timeout (slot={})", self.name, slot);
+                log::warn!(
+                    "xHCI: {}: bulk OUT SET_TR_DEQ timeout (slot={})",
+                    self.name,
+                    slot
+                );
                 return Err(PCIeDeviceErr::InitFailure);
             }
             Some((code, _)) if code != 1 => {
-                log::warn!("xHCI: {}: bulk OUT SET_TR_DEQ code={} (slot={})", self.name, code, slot);
+                log::warn!(
+                    "xHCI: {}: bulk OUT SET_TR_DEQ code={} (slot={})",
+                    self.name,
+                    code,
+                    slot
+                );
                 return Err(PCIeDeviceErr::InitFailure);
             }
             Some(_) => {}
         }
 
-        log::info!("xHCI: {}: bulk OUT ring recovered (slot={})", self.name, slot);
+        log::info!(
+            "xHCI: {}: bulk OUT ring recovered (slot={})",
+            self.name,
+            slot
+        );
         Ok(())
     }
 
@@ -1630,11 +1870,16 @@ impl XhciDevice {
 
     /// Vendor-specific IN transfer: read 1 byte from the PL2303 register at `wvalue`.
     /// The byte is discarded; we only care whether the transfer succeeds.
-    fn pl2303_vendor_read(&mut self, slot: u8, wvalue: u16, windex: u16)
-        -> Result<(), PCIeDeviceErr>
-    {
+    fn pl2303_vendor_read(
+        &mut self,
+        slot: u8,
+        wvalue: u16,
+        windex: u16,
+    ) -> Result<(), PCIeDeviceErr> {
         let mut buf = DMAPool::<[u8; 4]>::new(0, 1).ok_or(PCIeDeviceErr::InitFailure)?;
-        for b in buf.as_mut().iter_mut() { *b = 0; }
+        for b in buf.as_mut().iter_mut() {
+            *b = 0;
+        }
         let phys = buf.get_phy_addr().as_usize() as u64;
         // bmRequestType=0xC0 (IN, Vendor, Device)  bRequest=0x01  wLength=1
         let setup: u64 = 0xC0u64
@@ -1647,14 +1892,14 @@ impl XhciDevice {
 
     /// Vendor-specific OUT transfer with no data stage: write to PL2303 register.
     /// bmRequestType=0x40 (OUT, Vendor, Device), bRequest=0x01, wLength=0.
-    fn pl2303_vendor_write(&mut self, slot: u8, wvalue: u16, windex: u16)
-        -> Result<(), PCIeDeviceErr>
-    {
-        let setup: u64 = 0x40u64
-            | (0x01u64 << 8)
-            | ((wvalue as u64) << 16)
-            | ((windex as u64) << 32)
-            | (0u64 << 48);
+    fn pl2303_vendor_write(
+        &mut self,
+        slot: u8,
+        wvalue: u16,
+        windex: u16,
+    ) -> Result<(), PCIeDeviceErr> {
+        let setup: u64 =
+            0x40u64 | (0x01u64 << 8) | ((wvalue as u64) << 16) | ((windex as u64) << 32);
         self.control_transfer_out(slot, setup)
     }
 
@@ -1667,7 +1912,10 @@ impl XhciDevice {
     /// Sequence reference: FreeBSD sys/dev/usb/serial/uplcom.c `uplcom_pl2303_init()`
     /// and the surrounding code in `uplcom_attach()`.
     fn pl2303_init_seq(
-        &mut self, slot: u8, chip_type: pl2303::ChipType, data_iface_no: u8,
+        &mut self,
+        slot: u8,
+        chip_type: pl2303::ChipType,
+        data_iface_no: u8,
     ) -> Result<(), PCIeDeviceErr> {
         use pl2303::ChipType;
 
@@ -1677,8 +1925,7 @@ impl XhciDevice {
             let setup: u64 = 0x40u64
                 | (0x80u64 << 8)   // UPLCOM_SET_REQUEST_PL2303HXN
                 | (0x07u64 << 16)  // wValue = 0x07
-                | (0x03u64 << 32)  // wIndex = 0x03
-                | (0u64 << 48);
+                | (0x03u64 << 32); // wIndex = 0x03
             let _ = self.control_transfer_out(slot, setup);
             return Ok(());
         }
@@ -1694,21 +1941,21 @@ impl XhciDevice {
 
         // 10-step common init sequence (uplcom_pl2303_init, steps 1-10).
         // Reads are fire-and-forget; the returned byte is not used.
-        self.pl2303_vendor_read(slot,  0x8484, 0)?;
+        self.pl2303_vendor_read(slot, 0x8484, 0)?;
         self.pl2303_vendor_write(slot, 0x0404, 0)?;
-        self.pl2303_vendor_read(slot,  0x8484, 0)?;
-        self.pl2303_vendor_read(slot,  0x8383, 0)?;
-        self.pl2303_vendor_read(slot,  0x8484, 0)?;
+        self.pl2303_vendor_read(slot, 0x8484, 0)?;
+        self.pl2303_vendor_read(slot, 0x8383, 0)?;
+        self.pl2303_vendor_read(slot, 0x8484, 0)?;
         self.pl2303_vendor_write(slot, 0x0404, 1)?;
-        self.pl2303_vendor_read(slot,  0x8484, 0)?;
-        self.pl2303_vendor_read(slot,  0x8383, 0)?;
+        self.pl2303_vendor_read(slot, 0x8484, 0)?;
+        self.pl2303_vendor_read(slot, 0x8383, 0)?;
         self.pl2303_vendor_write(slot, 0x0000, 1)?; // wValue=0x0000, wIndex=0x0001
         self.pl2303_vendor_write(slot, 0x0001, 0)?; // wValue=0x0001, wIndex=0x0000
 
         // Step 11: mode byte — 0x24 for original PL2303, 0x44 for HX/HXD.
         let mode_windex: u16 = match chip_type {
             ChipType::Original => 0x24,
-            _                  => 0x44,
+            _ => 0x44,
         };
         self.pl2303_vendor_write(slot, 0x0002, mode_windex)?;
 
@@ -1732,7 +1979,11 @@ impl XhciDevice {
 
         log::info!(
             "xHCI: {}: slot {} — PL2303 detected VID={:#06x} PID={:#06x} bcdDevice={:#06x}",
-            self.name, slot, self.dev_vid, self.dev_pid, self.dev_bcd,
+            self.name,
+            slot,
+            self.dev_vid,
+            self.dev_pid,
+            self.dev_bcd,
         );
 
         // Walk the configuration descriptor for bulk endpoints.
@@ -1742,41 +1993,49 @@ impl XhciDevice {
         let mut info = match pl2303::find_bulk_endpoints(&cfg, cfg_len) {
             Some(i) => i,
             None => {
-                log::error!("xHCI: {}: slot {} — PL2303 bulk endpoints not found", self.name, slot);
+                log::error!(
+                    "xHCI: {}: slot {} — PL2303 bulk endpoints not found",
+                    self.name,
+                    slot
+                );
                 return Err(PCIeDeviceErr::InitFailure);
             }
         };
         XHCI_PL2303_GOT_EPS.store(true, Ordering::Relaxed);
 
         // Determine chip type from cached device descriptor fields.
-        let mut chip_type = pl2303::detect_chip_type(
-            self.dev_bcd, self.dev_class, self.dev_max_pkt0,
-        );
+        let mut chip_type =
+            pl2303::detect_chip_type(self.dev_bcd, self.dev_class, self.dev_max_pkt0);
 
         // Distinguish HX from HXN: reading register 0x8080 fails (STALL) on HXN.
         // After a STALL, EP0 enters the HALTED state on the host side and must be
         // reset before the next control transfer (set_configuration) can proceed.
-        if chip_type == pl2303::ChipType::Hx {
-            if self.pl2303_vendor_read(slot, 0x8080, info.data_iface_no as u16).is_err() {
-                chip_type = pl2303::ChipType::Hxn;
-                log::info!("xHCI: {}: slot {} — PL2303HXN confirmed", self.name, slot);
-                self.reset_ep0_after_stall(slot)?;
-            }
+        if chip_type == pl2303::ChipType::Hx
+            && self
+                .pl2303_vendor_read(slot, 0x8080, info.data_iface_no as u16)
+                .is_err()
+        {
+            chip_type = pl2303::ChipType::Hxn;
+            log::info!("xHCI: {}: slot {} — PL2303HXN confirmed", self.name, slot);
+            self.reset_ep0_after_stall(slot)?;
         }
         info.chip_type = chip_type;
 
         log::info!(
             "xHCI: {}: slot {} — PL2303 {:?} iface={} IN={:#04x} OUT={:#04x} max_pkt={}",
-            self.name, slot, chip_type, info.data_iface_no,
-            info.bulk_in_addr, info.bulk_out_addr, info.max_pkt,
+            self.name,
+            slot,
+            chip_type,
+            info.data_iface_no,
+            info.bulk_in_addr,
+            info.bulk_out_addr,
+            info.max_pkt,
         );
 
         self.set_configuration(slot, info.config_val)?;
         XHCI_PL2303_SET_CFG.store(true, Ordering::Relaxed);
 
-        self.configure_bulk_endpoints(
-            slot, info.bulk_in_addr, info.bulk_out_addr, info.max_pkt,
-        )?;
+        self.configure_bulk_endpoints(slot, info.bulk_in_addr, info.bulk_out_addr, info.max_pkt)?;
         XHCI_PL2303_CFG_EPS.store(true, Ordering::Relaxed);
 
         // Phase B: chip initialization sequence.
@@ -1790,19 +2049,22 @@ impl XhciDevice {
         // SET_CONTROL_LINE_STATE (DTR=1, RTS=1).
         self.cdcacm_set_control_line_state(slot, info.data_iface_no, true, true)?;
 
-        self.is_pl2303    = true;
+        self.is_pl2303 = true;
         self.cdcacm_max_pkt = info.max_pkt;
 
         // Phase C: pre-allocate the DMA TX buffer (shared with CDC-ACM path).
         if self.cdcacm_tx_dma.is_none() {
             let mut tx = DMAPool::<[u8; 512]>::new(0, 1).ok_or(PCIeDeviceErr::InitFailure)?;
-            for b in tx.as_mut().iter_mut() { *b = 0; }
+            for b in tx.as_mut().iter_mut() {
+                *b = 0;
+            }
             self.cdcacm_tx_dma = Some(tx);
         }
 
         log::info!(
             "xHCI: {}: slot {} — PL2303 ready for TX (115200 8N1 DTR+RTS)",
-            self.name, slot,
+            self.name,
+            slot,
         );
         Ok(())
     }
@@ -1814,7 +2076,9 @@ impl XhciDevice {
     /// GET_DESCRIPTOR(Configuration): fetch up to 255 bytes, return (buf, total_len).
     fn get_config_descriptor(&mut self, slot: u8) -> Result<([u8; 255], usize), PCIeDeviceErr> {
         let mut buf = DMAPool::<[u8; 256]>::new(0, 1).ok_or(PCIeDeviceErr::InitFailure)?;
-        for b in buf.as_mut().iter_mut() { *b = 0; }
+        for b in buf.as_mut().iter_mut() {
+            *b = 0;
+        }
         let phys = buf.get_phy_addr().as_usize() as u64;
 
         // First pass: 9 bytes to learn wTotalLength.
@@ -1825,7 +2089,12 @@ impl XhciDevice {
 
         let total = u16::from_le_bytes([buf.as_mut()[2], buf.as_mut()[3]]) as usize;
         let fetch = total.min(255);
-        log::info!("xHCI: {}: get_config_descriptor: wTotalLength={} fetch={}", self.name, total, fetch);
+        log::info!(
+            "xHCI: {}: get_config_descriptor: wTotalLength={} fetch={}",
+            self.name,
+            total,
+            fetch
+        );
         if total > 0 {
             // Diagnostic: DMA buffer was actually written (not a cache/coherency ghost of zeros).
             XHCI_PL2303_CFG_TOTAL_OK.store(true, Ordering::Relaxed);
@@ -1834,16 +2103,20 @@ impl XhciDevice {
         // Guard: if fetch==0 the device sent a malformed/empty config descriptor; bail now
         // rather than issuing a GET_DESCRIPTOR with wLength=0 which most devices STALL.
         if fetch == 0 {
-            log::error!("xHCI: {}: get_config_descriptor: wTotalLength=0 (DMA not updated?)", self.name);
+            log::error!(
+                "xHCI: {}: get_config_descriptor: wTotalLength=0 (DMA not updated?)",
+                self.name
+            );
             return Err(PCIeDeviceErr::InitFailure);
         }
         // Record fetch before the second transfer so it's visible even if the transfer fails.
         XHCI_CFG_FETCH.store(fetch as u8, Ordering::Relaxed);
 
         // Second pass: full descriptor.
-        for b in buf.as_mut().iter_mut() { *b = 0; }
-        let setup_full: u64 =
-            0x80u64 | (6u64 << 8) | (0x0200u64 << 16) | ((fetch as u64) << 48);
+        for b in buf.as_mut().iter_mut() {
+            *b = 0;
+        }
+        let setup_full: u64 = 0x80u64 | (6u64 << 8) | (0x0200u64 << 16) | ((fetch as u64) << 48);
         self.control_transfer_in(slot, setup_full, phys, fetch)?;
 
         let mut out = [0u8; 255];
@@ -1853,9 +2126,9 @@ impl XhciDevice {
 
     /// SET_CONFIGURATION(config_val) — no data stage.
     fn set_configuration(&mut self, slot: u8, config_val: u8) -> Result<(), PCIeDeviceErr> {
-        let setup: u64 = 0x00u64              // bmRequestType=0x00 (OUT, Std, Device)
-            | (9u64 << 8)                      // bRequest=SET_CONFIGURATION
-            | ((config_val as u64) << 16);     // wValue=config_val, wIndex=0, wLength=0
+        // bmRequestType=0x00 (OUT, Std, Device)
+        let setup: u64 = (9u64 << 8)          // bRequest=SET_CONFIGURATION
+            | ((config_val as u64) << 16); // wValue=config_val, wIndex=0, wLength=0
         self.control_transfer_out(slot, setup)
     }
 
@@ -1867,16 +2140,20 @@ impl XhciDevice {
     /// Uses the pre-allocated `cdcacm_tx_dma` buffer; must be called after
     /// `try_setup_cdcacm()` has succeeded.
     fn cdcacm_write(&mut self, slot: u8, data: &[u8]) -> Result<(), PCIeDeviceErr> {
-        let max_pkt = (self.cdcacm_max_pkt as usize).min(512).max(1);
+        let max_pkt = (self.cdcacm_max_pkt as usize).clamp(1, 512);
 
-        let tx_phys = self.cdcacm_tx_dma
+        let tx_phys = self
+            .cdcacm_tx_dma
             .as_ref()
             .ok_or(PCIeDeviceErr::InitFailure)?
-            .get_phy_addr().as_usize() as u64;
+            .get_phy_addr()
+            .as_usize() as u64;
 
         for chunk in data.chunks(max_pkt) {
             {
-                let tx = self.cdcacm_tx_dma.as_mut()
+                let tx = self
+                    .cdcacm_tx_dma
+                    .as_mut()
                     .ok_or(PCIeDeviceErr::InitFailure)?;
                 let b = tx.as_mut();
                 b[..chunk.len()].copy_from_slice(chunk);
@@ -1892,8 +2169,11 @@ impl XhciDevice {
 
     /// Issue CONFIGURE_EP to add bulk IN and OUT endpoints, then allocate their rings.
     fn configure_bulk_endpoints(
-        &mut self, slot: u8,
-        bulk_in_addr: u8, bulk_out_addr: u8, max_pkt: u16,
+        &mut self,
+        slot: u8,
+        bulk_in_addr: u8,
+        bulk_out_addr: u8,
+        max_pkt: u16,
     ) -> Result<(), PCIeDeviceErr> {
         // xHCI DCI: IN = ep_num*2+1,  OUT = ep_num*2  (ep_num ≥ 1).
         let in_dci = ((bulk_in_addr & 0xf) as usize) * 2 + 1;
@@ -1915,11 +2195,13 @@ impl XhciDevice {
         let mut input_ctx = DMAPool::<[u8; 4096]>::new(0, 1).ok_or(PCIeDeviceErr::InitFailure)?;
         {
             let b = input_ctx.as_mut();
-            for x in b.iter_mut() { *x = 0; }
+            for x in b.iter_mut() {
+                *x = 0;
+            }
 
             // Input Control Context: add Slot (bit 0) + bulk IN (bit in_dci) + bulk OUT (bit out_dci).
             let add: u32 = (1 << 0) | (1u32 << in_dci) | (1u32 << out_dci);
-            ctx_write32(b, 0, 0);   // Drop flags = 0
+            ctx_write32(b, 0, 0); // Drop flags = 0
             ctx_write32(b, 4, add); // Add flags
 
             // Slot Context: update ContextEntries to max_dci.
@@ -1928,14 +2210,22 @@ impl XhciDevice {
 
             // Bulk IN EP Context (EPType=6).
             let in_off = ctx * (in_dci + 1);
-            ctx_write32(b, in_off + 4, (3 << 1) | (6 << 3) | ((max_pkt as u32) << 16));
+            ctx_write32(
+                b,
+                in_off + 4,
+                (3 << 1) | (6 << 3) | ((max_pkt as u32) << 16),
+            );
             ctx_write32(b, in_off + 8, in_phys as u32 | 1); // DCS=1
             ctx_write32(b, in_off + 12, (in_phys >> 32) as u32);
             ctx_write32(b, in_off + 16, max_pkt as u32); // AvgTRBLen
 
             // Bulk OUT EP Context (EPType=2).
             let out_off = ctx * (out_dci + 1);
-            ctx_write32(b, out_off + 4, (3 << 1) | (2 << 3) | ((max_pkt as u32) << 16));
+            ctx_write32(
+                b,
+                out_off + 4,
+                (3 << 1) | (2 << 3) | ((max_pkt as u32) << 16),
+            );
             ctx_write32(b, out_off + 8, out_phys as u32 | 1);
             ctx_write32(b, out_off + 12, (out_phys >> 32) as u32);
             ctx_write32(b, out_off + 16, max_pkt as u32);
@@ -1945,15 +2235,15 @@ impl XhciDevice {
         let trb = Trb {
             param: input_phys,
             status: 0,
-            ctrl: (regs::trb_type::CONFIGURE_EP << regs::TRB_TYPE_SHIFT)
-                | ((slot as u32) << 24),
+            ctrl: (regs::trb_type::CONFIGURE_EP << regs::TRB_TYPE_SHIFT) | ((slot as u32) << 24),
         };
         if self.cmd_ring.enqueue(trb) {
             self.ring_cmd_doorbell();
         }
         drop(input_ctx);
 
-        let (code, _) = self.poll_cmd_completion(2_000_000)
+        let (code, _) = self
+            .poll_cmd_completion(2_000_000)
             .ok_or(PCIeDeviceErr::InitFailure)?;
         if code != 1 {
             log::error!("xHCI: {}: CONFIGURE_EP failed (code={})", self.name, code);
@@ -1967,7 +2257,11 @@ impl XhciDevice {
 
         log::info!(
             "xHCI: {}: slot {} bulk EPs configured: IN_DCI={} OUT_DCI={} max_pkt={}",
-            self.name, slot, in_dci, out_dci, max_pkt,
+            self.name,
+            slot,
+            in_dci,
+            out_dci,
+            max_pkt,
         );
         Ok(())
     }
@@ -1978,11 +2272,17 @@ impl XhciDevice {
 
     /// Enqueue one Normal TRB on the bulk OUT ring and wait for TRANSFER_EVENT.
     fn bulk_out_transfer(
-        &mut self, slot: u8, buf_phys: u64, len: u32,
+        &mut self,
+        slot: u8,
+        buf_phys: u64,
+        len: u32,
     ) -> Result<(), PCIeDeviceErr> {
         let ep_id = self.bulk_out_ep_id as u32;
         {
-            let r = self.bulk_out_ring.as_mut().ok_or(PCIeDeviceErr::InitFailure)?;
+            let r = self
+                .bulk_out_ring
+                .as_mut()
+                .ok_or(PCIeDeviceErr::InitFailure)?;
             r.enqueue(Trb {
                 param: buf_phys,
                 status: len,
@@ -1990,7 +2290,8 @@ impl XhciDevice {
             });
         }
         self.write_slot_doorbell(slot, ep_id);
-        let code = self.poll_xfer_completion(2_000_000)
+        let code = self
+            .poll_xfer_completion(2_000_000)
             .ok_or(PCIeDeviceErr::InitFailure)?;
         if code != 1 && code != 13 {
             log::error!("xHCI: bulk OUT failed (code={})", code);
@@ -2000,12 +2301,13 @@ impl XhciDevice {
     }
 
     /// Enqueue one Normal TRB on the bulk IN ring and wait for TRANSFER_EVENT.
-    fn bulk_in_transfer(
-        &mut self, slot: u8, buf_phys: u64, len: u32,
-    ) -> Result<(), PCIeDeviceErr> {
+    fn bulk_in_transfer(&mut self, slot: u8, buf_phys: u64, len: u32) -> Result<(), PCIeDeviceErr> {
         let ep_id = self.bulk_in_ep_id as u32;
         {
-            let r = self.bulk_in_ring.as_mut().ok_or(PCIeDeviceErr::InitFailure)?;
+            let r = self
+                .bulk_in_ring
+                .as_mut()
+                .ok_or(PCIeDeviceErr::InitFailure)?;
             r.enqueue(Trb {
                 param: buf_phys,
                 status: len,
@@ -2013,7 +2315,8 @@ impl XhciDevice {
             });
         }
         self.write_slot_doorbell(slot, ep_id);
-        let code = self.poll_xfer_completion(2_000_000)
+        let code = self
+            .poll_xfer_completion(2_000_000)
             .ok_or(PCIeDeviceErr::InitFailure)?;
         if code != 1 && code != 13 {
             log::error!("xHCI: bulk IN failed (code={})", code);
@@ -2029,14 +2332,21 @@ impl XhciDevice {
     /// Execute one BOT IN transaction: CBW → data IN → CSW.
     /// Returns CSW status byte (0 = pass).
     fn msc_bot_in(
-        &mut self, slot: u8,
-        cdb: &[u8; 16], cdb_len: u8,
-        data_phys: u64, data_len: u32,
+        &mut self,
+        slot: u8,
+        cdb: &[u8; 16],
+        cdb_len: u8,
+        data_phys: u64,
+        data_len: u32,
     ) -> Result<u8, PCIeDeviceErr> {
         let mut cbw_buf = DMAPool::<[u8; 64]>::new(0, 1).ok_or(PCIeDeviceErr::InitFailure)?;
         let mut csw_buf = DMAPool::<[u8; 64]>::new(0, 1).ok_or(PCIeDeviceErr::InitFailure)?;
-        for b in cbw_buf.as_mut().iter_mut() { *b = 0; }
-        for b in csw_buf.as_mut().iter_mut() { *b = 0; }
+        for b in cbw_buf.as_mut().iter_mut() {
+            *b = 0;
+        }
+        for b in csw_buf.as_mut().iter_mut() {
+            *b = 0;
+        }
 
         self.msc_tag = self.msc_tag.wrapping_add(1);
         let tag = self.msc_tag;
@@ -2078,9 +2388,12 @@ impl XhciDevice {
     }
 
     /// SCSI INQUIRY — confirm device type and log vendor/product strings.
+    #[allow(dead_code)]
     fn msc_inquiry(&mut self, slot: u8) -> Result<(), PCIeDeviceErr> {
         let mut buf = DMAPool::<[u8; 64]>::new(0, 1).ok_or(PCIeDeviceErr::InitFailure)?;
-        for b in buf.as_mut().iter_mut() { *b = 0; }
+        for b in buf.as_mut().iter_mut() {
+            *b = 0;
+        }
         let phys = buf.get_phy_addr().as_usize() as u64;
 
         let cdb = msc::scsi_inquiry_cdb();
@@ -2097,16 +2410,22 @@ impl XhciDevice {
         let product = core::str::from_utf8(&d[16..32]).unwrap_or("?");
         log::info!(
             "xHCI: {}: slot {} INQUIRY type={} vendor='{}' product='{}'",
-            self.name, slot, ptype,
-            vendor.trim(), product.trim(),
+            self.name,
+            slot,
+            ptype,
+            vendor.trim(),
+            product.trim(),
         );
         Ok(())
     }
 
     /// SCSI READ CAPACITY(10) — returns (last_lba, block_len_bytes).
+    #[allow(dead_code)]
     fn msc_read_capacity(&mut self, slot: u8) -> Result<(u32, u32), PCIeDeviceErr> {
         let mut buf = DMAPool::<[u8; 64]>::new(0, 1).ok_or(PCIeDeviceErr::InitFailure)?;
-        for b in buf.as_mut().iter_mut() { *b = 0; }
+        for b in buf.as_mut().iter_mut() {
+            *b = 0;
+        }
         let phys = buf.get_phy_addr().as_usize() as u64;
 
         let cdb = msc::scsi_read_capacity_cdb();
@@ -2121,7 +2440,10 @@ impl XhciDevice {
         let block_len = u32::from_be_bytes([d[4], d[5], d[6], d[7]]);
         log::info!(
             "xHCI: {}: slot {} capacity: last_lba={} block={}B (~{}MiB)",
-            self.name, slot, last_lba, block_len,
+            self.name,
+            slot,
+            last_lba,
+            block_len,
             (last_lba as u64 + 1) * block_len as u64 / (1024 * 1024),
         );
         Ok((last_lba, block_len))
@@ -2129,13 +2451,22 @@ impl XhciDevice {
 
     /// SCSI READ(10) — read `count` 512-byte sectors from `lba` into `buf_phys`.
     pub fn msc_read10(
-        &mut self, slot: u8, lba: u32, count: u16, buf_phys: u64,
+        &mut self,
+        slot: u8,
+        lba: u32,
+        count: u16,
+        buf_phys: u64,
     ) -> Result<(), PCIeDeviceErr> {
         let cdb = msc::scsi_read10_cdb(lba, count);
         let data_len = (count as u32) * 512;
         let st = self.msc_bot_in(slot, &cdb, 10, buf_phys, data_len)?;
         if st != msc::CSW_STATUS_PASS {
-            log::error!("xHCI: READ(10) lba={} count={} failed (status={})", lba, count, st);
+            log::error!(
+                "xHCI: READ(10) lba={} count={} failed (status={})",
+                lba,
+                count,
+                st
+            );
             return Err(PCIeDeviceErr::InitFailure);
         }
         Ok(())
@@ -2145,6 +2476,7 @@ impl XhciDevice {
     // Phase 4d: Top-level MSC setup orchestration
     // -------------------------------------------------------------------------
 
+    #[allow(dead_code)]
     fn try_setup_msc(&mut self, slot: u8) -> Result<(), PCIeDeviceErr> {
         let (cfg, cfg_len) = self.get_config_descriptor(slot)?;
 
@@ -2153,14 +2485,20 @@ impl XhciDevice {
             None => {
                 log::info!(
                     "xHCI: {}: slot {} — no MSC bulk endpoints in config descriptor",
-                    self.name, slot,
+                    self.name,
+                    slot,
                 );
                 return Ok(());
             }
         };
         log::info!(
             "xHCI: {}: slot {} — MSC cfg={} IN={:#04x} OUT={:#04x} max_pkt={}",
-            self.name, slot, info.config_val, info.in_addr, info.out_addr, info.max_pkt,
+            self.name,
+            slot,
+            info.config_val,
+            info.in_addr,
+            info.out_addr,
+            info.max_pkt,
         );
 
         self.set_configuration(slot, info.config_val)?;
@@ -2171,14 +2509,18 @@ impl XhciDevice {
         if block_len != 512 {
             log::warn!(
                 "xHCI: {}: slot {} — block size {} ≠ 512, skipping sector read",
-                self.name, slot, block_len,
+                self.name,
+                slot,
+                block_len,
             );
             return Ok(());
         }
 
         // Read LBA 0 (MBR / protective GPT header).
         let mut sec = DMAPool::<[u8; 512]>::new(0, 1).ok_or(PCIeDeviceErr::InitFailure)?;
-        for b in sec.as_mut().iter_mut() { *b = 0; }
+        for b in sec.as_mut().iter_mut() {
+            *b = 0;
+        }
         let sec_phys = sec.get_phy_addr().as_usize() as u64;
         self.msc_read10(slot, 0, 1, sec_phys)?;
 
@@ -2196,14 +2538,21 @@ impl XhciDevice {
                     let s = sec.as_mut();
                     let pt = s[off + 4];
                     let st = s[off];
-                    let ls = u32::from_le_bytes([s[off+8],  s[off+9],  s[off+10], s[off+11]]);
-                    let lz = u32::from_le_bytes([s[off+12], s[off+13], s[off+14], s[off+15]]);
+                    let ls = u32::from_le_bytes([s[off + 8], s[off + 9], s[off + 10], s[off + 11]]);
+                    let lz =
+                        u32::from_le_bytes([s[off + 12], s[off + 13], s[off + 14], s[off + 15]]);
                     (pt, st, ls, lz)
                 };
-                if ptype == 0 { continue; }
+                if ptype == 0 {
+                    continue;
+                }
                 log::info!(
                     "  partition {}: type={:#04x} status={:#04x} lba_start={} lba_size={}",
-                    i + 1, ptype, status, lba_start, lba_size,
+                    i + 1,
+                    ptype,
+                    status,
+                    lba_start,
+                    lba_size,
                 );
                 if fat32_part.is_none() && (ptype == 0x0B || ptype == 0x0C) {
                     fat32_part = Some(lba_start);
@@ -2212,7 +2561,10 @@ impl XhciDevice {
         } else {
             log::warn!(
                 "xHCI: {}: slot {} — no MBR signature ({:#06x}); total sectors: {}",
-                self.name, slot, boot_sig, last_lba as u64 + 1,
+                self.name,
+                slot,
+                boot_sig,
+                last_lba as u64 + 1,
             );
         }
         drop(sec);
@@ -2228,9 +2580,12 @@ impl XhciDevice {
     // -------------------------------------------------------------------------
 
     /// Parse the BPB from `partition_lba` and store FAT32 volume metadata.
+    #[allow(dead_code)]
     fn fat32_mount(&mut self, slot: u8, partition_lba: u32) -> Result<(), PCIeDeviceErr> {
         let mut bpb = DMAPool::<[u8; 512]>::new(0, 1).ok_or(PCIeDeviceErr::InitFailure)?;
-        for b in bpb.as_mut().iter_mut() { *b = 0; }
+        for b in bpb.as_mut().iter_mut() {
+            *b = 0;
+        }
         let phys = bpb.get_phy_addr().as_usize() as u64;
         self.msc_read10(slot, partition_lba, 1, phys)?;
 
@@ -2240,8 +2595,12 @@ impl XhciDevice {
         };
         log::info!(
             "xHCI: {}: FAT32 bps={} spc={} fat_sz={} root_clus={} data_sec={}",
-            self.name, fs.bytes_per_sec, fs.sec_per_clus,
-            fs.fat_sz, fs.root_clus, fs.first_data_sec,
+            self.name,
+            fs.bytes_per_sec,
+            fs.sec_per_clus,
+            fs.fat_sz,
+            fs.root_clus,
+            fs.first_data_sec,
         );
         self.fat32 = Some(fs);
         Ok(())
@@ -2255,20 +2614,30 @@ impl XhciDevice {
             fs.fat_entry_pos(cluster)
         };
         let mut sec = DMAPool::<[u8; 512]>::new(0, 1).ok_or(PCIeDeviceErr::InitFailure)?;
-        for b in sec.as_mut().iter_mut() { *b = 0; }
+        for b in sec.as_mut().iter_mut() {
+            *b = 0;
+        }
         let phys = sec.get_phy_addr().as_usize() as u64;
         self.msc_read10(slot, fat_lba, 1, phys)?;
         let raw = {
             let s = sec.as_mut();
-            u32::from_le_bytes([s[byte_off], s[byte_off+1], s[byte_off+2], s[byte_off+3]])
+            u32::from_le_bytes([
+                s[byte_off],
+                s[byte_off + 1],
+                s[byte_off + 2],
+                s[byte_off + 3],
+            ])
         };
         Ok(raw & 0x0FFF_FFFF)
     }
 
     /// Scan the root directory cluster chain for a file named `filename`.
     /// Returns `Some((first_cluster, file_size))` on match, `None` if not found.
+    #[allow(dead_code)]
     fn fat32_find_root_file(
-        &mut self, slot: u8, filename: &str,
+        &mut self,
+        slot: u8,
+        filename: &str,
     ) -> Result<Option<(u32, u32)>, PCIeDeviceErr> {
         let (mut cluster, sec_per_clus) = {
             let fs = self.fat32.as_ref().ok_or(PCIeDeviceErr::InitFailure)?;
@@ -2285,7 +2654,9 @@ impl XhciDevice {
                 fs.cluster_to_lba(cluster)
             };
             for s in 0..sec_per_clus as u32 {
-                for b in sec.as_mut().iter_mut() { *b = 0; }
+                for b in sec.as_mut().iter_mut() {
+                    *b = 0;
+                }
                 let phys = sec.get_phy_addr().as_usize() as u64;
                 self.msc_read10(slot, base_lba + s, 1, phys)?;
 
@@ -2299,24 +2670,33 @@ impl XhciDevice {
                         a
                     };
 
-                    if entry[0] == 0x00 { return Ok(None); } // end of directory
-                    if entry[0] == 0xE5 { lfn_valid = false; continue; } // deleted
+                    if entry[0] == 0x00 {
+                        return Ok(None);
+                    } // end of directory
+                    if entry[0] == 0xE5 {
+                        lfn_valid = false;
+                        continue;
+                    } // deleted
 
                     let attr = entry[11];
                     if attr == fat32::ATTR_LFN {
                         let order = entry[0];
                         if order & 0x40 != 0 {
                             // First-encountered LFN entry (highest seq, end of name).
-                            for x in lfn_buf.iter_mut() { *x = 0; }
+                            for x in lfn_buf.iter_mut() {
+                                *x = 0;
+                            }
                             lfn_valid = true;
                         }
                         if lfn_valid {
                             let seq = (order & 0x1F) as usize;
-                            if seq >= 1 && seq <= 20 {
+                            if (1..=20).contains(&seq) {
                                 let chars = fat32::lfn_chars(&entry);
                                 let base = (seq - 1) * 13;
                                 for (i, &c) in chars.iter().enumerate() {
-                                    if base + i < 260 { lfn_buf[base + i] = c; }
+                                    if base + i < 260 {
+                                        lfn_buf[base + i] = c;
+                                    }
                                 }
                             }
                         }
@@ -2342,7 +2722,9 @@ impl XhciDevice {
             }
 
             let next = self.fat32_next_cluster(slot, cluster)?;
-            if next >= fat32::EOC { break 'chain; }
+            if next >= fat32::EOC {
+                break 'chain;
+            }
             cluster = next;
         }
         Ok(None)
@@ -2351,7 +2733,11 @@ impl XhciDevice {
     /// Read `file_size` bytes of file data starting at `first_cluster` into
     /// the caller-provided DMA buffer at physical address `dest_phys`.
     pub fn fat32_read_file(
-        &mut self, slot: u8, first_cluster: u32, file_size: u32, dest_phys: u64,
+        &mut self,
+        slot: u8,
+        first_cluster: u32,
+        file_size: u32,
+        dest_phys: u64,
     ) -> Result<(), PCIeDeviceErr> {
         let sec_per_clus = {
             let fs = self.fat32.as_ref().ok_or(PCIeDeviceErr::InitFailure)?;
@@ -2368,7 +2754,7 @@ impl XhciDevice {
                 fs.cluster_to_lba(cluster)
             };
             let read_bytes = clus_bytes.min(remaining);
-            let read_secs = ((read_bytes + 511) / 512) as u16;
+            let read_secs = read_bytes.div_ceil(512) as u16;
             self.msc_read10(slot, clus_lba, read_secs, dest_phys + dest_off)?;
 
             remaining = remaining.saturating_sub(clus_bytes);
@@ -2376,7 +2762,9 @@ impl XhciDevice {
 
             if remaining > 0 {
                 let next = self.fat32_next_cluster(slot, cluster)?;
-                if next >= fat32::EOC { break; }
+                if next >= fat32::EOC {
+                    break;
+                }
                 cluster = next;
             }
         }
@@ -2385,19 +2773,30 @@ impl XhciDevice {
 
     /// Mount the FAT32 partition at `partition_lba` and search the root directory
     /// for common kernel file names, logging what is found.
+    #[allow(dead_code)]
     fn try_mount_fat32(&mut self, slot: u8, partition_lba: u32) {
         if let Err(e) = self.fat32_mount(slot, partition_lba) {
             log::error!("xHCI: {}: FAT32 mount failed: {:?}", self.name, e);
             return;
         }
-        let candidates = ["kernel.elf", "KERNEL.ELF", "vmlinux", "VMLINUX",
-                          "boot.elf",   "BOOT.ELF"];
+        let candidates = [
+            "kernel.elf",
+            "KERNEL.ELF",
+            "vmlinux",
+            "VMLINUX",
+            "boot.elf",
+            "BOOT.ELF",
+        ];
         for &name in &candidates {
             match self.fat32_find_root_file(slot, name) {
                 Ok(Some((cluster, size))) => {
                     log::info!(
                         "xHCI: {}: '{}' found: first_cluster={} size={}B ({}KiB)",
-                        self.name, name, cluster, size, size / 1024,
+                        self.name,
+                        name,
+                        cluster,
+                        size,
+                        size / 1024,
                     );
                 }
                 Ok(None) => {}
@@ -2415,6 +2814,7 @@ impl XhciDevice {
     /// Attempt to detect and configure a CDC-ACM USB serial adapter.
     /// Silently returns `Ok(())` when no CDC-ACM interface is present in the
     /// configuration descriptor.
+    #[allow(dead_code)]
     fn try_setup_cdcacm(&mut self, slot: u8) -> Result<(), PCIeDeviceErr> {
         let (cfg, cfg_len) = self.get_config_descriptor(slot)?;
 
@@ -2423,7 +2823,8 @@ impl XhciDevice {
             None => {
                 log::info!(
                     "xHCI: {}: slot {} — no CDC-ACM endpoints in config descriptor",
-                    self.name, slot,
+                    self.name,
+                    slot,
                 );
                 return Ok(());
             }
@@ -2432,31 +2833,37 @@ impl XhciDevice {
         log::info!(
             "xHCI: {}: slot {} — CDC-ACM cfg={} ctrl_if={} \
              IN={:#04x} OUT={:#04x} max_pkt={}",
-            self.name, slot, info.config_val, info.ctrl_if_num,
-            info.bulk_in_addr, info.bulk_out_addr, info.max_pkt,
+            self.name,
+            slot,
+            info.config_val,
+            info.ctrl_if_num,
+            info.bulk_in_addr,
+            info.bulk_out_addr,
+            info.max_pkt,
         );
 
         self.set_configuration(slot, info.config_val)?;
-        self.configure_bulk_endpoints(
-            slot, info.bulk_in_addr, info.bulk_out_addr, info.max_pkt,
-        )?;
+        self.configure_bulk_endpoints(slot, info.bulk_in_addr, info.bulk_out_addr, info.max_pkt)?;
 
         // Phase 7: line coding and control line state.
         self.cdcacm_set_line_coding(slot, info.ctrl_if_num, 115_200, 0, 0, 8)?;
         self.cdcacm_set_control_line_state(slot, info.ctrl_if_num, true, true)?;
 
-        self.is_cdcacm    = true;
+        self.is_cdcacm = true;
         self.cdcacm_ctrl_if = info.ctrl_if_num;
         self.cdcacm_max_pkt = info.max_pkt;
 
         // Phase 8: pre-allocate the DMA TX buffer used by cdcacm_write().
         let mut tx = DMAPool::<[u8; 512]>::new(0, 1).ok_or(PCIeDeviceErr::InitFailure)?;
-        for b in tx.as_mut().iter_mut() { *b = 0; }
+        for b in tx.as_mut().iter_mut() {
+            *b = 0;
+        }
         self.cdcacm_tx_dma = Some(tx);
 
         log::info!(
             "xHCI: {}: slot {} — CDC-ACM ready (115200 8N1 DTR+RTS)",
-            self.name, slot,
+            self.name,
+            slot,
         );
         Ok(())
     }
@@ -2475,13 +2882,15 @@ fn ctx_write32(ctx: &mut [u8], off: usize, val: u32) {
 // MSC bulk endpoint discovery: walk config descriptor for class 0x08 + Bulk EPs.
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 struct BulkInfo {
-    in_addr: u8,     // USB endpoint address (bit7=1)
-    out_addr: u8,    // USB endpoint address (bit7=0)
+    in_addr: u8,  // USB endpoint address (bit7=1)
+    out_addr: u8, // USB endpoint address (bit7=0)
     max_pkt: u16,
     config_val: u8,
 }
 
+#[allow(dead_code)]
 fn find_msc_bulk_endpoints(desc: &[u8], len: usize) -> Option<BulkInfo> {
     let config_val = if len >= 6 { desc[5] } else { 1 };
     let mut i = 0;
@@ -2492,7 +2901,9 @@ fn find_msc_bulk_endpoints(desc: &[u8], len: usize) -> Option<BulkInfo> {
 
     while i < len {
         let blen = desc[i] as usize;
-        if blen < 2 || i + blen > len { break; }
+        if blen < 2 || i + blen > len {
+            break;
+        }
         let btype = desc[i + 1];
 
         match btype {
@@ -2511,8 +2922,11 @@ fn find_msc_bulk_endpoints(desc: &[u8], len: usize) -> Option<BulkInfo> {
                 let pkt = u16::from_le_bytes([desc[i + 4], desc[i + 5]]);
                 if attrs & 0x3 == 2 {
                     max_pkt = pkt;
-                    if addr & 0x80 != 0 { in_ep = Some(addr); }
-                    else { out_ep = Some(addr); }
+                    if addr & 0x80 != 0 {
+                        in_ep = Some(addr);
+                    } else {
+                        out_ep = Some(addr);
+                    }
                 }
             }
             _ => {}
@@ -2521,7 +2935,12 @@ fn find_msc_bulk_endpoints(desc: &[u8], len: usize) -> Option<BulkInfo> {
     }
 
     match (in_ep, out_ep) {
-        (Some(ia), Some(oa)) => Some(BulkInfo { in_addr: ia, out_addr: oa, max_pkt, config_val }),
+        (Some(ia), Some(oa)) => Some(BulkInfo {
+            in_addr: ia,
+            out_addr: oa,
+            max_pkt,
+            config_val,
+        }),
         _ => None,
     }
 }

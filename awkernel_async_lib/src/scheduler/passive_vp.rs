@@ -36,7 +36,7 @@
 
 use super::{
     get_priority, peek_preemption_pending, push_preemption_pending, ClusteredTask, Scheduler,
-    SchedulerType, Task, GLOBAL_WAKE_GET_MUTEX,
+    SchedulerType, Task, GLOBAL_WAKE_GET_MUTEX, PREEMPTION_ENABLED,
 };
 use crate::{
     dag::calculate_and_update_dag_deadline,
@@ -83,8 +83,12 @@ pub(crate) fn active_vp_is_busy(cpu_id: usize) -> bool {
 /// Same key/ordering as `ClusteredEDF`/`ActiveVp` (see those modules):
 /// reused verbatim rather than redesigned, since nothing about the
 /// passive-VP role changes what a reasonable dispatch order looks like.
-type PassiveVpQueue =
-    AffinityBTreeQueue<(u64, u64, u64), ClusteredTask<Arc<Task>>, DEFAULT_MIN_DEGREE, CPU_SET_WORDS>;
+type PassiveVpQueue = AffinityBTreeQueue<
+    (u64, u64, u64),
+    ClusteredTask<Arc<Task>>,
+    DEFAULT_MIN_DEGREE,
+    CPU_SET_WORDS,
+>;
 
 pub struct PassiveVpScheduler {
     data: Mutex<Option<PassiveVpQueue>>,
@@ -202,6 +206,10 @@ impl PassiveVpScheduler {
     /// verbatim: the packed `PriorityInfo` comparison already prevents this
     /// from ever displacing an active-VP owner).
     fn invoke_preemption(&self, task: Arc<Task>) -> bool {
+        if !PREEMPTION_ENABLED {
+            return false;
+        }
+
         let cpu_set = task.cpu_set.expect("Task has no CPU set");
 
         let mut victim: Option<(usize, Arc<Task>)> = None;

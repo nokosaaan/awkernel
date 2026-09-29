@@ -10,7 +10,7 @@ use crate::{
     dag::calculate_and_update_dag_deadline,
     scheduler::{
         get_priority, peek_preemption_pending, push_preemption_pending, ClusteredTask,
-        GLOBAL_WAKE_GET_MUTEX,
+        GLOBAL_WAKE_GET_MUTEX, PREEMPTION_ENABLED,
     },
     task::{
         get_task, get_task_running, set_current_task, set_need_preemption, State, MAX_TASK_PRIORITY,
@@ -35,8 +35,12 @@ use awkernel_lib::{
 /// larger-is-more-urgent value into a smaller-sorts-first one.
 ///
 /// [`get_node_priority`]: crate::dag::get_node_priority
-type EDFQueue =
-    AffinityBTreeQueue<(u64, u64, u64), ClusteredTask<Arc<Task>>, DEFAULT_MIN_DEGREE, CPU_SET_WORDS>;
+type EDFQueue = AffinityBTreeQueue<
+    (u64, u64, u64),
+    ClusteredTask<Arc<Task>>,
+    DEFAULT_MIN_DEGREE,
+    CPU_SET_WORDS,
+>;
 
 pub struct ClusteredEDFScheduler {
     // `AffinityBTreeQueue::new` is not a const fn, so the queue is lazily

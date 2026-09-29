@@ -13,10 +13,11 @@
 //! - `events()` must only be called after `stop()`; a record racing past the
 //!   enabled-check may at worst leave one torn event at the tail.
 
+use crate::atomic_u64::AtomicU64;
 use alloc::vec::Vec;
 use array_macro::array;
 use awkernel_lib::cpu::NUM_MAX_CPU;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Maximum number of events recorded per CPU.
 /// 32768 events x 16 bytes = 512 KiB per CPU, allocated on `start()`.

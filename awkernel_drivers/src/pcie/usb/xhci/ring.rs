@@ -1,6 +1,6 @@
 use awkernel_lib::{addr::Addr, dma_pool::DMAPool};
 
-use super::regs::{TRB_CYCLE, TRB_LINK_TC, TRB_TYPE_SHIFT, trb_type};
+use super::regs::{trb_type, TRB_CYCLE, TRB_LINK_TC, TRB_TYPE_SHIFT};
 
 /// Number of TRBs in the Command Ring. The last entry is the Link TRB.
 /// 256 × 16 bytes = 4096 bytes = 1 page, so DMAPool<CmdRingMem>::new(n, 1) works.
@@ -253,7 +253,11 @@ pub struct TransferRing {
 impl TransferRing {
     pub fn new(numa_id: usize) -> Option<Self> {
         let mem = DMAPool::<XferRingMem>::new(numa_id, 1)?;
-        Some(Self { mem, enqueue_idx: 0, cycle_bit: 1 })
+        Some(Self {
+            mem,
+            enqueue_idx: 0,
+            cycle_bit: 1,
+        })
     }
 
     /// Zero all TRBs and install the Link TRB at the last slot.

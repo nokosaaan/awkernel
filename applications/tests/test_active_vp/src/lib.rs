@@ -21,8 +21,8 @@
 extern crate alloc;
 
 use awkernel_async_lib::{
-    dag_sched::policy::vfed::{self, PackingStrategy, VFedAssignment},
     dag_sched::metrics::DagMetrics,
+    dag_sched::policy::vfed::{self, PackingStrategy, VFedAssignment},
     scheduler::SchedulerType,
     spawn,
 };
@@ -158,7 +158,8 @@ async fn test_mixed_vp_group() {
     log::info!(
         "test_active_vp: mixed: donor admitted as pure ActiveVp, leading={donor_leading_cpu} non_leading={donor_non_leading_cpu} [OK]"
     );
-    let Some(donor_sched_type) = donor_assignment.into_scheduler_type(donor_config.relative_deadline)
+    let Some(donor_sched_type) =
+        donor_assignment.into_scheduler_type(donor_config.relative_deadline)
     else {
         log::error!("test_active_vp: mixed: donor into_scheduler_type returned None [FAIL]");
         return;

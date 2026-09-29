@@ -1,7 +1,7 @@
 use awkernel_lib::delay::uptime;
-use core::hint::black_box;
-use core::sync::atomic::{AtomicU64, Ordering};
 use awkernel_lib::delay::wait_millisec;
+use core::hint::black_box;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
 
 #[cfg(feature = "seconds")]
@@ -58,11 +58,14 @@ pub(super) fn convert_duration(duration: u64) -> Duration {
 // DAG task body under Federated admission) needs.
 // ---------------------------------------------------------------------------
 
-static ITERS_PER_MS: AtomicU64 = AtomicU64::new(0);
+// Kept for switching back from `wait_millisec` in `simulated_execution_time`.
+#[allow(dead_code)]
+static ITERS_PER_MS: AtomicUsize = AtomicUsize::new(0);
 
 /// One unit of genuine compute (integer multiply-add, `black_box`-wrapped so
 /// the compiler can't prove it's dead and elide the loop). Deliberately not
 /// `core::hint::spin_loop()` -- see this module's own doc comment above.
+#[allow(dead_code)]
 #[inline(always)]
 fn busy_iteration(acc: u64) -> u64 {
     black_box(acc.wrapping_mul(2_654_435_761).wrapping_add(1))
@@ -77,6 +80,7 @@ fn busy_iteration(acc: u64) -> u64 {
 /// from inside a DAG task body instead would risk calibrating *during*
 /// contention on whichever CPU happens to run first, corrupting the
 /// baseline for every other CPU (this static is shared, not per-CPU).
+#[allow(dead_code)]
 pub fn calibrate_busy_work() {
     const CALIBRATION_MS: u64 = 5;
     const SAMPLE_EVERY: u64 = 4096;
@@ -87,7 +91,8 @@ pub fn calibrate_busy_work() {
     loop {
         acc = busy_iteration(acc);
         iters += 1;
-        if iters.is_multiple_of(SAMPLE_EVERY) && uptime().saturating_sub(start) >= CALIBRATION_MS * 1000
+        if iters.is_multiple_of(SAMPLE_EVERY)
+            && uptime().saturating_sub(start) >= CALIBRATION_MS * 1000
         {
             break;
         }
@@ -95,12 +100,13 @@ pub fn calibrate_busy_work() {
     black_box(acc);
 
     let per_ms = (iters / CALIBRATION_MS).max(1);
-    ITERS_PER_MS.store(per_ms, Ordering::Relaxed);
+    ITERS_PER_MS.store(per_ms as usize, Ordering::Relaxed);
     log::info!("rd_gen_to_dags: calibrated busy-work at {per_ms} iterations/ms");
 }
 
+#[allow(dead_code)]
 fn busy_work_for_millisec(ms: u64) {
-    let per_ms = ITERS_PER_MS.load(Ordering::Relaxed);
+    let per_ms = ITERS_PER_MS.load(Ordering::Relaxed) as u64;
     // Uncalibrated (caller forgot `calibrate_busy_work()`): fall back to the
     // old time-bound wait rather than doing zero work silently.
     if per_ms == 0 {

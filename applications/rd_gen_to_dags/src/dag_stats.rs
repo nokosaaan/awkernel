@@ -78,8 +78,8 @@ pub(crate) fn compute_dag_stats(dag_data: &DagData) -> DagAggregateStats {
 
 /// Reverse (sink-to-source) topological DP computing every node's *laxity*
 /// for the "static Laxity-Based" scheduling baseline: `laxity(sink) = D -
-/// execution_time(sink)`; `laxity(v) = min(laxity(u) for u in out_links(v))
-/// - execution_time(v)` for every other node. Mirrors [`compute_dag_stats`]
+/// execution_time(sink)`; `laxity(v) = min(laxity(u) for u in out_links(v)) -
+/// execution_time(v)` for every other node. Mirrors [`compute_dag_stats`]
 /// exactly (same topological-DP shape, `in_links`/`out_links` and `min`/`max`
 /// swapped) -- deliberately omits communication delay between nodes, the
 /// same "don't model communication cost" convention `compute_dag_stats`'s
@@ -101,6 +101,7 @@ pub(crate) fn compute_dag_stats(dag_data: &DagData) -> DagAggregateStats {
 /// specific to this baseline); mirrors
 /// [`awkernel_async_lib::dag_sched::metrics::DagMetrics::min_dedicated_cores`]'s
 /// own `None` case for the same condition.
+#[cfg_attr(not(feature = "laxity"), allow(dead_code))]
 pub(crate) fn compute_node_laxity(
     dag_data: &DagData,
     relative_deadline: u64,

@@ -393,7 +393,13 @@ enum PassiveTest {
 }
 
 impl PassiveTest {
-    fn holds(self, volume: u64, critical_path: u64, deadline: u64, passives: &[&PassiveVp]) -> bool {
+    fn holds(
+        self,
+        volume: u64,
+        critical_path: u64,
+        deadline: u64,
+        passives: &[&PassiveVp],
+    ) -> bool {
         let base = match self {
             PassiveTest::Theorem2 => critical_path,
             PassiveTest::Theorem4 { active_budget_sum } => active_budget_sum,
@@ -465,14 +471,14 @@ pub fn plan_heavy(
         );
     }
 
-    let active_budgets =
-        partial_active_vp_budgets(config.critical_path, config.relative_deadline, cores_available);
+    let active_budgets = partial_active_vp_budgets(
+        config.critical_path,
+        config.relative_deadline,
+        cores_available,
+    );
     let active_budget_sum: u64 = active_budgets.iter().sum();
-    let passive_indices = pull_passives_until_schedulable(
-        config,
-        PassiveTest::Theorem4 { active_budget_sum },
-        pool,
-    )?;
+    let passive_indices =
+        pull_passives_until_schedulable(config, PassiveTest::Theorem4 { active_budget_sum }, pool)?;
 
     Ok(HeavyPlan {
         cores_used: cores_available,
@@ -491,15 +497,19 @@ fn pull_passives_until_schedulable(
     test: PassiveTest,
     pool: &[PassiveVp],
 ) -> Result<Vec<usize>, VFedError> {
-    let (volume, critical_path, deadline) =
-        (config.volume, config.critical_path, config.relative_deadline);
+    let (volume, critical_path, deadline) = (
+        config.volume,
+        config.critical_path,
+        config.relative_deadline,
+    );
     let mut used = Vec::new();
     let mut used_mask = alloc::vec![false; pool.len()];
 
     loop {
-        let chosen = pool.iter().enumerate().find(|(i, vp)| {
-            !used_mask[*i] && passive_vp_is_useful(vp, critical_path, deadline)
-        });
+        let chosen = pool
+            .iter()
+            .enumerate()
+            .find(|(i, vp)| !used_mask[*i] && passive_vp_is_useful(vp, critical_path, deadline));
         let Some((idx, _)) = chosen else {
             return Err(VFedError::NoFeasibleAllocation);
         };
@@ -535,7 +545,10 @@ pub fn plan_light(config: &DagMetrics, pool: &[PassiveVp]) -> Result<Vec<usize>,
 /// before the search at line 15 runs, so its indices refer to that
 /// extended `V`. (For the other two kinds of plan one of the two steps is
 /// empty, so the same replay order is correct for them too.)
-fn try_alloc_heavy_within(heavy_sorted: &[DagMetrics], mh: u16) -> Option<(Vec<HeavyPlan>, Vec<PassiveVp>)> {
+fn try_alloc_heavy_within(
+    heavy_sorted: &[DagMetrics],
+    mh: u16,
+) -> Option<(Vec<HeavyPlan>, Vec<PassiveVp>)> {
     let mut processors_left = mh; // |P|
     let mut next_slot: usize = 0;
     let mut pool: Vec<PassiveVp> = Vec::new(); // V
@@ -782,7 +795,10 @@ impl VFedAssignment {
 /// to heavy tasks, but each call commits independently — unlike
 /// [`admit_batch`], one task failing to place here does not undo earlier
 /// ones, and this never searches for a better `M_h`.
-pub fn admit_one(config: DagMetrics, packing: PackingStrategy) -> Result<VFedAssignment, VFedError> {
+pub fn admit_one(
+    config: DagMetrics,
+    packing: PackingStrategy,
+) -> Result<VFedAssignment, VFedError> {
     match classify(&config)? {
         TaskClass::Heavy { .. } => admit_heavy(config),
         TaskClass::Light => admit_light(config, packing),
@@ -1103,7 +1119,10 @@ pub fn admit_batch(
         match outcome {
             LightOutcome::Passive(indices) => {
                 let consumed = take_indices(&mut real_pool, &indices);
-                results.push((*orig_idx, VFedAssignment::LightPassive { passive: consumed }));
+                results.push((
+                    *orig_idx,
+                    VFedAssignment::LightPassive { passive: consumed },
+                ));
             }
             LightOutcome::Partitioned(idx) => {
                 while real_partition_cpus.len() <= idx {
@@ -1139,7 +1158,12 @@ pub fn admit_batch(
                 .iter()
                 .map(|t| resource::utilization_scaled(t.volume, t.deadline))
                 .sum();
-            global_partitions.push((cpu, Partition { committed_density_scaled }));
+            global_partitions.push((
+                cpu,
+                Partition {
+                    committed_density_scaled,
+                },
+            ));
         }
     }
 
@@ -1414,9 +1438,13 @@ mod tests {
         assert_eq!(plan1.cores_used, 5);
         assert_eq!(plan1.active_budgets, alloc::vec![8, 1, 1, 1, 1]);
         assert!(plan1.passive_indices.is_empty());
-        pool.extend(plan1.active_budgets.iter().enumerate().map(|(i, &b)| {
-            vp(i + 1, b, tau1.period, tau1.relative_deadline)
-        })); // p1..p5
+        pool.extend(
+            plan1
+                .active_budgets
+                .iter()
+                .enumerate()
+                .map(|(i, &b)| vp(i + 1, b, tau1.period, tau1.relative_deadline)),
+        ); // p1..p5
 
         // tau2: D2-L2=4, only 1 core (p6) remains of the 6-core heavy
         // budget; leading-only budget of 8 falls short of C2=10, topped up
@@ -1468,11 +1496,11 @@ mod tests {
         assert_eq!(plans[0].cores_used, 5); // tau1
         assert_eq!(plans[1].cores_used, 1); // tau2
         assert_eq!(plans[2].cores_used, 0); // tau3
-        // tau3 consumed 2 of the passive-VPs generated along the way (p3,
-        // p4 in the paper's own labeling); 5+1 active slots minus 2
-        // consumed by tau2/tau3 plus... simplest direct check: the leftover
-        // pool has 3 entries left over for light tasks, as the paper's
-        // walkthrough shows (p1, p5, p6).
+                                            // tau3 consumed 2 of the passive-VPs generated along the way (p3,
+                                            // p4 in the paper's own labeling); 5+1 active slots minus 2
+                                            // consumed by tau2/tau3 plus... simplest direct check: the leftover
+                                            // pool has 3 entries left over for light tasks, as the paper's
+                                            // walkthrough shows (p1, p5, p6).
         assert_eq!(pool.len(), 3);
     }
 
@@ -1653,7 +1681,10 @@ mod tests {
         };
         let (c, l, d) = (8, 4, 10);
         assert!(PassiveTest::Theorem2.holds(c, l, d, &[&free]));
-        assert!(!PassiveTest::Theorem4 { active_budget_sum: 0 }.holds(c, l, d, &[&free]));
+        assert!(!PassiveTest::Theorem4 {
+            active_budget_sum: 0
+        }
+        .holds(c, l, d, &[&free]));
     }
 
     /// The paper's Sec. 6.2 walkthrough for tau3 (C=10, L=2, D=9) after the
@@ -1683,6 +1714,10 @@ mod tests {
         let tau1 = DagMetrics::from_static(12, 7, 10, 8);
         let tau2 = DagMetrics::from_static(10, 4, 10, 8);
         let tau3 = DagMetrics::from_static(10, 2, 9, 9);
-        assert!(!is_batch_feasible(&[tau1, tau2, tau3], 5, PackingStrategy::FirstFit));
+        assert!(!is_batch_feasible(
+            &[tau1, tau2, tau3],
+            5,
+            PackingStrategy::FirstFit
+        ));
     }
 }

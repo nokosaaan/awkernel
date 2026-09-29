@@ -10,7 +10,11 @@
 //! (`u_norm,dag,volume,critical_path,period,relative_deadline,utilization,class,required_cores`)
 //! to stdout.
 
-use std::{env, fs, path::{Path, PathBuf}, process::ExitCode};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
 
 use awkernel_async_lib::dag_sched::{
     metrics::DagMetrics,
@@ -39,7 +43,9 @@ fn main() -> ExitCode {
         }
     };
 
-    println!("u_norm,dag,volume,critical_path,period,relative_deadline,utilization,class,required_cores");
+    println!(
+        "u_norm,dag,volume,critical_path,period,relative_deadline,utilization,class,required_cores"
+    );
     for (u_norm, bin_dir) in bins {
         let dags_dir = bin_dir.join("DAGs");
         let entries = match load_dags(&dags_dir) {
@@ -53,7 +59,11 @@ fn main() -> ExitCode {
             let utilization = config.volume as f64 / config.period as f64;
             let (class, required_cores) = match federated::classify_dag(&config) {
                 Ok(FedTaskClass::Heavy { required_cores }) => {
-                    let over = if required_cores > real_cores { "_over" } else { "" };
+                    let over = if required_cores > real_cores {
+                        "_over"
+                    } else {
+                        ""
+                    };
                     (format!("heavy{over}"), required_cores.to_string())
                 }
                 Ok(FedTaskClass::Light) => ("light".to_string(), String::new()),

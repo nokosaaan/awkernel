@@ -1,8 +1,8 @@
+use crate::config::SERIAL_PORT_BASE as BASE;
 use alloc::boxed::Box;
 use awkernel_drivers::uart::uart_16550;
 use awkernel_lib::console::Console;
 use core::fmt::Write;
-use crate::config::SERIAL_PORT_BASE as BASE;
 
 pub struct Uart {
     port: uart_16550::SerialPort,

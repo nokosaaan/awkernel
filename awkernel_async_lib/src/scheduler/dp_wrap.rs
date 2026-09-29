@@ -47,8 +47,8 @@
 //! analogous precondition).
 
 use super::{
-    get_priority, peek_preemption_pending, push_preemption_pending, Scheduler, SchedulerType,
-    Task, GLOBAL_WAKE_GET_MUTEX,
+    get_priority, peek_preemption_pending, push_preemption_pending, Scheduler, SchedulerType, Task,
+    GLOBAL_WAKE_GET_MUTEX, PREEMPTION_ENABLED,
 };
 use crate::{
     dag::calculate_and_update_dag_deadline,
@@ -314,6 +314,10 @@ impl DpWrapScheduler {
     /// every running CPU -- a `DpWrap` task must never preempt a CPU that
     /// some *other* DAG currently owns the entitlement for.
     fn invoke_preemption(&self, task: Arc<Task>, dag_id: u32) -> bool {
+        if !PREEMPTION_ENABLED {
+            return false;
+        }
+
         let tasks_running = get_tasks_running()
             .into_iter()
             .filter(|rt| rt.task_id != 0) // Filter out idle CPUs.
@@ -325,9 +329,8 @@ impl DpWrapScheduler {
 
         // An idle CPU currently entitled to `dag_id` will pick this task up
         // on its own next `get_next` poll; no forced preemption needed.
-        let entitled_idle_cpu_exists = (1..awkernel_lib::cpu::num_cpu()).any(|cpu| {
-            entitlement_of(cpu) == Some(dag_id) && get_task_running(cpu).task_id == 0
-        });
+        let entitled_idle_cpu_exists = (1..awkernel_lib::cpu::num_cpu())
+            .any(|cpu| entitlement_of(cpu) == Some(dag_id) && get_task_running(cpu).task_id == 0);
         if entitled_idle_cpu_exists {
             return false;
         }
@@ -335,7 +338,8 @@ impl DpWrapScheduler {
         let preemption_target = tasks_running
             .iter()
             .filter(|rt| {
-                !crate::task::is_cpu_reserved(rt.cpu_id) && entitlement_of(rt.cpu_id) == Some(dag_id)
+                !crate::task::is_cpu_reserved(rt.cpu_id)
+                    && entitlement_of(rt.cpu_id) == Some(dag_id)
             })
             .filter_map(|rt| {
                 get_task(rt.task_id).map(|t| {
@@ -424,8 +428,9 @@ pub fn recompute_and_apply(active: &[(u32, u32, f64)], dp_start: Time, dp_end: O
         }
     }
 
-    let pool: alloc::vec::Vec<usize> =
-        crate::dag_sched::resource::dagfluid_pool_cpu_set().iter().collect();
+    let pool: alloc::vec::Vec<usize> = crate::dag_sched::resource::dagfluid_pool_cpu_set()
+        .iter()
+        .collect();
     if pool.is_empty() {
         return;
     }
@@ -446,7 +451,9 @@ pub fn recompute_and_apply(active: &[(u32, u32, f64)], dp_start: Time, dp_end: O
             // own contract) shares, same as before intra-DP migration
             // existed.
             let winner = blocks.iter().max_by(|a, b| {
-                (a.2 - a.1).partial_cmp(&(b.2 - b.1)).unwrap_or(core::cmp::Ordering::Equal)
+                (a.2 - a.1)
+                    .partial_cmp(&(b.2 - b.1))
+                    .unwrap_or(core::cmp::Ordering::Equal)
             });
             let new_dag = winner.map(|&(slot_idx, _, _)| slot_table[slot_idx]);
             if let Some(slot) = SWITCH_PLAN.get(cpu_id) {
@@ -570,6 +577,13 @@ fn apply_entitlement(cpu_id: usize, new_dag: Option<u32>) {
         // Idle: nudge it to re-poll `get_next_task` now, rather than wait
         // for `task::wake_workers`'s own next pass.
         awkernel_lib::cpu::wake_cpu(cpu_id);
+        return;
+    }
+
+    // Without preemption the successor popped below would be stranded in
+    // the pending queue; the running task keeps the CPU and the entitled
+    // DAG's node is picked up by `get_next` once it yields.
+    if !PREEMPTION_ENABLED {
         return;
     }
 

@@ -52,7 +52,7 @@ use awkernel_async_lib::dag_sched::{
         vfed::{self, PackingStrategy},
     },
 };
-use rand::{seq::IndexedRandom, Rng};
+use rand::{Rng, seq::IndexedRandom};
 use rd_gen_to_dags::dag_fluid::{self, Segment};
 
 const DAGS_PER_SET: usize = 8;
@@ -69,7 +69,10 @@ fn main() -> ExitCode {
     let fixed_cores: Option<u16> = match args.iter().position(|a| a == "--cores") {
         None => None,
         Some(i) => {
-            let value = args.get(i + 1).and_then(|v| v.parse::<u16>().ok()).filter(|m| *m > 0);
+            let value = args
+                .get(i + 1)
+                .and_then(|v| v.parse::<u16>().ok())
+                .filter(|m| *m > 0);
             let Some(m) = value else {
                 eprintln!("--cores needs a positive integer");
                 return ExitCode::from(2);
@@ -126,8 +129,11 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mean_parallelism =
-        pool.iter().map(|s| s.volume as f64 / s.critical_path as f64).sum::<f64>() / pool.len() as f64;
+    let mean_parallelism = pool
+        .iter()
+        .map(|s| s.volume as f64 / s.critical_path as f64)
+        .sum::<f64>()
+        / pool.len() as f64;
     let m_desc = match fixed_cores {
         Some(m) => format!("fixed m={m}"),
         None => format!("per-trial m, alpha={alpha}"),
@@ -142,16 +148,20 @@ fn main() -> ExitCode {
     let n_steps = ((hi - lo) / step + 1e-9).floor() as usize;
     for k in 0..=n_steps {
         let u_norm = ((lo + k as f64 * step) * 1e4).round() / 1e4;
-        let (mut li, mut date, mut ours1, mut ours2, mut fluid) = (0usize, 0usize, 0usize, 0usize, 0usize);
+        let (mut li, mut date, mut ours1, mut ours2, mut fluid) =
+            (0usize, 0usize, 0usize, 0usize, 0usize);
         let mut sfs_ok = 0usize;
         let mut redraws = 0usize;
         for _ in 0..trials {
             let (drawn, metrics, m) = match fixed_cores {
                 None => {
-                    let drawn: Vec<&Structure> = pool.choose_multiple(&mut rng, DAGS_PER_SET).collect();
+                    let drawn: Vec<&Structure> =
+                        pool.choose_multiple(&mut rng, DAGS_PER_SET).collect();
                     let metrics = per_trial_m_timing(&drawn, alpha, implicit, &mut rng);
-                    let u_sigma: f64 =
-                        metrics.iter().map(|c| c.volume as f64 / c.period as f64).sum();
+                    let u_sigma: f64 = metrics
+                        .iter()
+                        .map(|c| c.volume as f64 / c.period as f64)
+                        .sum();
                     (drawn, metrics, ((u_sigma / u_norm).ceil() as u16).max(1))
                 }
                 Some(m) => {
@@ -186,7 +196,8 @@ fn main() -> ExitCode {
                 })
                 .collect();
             if implicit {
-                li += federated::plan_batch(&tasks, m, FederatedVariant::LiImplicit).is_ok() as usize;
+                li +=
+                    federated::plan_batch(&tasks, m, FederatedVariant::LiImplicit).is_ok() as usize;
             }
             date += federated::plan_batch(&tasks, m, FederatedVariant::BaruahConstrained).is_ok()
                 as usize;
@@ -197,7 +208,11 @@ fn main() -> ExitCode {
                 .map(|c| match c.min_dedicated_cores() {
                     Some(mi) => {
                         let lo = mi.div_ceil(2);
-                        let max_parallelism = if lo >= mi { mi } else { rng.random_range(lo..=mi) };
+                        let max_parallelism = if lo >= mi {
+                            mi
+                        } else {
+                            rng.random_range(lo..=mi)
+                        };
                         DagMetrics {
                             max_parallelism,
                             ..*c
@@ -206,13 +221,20 @@ fn main() -> ExitCode {
                     None => *c,
                 })
                 .collect();
-            ours2 += vfed::is_batch_feasible(&with_parallelism, m, PackingStrategy::BestFit) as usize;
+            ours2 +=
+                vfed::is_batch_feasible(&with_parallelism, m, PackingStrategy::BestFit) as usize;
 
             let fluid_entries: Vec<(u64, u64, u64, u64, &[Segment])> = drawn
                 .iter()
                 .zip(metrics.iter())
                 .map(|(s, c)| {
-                    (c.volume, c.period, c.critical_path, c.relative_deadline, s.segments.as_slice())
+                    (
+                        c.volume,
+                        c.period,
+                        c.critical_path,
+                        c.relative_deadline,
+                        s.segments.as_slice(),
+                    )
                 })
                 .collect();
             fluid += dag_fluid::is_batch_feasible(&fluid_entries, m) as usize;
@@ -232,7 +254,11 @@ fn main() -> ExitCode {
             eprintln!("u_norm={u_norm}: {redraws} structure redraws (caps below target)");
         }
         let pct = |x: usize| 100.0 * x as f64 / trials as f64;
-        let li_col = if implicit { alloc_fmt(pct(li)) } else { String::from("-") };
+        let li_col = if implicit {
+            alloc_fmt(pct(li))
+        } else {
+            String::from("-")
+        };
         println!(
             "{u_norm:.4},{li_col},{:.2},{:.2},{:.2},{:.2},{:.2}",
             pct(date),
@@ -251,7 +277,12 @@ const MAX_REDRAWS: usize = 10_000;
 const MAX_UUNIFAST_TRIES: usize = 1_000;
 
 /// The V-Fed paper's timing: `D ~ U[L, L/α]`, `T = D` or `D/β`.
-fn per_trial_m_timing(drawn: &[&Structure], alpha: f64, implicit: bool, rng: &mut impl Rng) -> Vec<DagMetrics> {
+fn per_trial_m_timing(
+    drawn: &[&Structure],
+    alpha: f64,
+    implicit: bool,
+    rng: &mut impl Rng,
+) -> Vec<DagMetrics> {
     drawn
         .iter()
         .map(|s| {
@@ -298,7 +329,10 @@ fn fixed_m_timing(
             sum = next;
         }
         u.push(sum);
-        u.iter().zip(&caps).all(|(ui, cap)| *ui > 0.0 && ui <= cap).then_some(u)
+        u.iter()
+            .zip(&caps)
+            .all(|(ui, cap)| *ui > 0.0 && ui <= cap)
+            .then_some(u)
     })?;
     Some(
         drawn

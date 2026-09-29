@@ -99,9 +99,7 @@ impl Bin {
         }
         match condition {
             Condition::Demand => true,
-            Condition::DemandAndUtilization => {
-                task.utilization() <= 1.0 - self.utilization() + EPS
-            }
+            Condition::DemandAndUtilization => task.utilization() <= 1.0 - self.utilization() + EPS,
         }
     }
 }
