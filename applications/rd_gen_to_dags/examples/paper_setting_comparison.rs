@@ -34,7 +34,8 @@
 //! `constrained` mode),
 //! `date` = Baruah DATE 2015 (`FederatedVariant::BaruahConstrained`
 //! forced; valid for implicit deadlines too, as a special case), `ours1` /
-//! `ours2` = V-Fed, `fluid` = DAG-Fluid (Guan et al., TC 2022). The pool's
+//! `ours2` = V-Fed, `fluid` = DAG-Fluid (Guan et al., TC 2022), `sfs` =
+//! SFS-G (Lendve et al., JSA 2026; `policy::sfs`). The pool's
 //! mean parallelism `C/L` is printed to stderr, so pools generated with
 //! different generator parameters can be compared on that axis.
 //!
@@ -47,6 +48,7 @@ use awkernel_async_lib::dag_sched::{
     metrics::DagMetrics,
     policy::{
         federated::{self, DagGraph, FedTask, FederatedVariant},
+        sfs::{self, SfsTask},
         vfed::{self, PackingStrategy},
     },
 };
@@ -136,11 +138,12 @@ fn main() -> ExitCode {
     );
 
     let mut rng = rand::rng();
-    println!("u_norm,li,date,ours1,ours2,fluid");
+    println!("u_norm,li,date,ours1,ours2,fluid,sfs");
     let n_steps = ((hi - lo) / step + 1e-9).floor() as usize;
     for k in 0..=n_steps {
         let u_norm = ((lo + k as f64 * step) * 1e4).round() / 1e4;
         let (mut li, mut date, mut ours1, mut ours2, mut fluid) = (0usize, 0usize, 0usize, 0usize, 0usize);
+        let mut sfs_ok = 0usize;
         let mut redraws = 0usize;
         for _ in 0..trials {
             let (drawn, metrics, m) = match fixed_cores {
@@ -213,6 +216,17 @@ fn main() -> ExitCode {
                 })
                 .collect();
             fluid += dag_fluid::is_batch_feasible(&fluid_entries, m) as usize;
+
+            let sfs_tasks: Vec<SfsTask<'_>> = drawn
+                .iter()
+                .zip(metrics.iter())
+                .map(|(s, c)| SfsTask {
+                    graph: &s.graph,
+                    period: c.period,
+                    deadline: c.relative_deadline,
+                })
+                .collect();
+            sfs_ok += sfs::is_schedulable(&sfs_tasks, m) as usize;
         }
         if redraws > 0 {
             eprintln!("u_norm={u_norm}: {redraws} structure redraws (caps below target)");
@@ -220,11 +234,12 @@ fn main() -> ExitCode {
         let pct = |x: usize| 100.0 * x as f64 / trials as f64;
         let li_col = if implicit { alloc_fmt(pct(li)) } else { String::from("-") };
         println!(
-            "{u_norm:.4},{li_col},{:.2},{:.2},{:.2},{:.2}",
+            "{u_norm:.4},{li_col},{:.2},{:.2},{:.2},{:.2},{:.2}",
             pct(date),
             pct(ours1),
             pct(ours2),
-            pct(fluid)
+            pct(fluid),
+            pct(sfs_ok)
         );
     }
     ExitCode::SUCCESS

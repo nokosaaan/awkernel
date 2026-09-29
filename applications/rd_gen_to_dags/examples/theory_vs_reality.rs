@@ -65,6 +65,7 @@
 //! `acceptance_ratio.rs`'s own three-column CSV, just with `real_cores`
 //! fixed instead of a derived `m`. `manifest_jsonl` records all three
 //! per-trial booleans (`accepted`/`vfed_accepted`/`dag_fluid_accepted`),
+//! (plus `sfs_accepted`, SFS-G of Lendve et al., JSA 2026, `policy::sfs`),
 //! so a real-machine comparison can read the ONE column matching whichever
 //! algorithm it actually booted, instead of reusing Federated's own
 //! decision as a stand-in for every algorithm (which conflates "the real
@@ -98,6 +99,7 @@ use awkernel_async_lib::dag_sched::{
     metrics::DagMetrics,
     policy::{
         federated::{self, DagGraph, FedTask, FederatedVariant},
+        sfs::{self, SfsTask},
         vfed::{self, PackingStrategy},
     },
 };
@@ -203,7 +205,7 @@ fn main() -> ExitCode {
     let per_dag_scale = real_cores as f64 / dags_per_set as f64;
     let delta = WINDOW_FRACTION_OF_STEP * u_norm_step * per_dag_scale;
 
-    println!("u_norm,federated_ratio,vfed_ratio,dag_fluid_ratio");
+    println!("u_norm,federated_ratio,vfed_ratio,dag_fluid_ratio,sfs_ratio");
     for u_norm in u_norm_values(u_norm_min, u_norm_max, u_norm_step) {
         let center = u_norm * per_dag_scale;
         let (lo, hi) = (center - delta, center + delta);
@@ -227,6 +229,7 @@ fn main() -> ExitCode {
         let mut fed_accepted = 0usize;
         let mut vfed_accepted = 0usize;
         let mut dag_fluid_accepted = 0usize;
+        let mut sfs_accepted = 0usize;
         for trial in 0..trials_per_bin {
             let set: Vec<&PoolEntry> = window.choose_multiple(&mut rng, dags_per_set).copied().collect();
             let metrics: Vec<DagMetrics> = set.iter().map(|e| e.metrics).collect();
@@ -258,19 +261,32 @@ fn main() -> ExitCode {
             if dag_fluid_ok {
                 dag_fluid_accepted += 1;
             }
+            let sfs_tasks: Vec<SfsTask<'_>> = set
+                .iter()
+                .map(|e| SfsTask {
+                    graph: &e.graph,
+                    period: e.metrics.period,
+                    deadline: e.metrics.relative_deadline,
+                })
+                .collect();
+            let sfs_ok = sfs::is_schedulable(&sfs_tasks, real_cores);
+            if sfs_ok {
+                sfs_accepted += 1;
+            }
 
             let u_sigma_actual: f64 = set.iter().map(|e| e.utilization).sum();
             write_trial_record(
                 &mut manifest, u_norm, trial, &dags_dir, &set, fed_variant, fed_ok, vfed_ok,
-                dag_fluid_ok, u_sigma_actual, real_cores,
+                dag_fluid_ok, sfs_ok, u_sigma_actual, real_cores,
             );
         }
 
         println!(
-            "{u_norm:.4},{:.2},{:.2},{:.2}",
+            "{u_norm:.4},{:.2},{:.2},{:.2},{:.2}",
             100.0 * fed_accepted as f64 / trials_per_bin as f64,
             100.0 * vfed_accepted as f64 / trials_per_bin as f64,
             100.0 * dag_fluid_accepted as f64 / trials_per_bin as f64,
+            100.0 * sfs_accepted as f64 / trials_per_bin as f64,
         );
     }
 
@@ -386,6 +402,7 @@ fn write_trial_record(
     accepted: bool,
     vfed_accepted: bool,
     dag_fluid_accepted: bool,
+    sfs_accepted: bool,
     u_sigma_actual: f64,
     real_cores: u16,
 ) {
@@ -398,7 +415,7 @@ fn write_trial_record(
     let line = format!(
         "{{\"u_norm\":{u_norm:.4},\"trial\":{trial},\"dags_dir\":\"{}\",\"dags\":[{dags}],\
          \"real_cores\":{real_cores},\"federated_variant\":\"{federated_variant:?}\",\"accepted\":{accepted},\"vfed_accepted\":{vfed_accepted},\
-         \"dag_fluid_accepted\":{dag_fluid_accepted},\"u_sigma_actual\":{u_sigma_actual:.6},\
+         \"dag_fluid_accepted\":{dag_fluid_accepted},\"sfs_accepted\":{sfs_accepted},\"u_sigma_actual\":{u_sigma_actual:.6},\
          \"u_norm_actual\":{u_norm_actual:.6}}}\n",
         dags_dir.display(),
     );

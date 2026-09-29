@@ -289,6 +289,21 @@ impl DagGraph {
     pub fn is_empty(&self) -> bool {
         self.wcet.is_empty()
     }
+
+    /// Node `v`'s WCET.
+    pub fn wcet(&self, v: usize) -> u64 {
+        self.wcet[v]
+    }
+
+    /// Node `v`'s immediate successors, in edge-insertion order.
+    pub fn successors(&self, v: usize) -> &[usize] {
+        &self.successors[v]
+    }
+
+    /// Number of immediate predecessors of node `v`.
+    pub fn in_degree(&self, v: usize) -> usize {
+        self.in_degree[v]
+    }
 }
 
 /// Makespan of one dag-job under Graham's (non-preemptive) list scheduling

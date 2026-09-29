@@ -69,6 +69,7 @@ SERIES = [
     ("ours1", "V-Fed OURS1", "#1baf7a", "^"),
     ("ours2", "V-Fed OURS2", "#eda100", "D"),
     ("fluid", "DAG-Fluid (Guan et al. 2022)", "#e87ba4", "v"),
+    ("sfs", "SFS-G (Lendve et al. 2026)", "#008300", "P"),
 ]
 
 
