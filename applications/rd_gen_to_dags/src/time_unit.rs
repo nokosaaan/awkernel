@@ -1,6 +1,7 @@
 use awkernel_lib::delay::uptime;
 use core::hint::black_box;
 use core::sync::atomic::{AtomicU64, Ordering};
+use awkernel_lib::delay::wait_millisec;
 use core::time::Duration;
 
 #[cfg(feature = "seconds")]

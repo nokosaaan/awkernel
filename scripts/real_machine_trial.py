@@ -269,8 +269,9 @@ def load_trials_jsonl(path, include_rejected=False):
     Accepts either schema this file's own JSONL producers write: this
     repo's newer `theory_vs_reality.rs` (`{"u_norm","trial","dags_dir",
     "dags","accepted"}` -- one shared Federated-only `accepted` flag, and a
-    *per-record* `dags_dir` since that file's pools are one-per-u_norm-bin,
-    not a single shared pool like `acceptance_ratio.rs`'s own
+    *per-record* `dags_dir` naming the pool it drew from (a single core-
+    count-independent pool, windowed per u_norm by that file itself), unlike
+    `acceptance_ratio.rs`'s own
     `{"u_norm","trial","dags","federated_accepted","vfed_accepted",
     "dag_fluid_accepted"}`, which has no `dags_dir` at all -- for that
     schema, `--pool-dir` supplies the (single, shared) directory instead;

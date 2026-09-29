@@ -7,6 +7,12 @@
 //! Federated's near-ideal, fragmentation-free shared pool), not from any
 //! per-DAG core-count difference versus V-Fed.
 //!
+//! Federated's acceptance is `federated::is_batch_feasible` (the
+//! paper-faithful batch admission, with partitioned low-density DAGs); the
+//! heavy/light bucketing below still uses the legacy per-DAG
+//! `classify_dag`, whose boundary (`density > 1`) differs from the batch
+//! path's (`density >= 1`) only at exactly `density = 1`.
+//!
 //! Usage: `diagnose_light_dominance <pool_dir> <u_norm> [trials]`
 
 use std::{env, fs, path::Path, process::ExitCode};
@@ -14,7 +20,7 @@ use std::{env, fs, path::Path, process::ExitCode};
 use awkernel_async_lib::dag_sched::{
     metrics::DagMetrics,
     policy::{
-        federated::{self, TaskClass as FedTaskClass},
+        federated::{self, DagGraph, FedTask, TaskClass as FedTaskClass},
         vfed::{self, PackingStrategy, TaskClass as VFedTaskClass},
     },
 };
@@ -67,9 +73,10 @@ fn main() -> ExitCode {
     let mut light_util_max = 0.0f64;
 
     for _ in 0..trials {
-        let set: Vec<DagMetrics> = (0..DAGS_PER_SET)
-            .map(|_| *pool.choose(&mut rng).expect("pool checked non-empty above"))
+        let drawn: Vec<&(DagMetrics, DagGraph)> = (0..DAGS_PER_SET)
+            .map(|_| pool.choose(&mut rng).expect("pool checked non-empty above"))
             .collect();
+        let set: Vec<DagMetrics> = drawn.iter().map(|(m, _)| *m).collect();
 
         let u_sigma: f64 = set.iter().map(|d| d.volume as f64 / d.period as f64).sum();
         let m = ((u_sigma / u_norm).ceil() as u16).max(1);
@@ -79,7 +86,14 @@ fn main() -> ExitCode {
             .filter(|c| matches!(federated::classify_dag(c), Ok(FedTaskClass::Heavy { .. })))
             .count();
 
-        let fed_ok = federated_batch_feasible(&set, m);
+        let fed_tasks: Vec<FedTask<'_>> = drawn
+            .iter()
+            .map(|(metrics, graph)| FedTask {
+                metrics: *metrics,
+                graph,
+            })
+            .collect();
+        let fed_ok = federated::is_batch_feasible(&fed_tasks, m);
         let vfed_ok = vfed::is_batch_feasible(&set, m, PackingStrategy::BestFit);
 
         let bucket = &mut by_heavy_count[heavy_count];
@@ -115,7 +129,7 @@ fn main() -> ExitCode {
     );
 
     // A few concrete pool DAGs' own numbers, to see actual scale.
-    for config in pool.iter().take(5) {
+    for (config, _) in pool.iter().take(5) {
         println!(
             "# sample pool DAG: C={} L={} T={} D={} m_i={:?} class={:?}",
             config.volume,
@@ -144,7 +158,7 @@ fn main() -> ExitCode {
     // disagrees with Federated's (would show up as a note, not a bucket).
     let mut vfed_heavy_mismatch = 0usize;
     let mut checked = 0usize;
-    for config in &pool {
+    for (config, _) in &pool {
         checked += 1;
         let fed_heavy = matches!(federated::classify_dag(config), Ok(FedTaskClass::Heavy { .. }));
         let vfed_heavy = matches!(vfed::classify(config), Ok(VFedTaskClass::Heavy { .. }));
@@ -159,7 +173,7 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn load_pool(pool_dir: &Path) -> Result<Vec<DagMetrics>, String> {
+fn load_pool(pool_dir: &Path) -> Result<Vec<(DagMetrics, DagGraph)>, String> {
     let mut yaml_paths: Vec<_> = fs::read_dir(pool_dir)
         .map_err(|e| format!("cannot read directory '{}': {e}", pool_dir.display()))?
         .filter_map(|entry| entry.ok().map(|e| e.path()))
@@ -180,14 +194,17 @@ fn load_pool(pool_dir: &Path) -> Result<Vec<DagMetrics>, String> {
 
     let all = rd_gen_to_dags::dag_metrics_from_yaml(&yaml_refs)
         .map_err(|e| format!("failed to parse DAG pool in '{}': {e}", pool_dir.display()))?;
+    let graphs = rd_gen_to_dags::dag_graphs_from_yaml(&yaml_refs)
+        .map_err(|e| format!("failed to parse DAG pool in '{}': {e}", pool_dir.display()))?;
 
     let mut rng = rand::rng();
     Ok(all
         .into_iter()
-        .map(|config| {
+        .zip(graphs)
+        .map(|(config, graph)| {
             let config = override_deadline(config, &mut rng);
             let config = override_period(config, &mut rng);
-            assign_max_parallelism(config, &mut rng)
+            (assign_max_parallelism(config, &mut rng), graph)
         })
         .collect())
 }
@@ -217,25 +234,3 @@ fn assign_max_parallelism(config: DagMetrics, rng: &mut impl Rng) -> DagMetrics 
     DagMetrics { max_parallelism, ..config }
 }
 
-fn federated_batch_feasible(configs: &[DagMetrics], num_cores: u16) -> bool {
-    let mut heavy_cores: u32 = 0;
-    let mut light_utilization: f64 = 0.0;
-
-    for &config in configs {
-        match federated::classify_dag(&config) {
-            Ok(FedTaskClass::Heavy { required_cores }) => {
-                heavy_cores += required_cores as u32;
-            }
-            Ok(FedTaskClass::Light) => {
-                let window = config.relative_deadline.min(config.period) as f64;
-                light_utilization += config.volume as f64 / window;
-            }
-            Err(_) => return false,
-        }
-    }
-
-    if heavy_cores > num_cores as u32 {
-        return false;
-    }
-    light_utilization <= (num_cores as u32 - heavy_cores) as f64
-}

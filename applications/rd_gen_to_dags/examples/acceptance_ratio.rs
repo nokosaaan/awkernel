@@ -99,12 +99,16 @@ use std::{
 use awkernel_async_lib::dag_sched::{
     metrics::DagMetrics,
     policy::{
-        federated::{self, TaskClass as FedTaskClass},
+        federated::{self, DagGraph, FedTask},
         vfed::{self, PackingStrategy},
     },
 };
 use rand::{seq::IndexedRandom, Rng};
 use rd_gen_to_dags::dag_fluid::{self, Segment};
+
+/// One pool DAG: filename, metrics (deadline/period overridden), DAG-Fluid
+/// segments, and precedence structure for Federated's list scheduling.
+type PoolEntry = (String, DagMetrics, Vec<Segment>, DagGraph);
 
 /// N in the paper's own "N=8 DAGs per task set".
 const DAGS_PER_SET: usize = 8;
@@ -177,9 +181,9 @@ fn main() -> ExitCode {
         let mut dag_fluid_accepted = 0usize;
 
         for trial in 0..TRIALS_PER_LEVEL {
-            let set: Vec<&(String, DagMetrics, Vec<Segment>)> =
+            let set: Vec<&PoolEntry> =
                 pool.choose_multiple(&mut rng, DAGS_PER_SET).collect();
-            let metrics: Vec<DagMetrics> = set.iter().map(|(_, m, _)| *m).collect();
+            let metrics: Vec<DagMetrics> = set.iter().map(|(_, m, _, _)| *m).collect();
 
             let u_sigma: f64 = metrics.iter().map(|d| d.volume as f64 / d.period as f64).sum();
             // u_sigma > 0 always (every WCET is >= 1), so this is never 0/0;
@@ -188,7 +192,14 @@ fn main() -> ExitCode {
             // since M=0 cores can admit nothing.
             let m = ((u_sigma / u_norm).ceil() as u16).max(1);
 
-            let fed_ok = federated_batch_feasible(&metrics, m);
+            let fed_tasks: Vec<FedTask<'_>> = set
+                .iter()
+                .map(|(_, metrics, _, graph)| FedTask {
+                    metrics: *metrics,
+                    graph,
+                })
+                .collect();
+            let fed_ok = federated::is_batch_feasible(&fed_tasks, m);
             if fed_ok {
                 fed_accepted += 1;
             }
@@ -198,7 +209,7 @@ fn main() -> ExitCode {
             }
             let dag_fluid_entries: Vec<(u64, u64, u64, u64, &[Segment])> = set
                 .iter()
-                .map(|(_, metrics, segments)| {
+                .map(|(_, metrics, segments, _)| {
                     (
                         metrics.volume,
                         metrics.period,
@@ -241,7 +252,7 @@ fn parse_positive_f64(s: &str) -> Option<f64> {
 /// per [`override_deadline`], and pairing each resulting [`DagMetrics`] with
 /// its DAG-Fluid [`Segment`] decomposition (structure-derived, so computed
 /// once here and left untouched by the later per-`DagMetrics` overrides).
-fn load_pool(pool_dir: &Path) -> Result<Vec<(String, DagMetrics, Vec<Segment>)>, String> {
+fn load_pool(pool_dir: &Path) -> Result<Vec<PoolEntry>, String> {
     let mut yaml_paths: Vec<_> = fs::read_dir(pool_dir)
         .map_err(|e| format!("cannot read directory '{}': {e}", pool_dir.display()))?
         .filter_map(|entry| entry.ok().map(|e| e.path()))
@@ -266,16 +277,19 @@ fn load_pool(pool_dir: &Path) -> Result<Vec<(String, DagMetrics, Vec<Segment>)>,
 
     let all = rd_gen_to_dags::dag_metrics_and_fluid_segments_from_yaml(&yaml_refs)
         .map_err(|e| format!("failed to parse DAG pool in '{}': {e}", pool_dir.display()))?;
+    let graphs = rd_gen_to_dags::dag_graphs_from_yaml(&yaml_refs)
+        .map_err(|e| format!("failed to parse DAG pool in '{}': {e}", pool_dir.display()))?;
 
     let mut rng = rand::rng();
     Ok(names
         .into_iter()
         .zip(all)
-        .map(|(name, (config, segments))| {
+        .zip(graphs)
+        .map(|((name, (config, segments)), graph)| {
             let config = override_deadline(config, &mut rng);
             let config = override_period(config, &mut rng);
             let config = assign_max_parallelism(config, &mut rng);
-            (name, config, segments)
+            (name, config, segments, graph)
         })
         .collect())
 }
@@ -291,14 +305,14 @@ fn write_trial_record(
     out: &mut fs::File,
     u_norm: f64,
     trial: usize,
-    set: &[&(String, DagMetrics, Vec<Segment>)],
+    set: &[&PoolEntry],
     federated_accepted: bool,
     vfed_accepted: bool,
     dag_fluid_accepted: bool,
 ) {
     let dags = set
         .iter()
-        .map(|(name, _, _)| format!("\"{name}\""))
+        .map(|(name, _, _, _)| format!("\"{name}\""))
         .collect::<Vec<_>>()
         .join(",");
     let line = format!(
@@ -361,33 +375,3 @@ fn assign_max_parallelism(config: DagMetrics, rng: &mut impl Rng) -> DagMetrics 
     DagMetrics { max_parallelism, ..config }
 }
 
-/// Federated's all-or-nothing batch verdict for `configs` against
-/// `num_cores`, reimplemented as a pure function of `classify_dag` (no
-/// `resource` ledger side effects, mirroring `vfed::is_batch_feasible`):
-/// every heavy DAG's `required_cores` must sum to at most `num_cores`, and
-/// every light DAG's utilization must sum to at most whatever cores that
-/// leaves — exactly the two checks `resource::allocate_cluster`/
-/// `reserve_light_utilization` enforce for real, restated without the
-/// shared ledger.
-fn federated_batch_feasible(configs: &[DagMetrics], num_cores: u16) -> bool {
-    let mut heavy_cores: u32 = 0;
-    let mut light_utilization: f64 = 0.0;
-
-    for &config in configs {
-        match federated::classify_dag(&config) {
-            Ok(FedTaskClass::Heavy { required_cores }) => {
-                heavy_cores += required_cores as u32;
-            }
-            Ok(FedTaskClass::Light) => {
-                let window = config.relative_deadline.min(config.period) as f64;
-                light_utilization += config.volume as f64 / window;
-            }
-            Err(_) => return false, // Infeasible regardless of resources.
-        }
-    }
-
-    if heavy_cores > num_cores as u32 {
-        return false;
-    }
-    light_utilization <= (num_cores as u32 - heavy_cores) as f64
-}

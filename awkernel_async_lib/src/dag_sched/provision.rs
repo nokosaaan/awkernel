@@ -21,8 +21,14 @@ pub enum Provision {
     Dedicated { cores: CpuSet },
     /// A share of the remaining pool, tracked only by aggregate
     /// utilization (scaled by a fixed factor internal to
-    /// [`super::resource`]), e.g. a Federated light DAG.
+    /// [`super::resource`]), e.g. a Federated light DAG under the legacy
+    /// per-DAG [`super::policy::federated::admit_dag`].
     Shared { utilization_scaled: u64 },
+    /// One core shared by several sequential (low-density) DAGs under
+    /// uniprocessor EDF -- a partition of partitioned EDF, e.g. a Federated
+    /// low-density DAG under [`super::policy::federated::admit_batch`].
+    /// `cpu` holds exactly that one core.
+    Partitioned { cpu: CpuSet },
 }
 
 impl Provision {
@@ -32,6 +38,7 @@ impl Provision {
         match self {
             Provision::Dedicated { cores } => SchedulerType::ClusteredEDF(relative_deadline, cores),
             Provision::Shared { .. } => SchedulerType::GEDF(relative_deadline),
+            Provision::Partitioned { cpu } => SchedulerType::ClusteredEDF(relative_deadline, cpu),
         }
     }
 }

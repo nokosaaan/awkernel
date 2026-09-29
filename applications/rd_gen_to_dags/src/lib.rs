@@ -8,7 +8,12 @@ mod parse_yaml;
 mod time_unit;
 
 use alloc::{string::String, vec, vec::Vec};
-use awkernel_async_lib::{dag::finish_create_dags, dag_sched::metrics::DagMetrics};
+use awkernel_async_lib::{
+    dag::finish_create_dags,
+    dag_sched::{metrics::DagMetrics, policy::federated::DagGraph},
+};
+#[cfg(not(any(feature = "vfed", feature = "laxity", feature = "dagfluid")))]
+use awkernel_async_lib::dag_sched::policy::federated;
 use awkernel_lib::delay::wait_millisec;
 #[cfg(not(feature = "vfed"))]
 use build_dag::build_dag;
@@ -32,33 +37,7 @@ include!(concat!(env!("OUT_DIR"), "/dag_files.rs"));
 pub fn dag_metrics_from_yaml(yaml_files: &[&str]) -> Result<Vec<DagMetrics>, String> {
     let dags_data =
         parse_yaml::parse_dags(yaml_files).map_err(|e| alloc::format!("failed to parse: {e}"))?;
-
-    dags_data
-        .iter()
-        .map(|dag_data| {
-            let stats = dag_stats::compute_dag_stats(dag_data);
-            let period = dag_data
-                .get_nodes()
-                .iter()
-                .find(|node| node.is_source())
-                .and_then(parse_yaml::NodeData::get_period)
-                .ok_or_else(|| String::from("DAG has no source node with a period"))?;
-            let relative_deadline = dag_data
-                .get_nodes()
-                .iter()
-                .find(|node| node.is_sink())
-                .and_then(parse_yaml::NodeData::get_end_to_end_deadline)
-                .ok_or_else(|| {
-                    String::from("DAG has no sink node with an end_to_end_deadline")
-                })?;
-            Ok(DagMetrics::from_static(
-                stats.volume,
-                stats.critical_path,
-                period,
-                relative_deadline,
-            ))
-        })
-        .collect()
+    dags_data.iter().map(dag_metrics).collect()
 }
 
 /// Parse a batch of RD-Gen DAG YAML documents into `(DagMetrics,
@@ -72,35 +51,88 @@ pub fn dag_metrics_and_fluid_segments_from_yaml(
 ) -> Result<Vec<(DagMetrics, Vec<dag_fluid::Segment>)>, String> {
     let dags_data =
         parse_yaml::parse_dags(yaml_files).map_err(|e| alloc::format!("failed to parse: {e}"))?;
-
     dags_data
         .iter()
-        .map(|dag_data| {
-            let stats = dag_stats::compute_dag_stats(dag_data);
-            let period = dag_data
-                .get_nodes()
-                .iter()
-                .find(|node| node.is_source())
-                .and_then(parse_yaml::NodeData::get_period)
-                .ok_or_else(|| String::from("DAG has no source node with a period"))?;
-            let relative_deadline = dag_data
-                .get_nodes()
-                .iter()
-                .find(|node| node.is_sink())
-                .and_then(parse_yaml::NodeData::get_end_to_end_deadline)
-                .ok_or_else(|| {
-                    String::from("DAG has no sink node with an end_to_end_deadline")
-                })?;
-            let metrics = DagMetrics::from_static(
-                stats.volume,
-                stats.critical_path,
-                period,
-                relative_deadline,
-            );
-            let segments = dag_fluid::decompose_segments(dag_data);
-            Ok((metrics, segments))
-        })
+        .map(|dag_data| Ok((dag_metrics(dag_data)?, dag_fluid::decompose_segments(dag_data))))
         .collect()
+}
+
+/// Parse a batch of RD-Gen DAG YAML documents into each DAG's precedence
+/// structure ([`DagGraph`]), in input order -- what Federated's
+/// list-scheduling `MINPROCS` (Baruah, DATE/IPDPS 2015) needs on top of
+/// [`DagMetrics`]. See [`dag_graph`] for the node order used.
+pub fn dag_graphs_from_yaml(yaml_files: &[&str]) -> Result<Vec<DagGraph>, String> {
+    let dags_data =
+        parse_yaml::parse_dags(yaml_files).map_err(|e| alloc::format!("failed to parse: {e}"))?;
+    dags_data.iter().map(dag_graph).collect()
+}
+
+/// One DAG's [`DagMetrics`]: volume and critical path from
+/// `compute_dag_stats`, period from its source node, relative deadline
+/// from its sink node's `end_to_end_deadline`.
+fn dag_metrics(dag_data: &parse_yaml::DagData) -> Result<DagMetrics, String> {
+    let stats = dag_stats::compute_dag_stats(dag_data);
+    let period = dag_data
+        .get_nodes()
+        .iter()
+        .find(|node| node.is_source())
+        .and_then(parse_yaml::NodeData::get_period)
+        .ok_or_else(|| String::from("DAG has no source node with a period"))?;
+    let relative_deadline = dag_data
+        .get_nodes()
+        .iter()
+        .find(|node| node.is_sink())
+        .and_then(parse_yaml::NodeData::get_end_to_end_deadline)
+        .ok_or_else(|| String::from("DAG has no sink node with an end_to_end_deadline"))?;
+    Ok(DagMetrics::from_static(
+        stats.volume,
+        stats.critical_path,
+        period,
+        relative_deadline,
+    ))
+}
+
+/// One DAG's [`DagGraph`]: nodes in ascending node-id order (which is also
+/// the list-scheduling priority list), WCET = `execution_time`, one edge per
+/// `out_links` entry.
+fn dag_graph(dag_data: &parse_yaml::DagData) -> Result<DagGraph, String> {
+    let mut ids: Vec<u32> = dag_data.get_nodes().iter().map(|n| n.get_id()).collect();
+    ids.sort_unstable();
+    let index_of = |id: u32| ids.binary_search(&id).ok();
+
+    let mut wcet = vec![0u64; ids.len()];
+    let mut edges = Vec::new();
+    for node in dag_data.get_nodes() {
+        let from = index_of(node.get_id()).ok_or_else(|| String::from("duplicate node id"))?;
+        wcet[from] = node.get_execution_time();
+        for &to_id in node.get_out_links() {
+            let to = index_of(to_id)
+                .ok_or_else(|| alloc::format!("link to unknown node id {to_id}"))?;
+            edges.push((from, to));
+        }
+    }
+    DagGraph::new(wcet, &edges).ok_or_else(|| String::from("DAG edge out of range"))
+}
+
+/// Federated's batch admission over the whole embedded task set
+/// (`federated::admit_batch`, which picks Li et al. / Baruah DATE 2015 /
+/// Baruah IPDPS 2015 from the set's deadline type), one assignment per DAG
+/// in `dags_data` order.
+#[cfg(not(any(feature = "vfed", feature = "laxity", feature = "dagfluid")))]
+fn federated_admit_batch(
+    dags_data: &[parse_yaml::DagData],
+) -> Result<Vec<federated::FederatedAssignment>, String> {
+    let metrics: Vec<DagMetrics> = dags_data.iter().map(dag_metrics).collect::<Result<_, _>>()?;
+    let graphs: Vec<DagGraph> = dags_data.iter().map(dag_graph).collect::<Result<_, _>>()?;
+    let tasks: Vec<federated::FedTask<'_>> = metrics
+        .iter()
+        .zip(graphs.iter())
+        .map(|(&metrics, graph)| federated::FedTask { metrics, graph })
+        .collect();
+    let (variant, assignments) =
+        federated::admit_batch(&tasks).map_err(|e| alloc::format!("{e}"))?;
+    log::info!("federated batch admission: {variant:?}, {} DAGs admitted", assignments.len());
+    Ok(assignments)
 }
 
 #[cfg(not(feature = "vfed"))]
@@ -138,10 +170,24 @@ pub async fn run() {
         }
     };
 
+    // Federated decides the whole task set at once (see
+    // `federated_admit_batch`); a rejected batch runs nothing, like the
+    // papers' `return FAILURE` (and like V-Fed's `admit_batch` below).
+    #[cfg(not(any(feature = "laxity", feature = "dagfluid")))]
+    let federated_assignments: Vec<Option<_>> = match federated_admit_batch(&dags_data) {
+        Ok(a) => a.into_iter().map(Some).collect(),
+        Err(e) => {
+            log::error!("federated::admit_batch rejected the whole batch: {e}");
+            return;
+        }
+    };
+    #[cfg(any(feature = "laxity", feature = "dagfluid"))]
+    let federated_assignments = vec![None; dags_data.len()];
+
     let mut success_build_dags = vec![];
 
-    for dag_data in dags_data {
-        match build_dag(dag_data).await {
+    for (dag_data, federated_assignment) in dags_data.into_iter().zip(federated_assignments) {
+        match build_dag(dag_data, federated_assignment).await {
             Ok(dag) => {
                 success_build_dags.push(dag);
             }
@@ -217,7 +263,7 @@ pub async fn run() {
         }
     };
 
-    let assignments = match vfed::admit_batch(&configs, PackingStrategy::FirstFit) {
+    let assignments = match vfed::admit_batch(&configs, PackingStrategy::BestFit) {
         Ok(a) => a,
         Err(e) => {
             log::error!("vfed::admit_batch rejected the whole batch: {e:?}");
@@ -266,5 +312,43 @@ pub async fn run() {
                 log::error!("- {error}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use awkernel_async_lib::dag_sched::policy::federated::list_schedule_makespan;
+
+    /// Diamond 0 -> {1, 2} -> 3 with WCETs 10, 30, 5, 5 (node ids given out
+    /// of order in the YAML): the graph must follow the links, not the file
+    /// order.
+    #[test]
+    fn test_dag_graphs_from_yaml_diamond() {
+        let dag_file = "links:
+  - source: 0
+    target: 1
+  - source: 0
+    target: 2
+  - source: 1
+    target: 3
+  - source: 2
+    target: 3
+nodes:
+  - end_to_end_deadline: 100
+    execution_time: 5
+    id: 3
+  - execution_time: 10
+    id: 0
+    period: 50
+  - execution_time: 30
+    id: 1
+  - execution_time: 5
+    id: 2
+";
+        let graphs = dag_graphs_from_yaml(&[dag_file]).unwrap();
+        assert_eq!(graphs[0].len(), 4);
+        assert_eq!(list_schedule_makespan(&graphs[0], 1), Some(50)); // volume
+        assert_eq!(list_schedule_makespan(&graphs[0], 2), Some(45)); // critical path
     }
 }

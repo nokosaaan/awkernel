@@ -5,8 +5,8 @@ use crate::parse_yaml::{DagData, NodeData};
 use crate::time_unit::{convert_duration, simulated_execution_time};
 
 use alloc::{borrow::Cow, collections::BTreeMap, format, sync::Arc, vec::Vec};
-#[cfg(not(any(feature = "vfed", feature = "laxity", feature = "dagfluid")))]
-use awkernel_async_lib::dag_sched::policy::federated::admit_dag;
+#[cfg(not(feature = "vfed"))]
+use awkernel_async_lib::dag_sched::policy::federated::FederatedAssignment;
 #[cfg(feature = "vfed")]
 use awkernel_async_lib::dag_sched::policy::vfed::{self, VFedError};
 #[cfg(feature = "dagfluid")]
@@ -16,7 +16,7 @@ use awkernel_async_lib::{
     dag_sched::policy::federated::FederatedError,
     scheduler::SchedulerType,
 };
-#[cfg(not(any(feature = "vfed", feature = "dagfluid")))]
+#[cfg(feature = "laxity")]
 use awkernel_async_lib::dag_sched::metrics::DagMetrics;
 
 #[cfg(any(
@@ -67,6 +67,10 @@ pub(crate) enum BuildDagError {
     /// happen case.
     #[cfg(feature = "vfed")]
     VFedSchedulerTypeMissing(u32),
+    /// Federated build: `build_dag` was called without the assignment the
+    /// batch admission (`federated::admit_batch`) should have decided.
+    #[cfg(not(any(feature = "vfed", feature = "laxity", feature = "dagfluid")))]
+    FederatedNotAdmitted(u32),
     /// The DAG's source node has no `period`, or its sink node has no
     /// `end_to_end_deadline` — both are required for admission.
     MissingDagTiming(u32),
@@ -98,6 +102,11 @@ impl core::fmt::Display for BuildDagError {
             BuildDagError::VFedSchedulerTypeMissing(dag_id) => write!(
                 f,
                 "DAG#{dag_id}: vfed admitted it but produced no SchedulerType"
+            ),
+            #[cfg(not(any(feature = "vfed", feature = "laxity", feature = "dagfluid")))]
+            BuildDagError::FederatedNotAdmitted(dag_id) => write!(
+                f,
+                "DAG#{dag_id}: no federated batch-admission decision for this DAG"
             ),
             BuildDagError::MissingDagTiming(dag_id) => write!(
                 f,
@@ -1167,9 +1176,17 @@ async fn register_intermediate_node(
 /// but never reaches `finish_create_dags`/spawn, so without this it would
 /// never appear in the trace dump at all; recording it here means the host
 /// sees a `TRACE_BUILD_MISS` line for it instead of it silently vanishing.
+///
+/// `federated_assignment` is this DAG's share of the Federated batch
+/// decision (`federated::admit_batch`, made in `run()` over the whole task
+/// set before any DAG is built); `None` on the `laxity`/`dagfluid` builds,
+/// which decide per DAG inside `build_dag_impl`.
 #[cfg(not(feature = "vfed"))]
-pub(super) async fn build_dag(dag_data: DagData) -> Result<Arc<Dag>, BuildDagError> {
-    match build_dag_impl(dag_data).await {
+pub(super) async fn build_dag(
+    dag_data: DagData,
+    federated_assignment: Option<FederatedAssignment>,
+) -> Result<Arc<Dag>, BuildDagError> {
+    match build_dag_impl(dag_data, federated_assignment).await {
         Ok(dag) => Ok(dag),
         Err((dag_id, e)) => {
             record_build_failure(dag_id, format!("{e}"));
@@ -1238,7 +1255,10 @@ async fn register_dag_nodes(
 }
 
 #[cfg(not(feature = "vfed"))]
-async fn build_dag_impl(dag_data: DagData) -> Result<Arc<Dag>, (u32, BuildDagError)> {
+async fn build_dag_impl(
+    dag_data: DagData,
+    _federated_assignment: Option<FederatedAssignment>,
+) -> Result<Arc<Dag>, (u32, BuildDagError)> {
     let dag = create_dag();
     let dag_id = dag.get_id();
 
@@ -1263,12 +1283,23 @@ async fn build_dag_impl(dag_data: DagData) -> Result<Arc<Dag>, (u32, BuildDagErr
         .and_then(NodeData::get_end_to_end_deadline)
         .ok_or(BuildDagError::MissingDagTiming(dag_id))?;
 
-    #[cfg(not(feature = "dagfluid"))]
+    #[cfg(feature = "laxity")]
     let config = DagMetrics::from_static(stats.volume, stats.critical_path, period, relative_deadline);
+    // Federated already read both from the same nodes in `run()`'s batch
+    // admission; they are still fetched above so a DAG missing either is
+    // rejected with the same `MissingDagTiming` error on every build.
+    #[cfg(not(any(feature = "laxity", feature = "dagfluid")))]
+    let _ = (period, relative_deadline);
 
+    // Federated: the decision was already made for the whole task set by
+    // `federated::admit_batch` in `run()` (the papers' algorithms are
+    // batch algorithms -- high-density DAGs first, then partitioning of the
+    // rest -- so admitting DAGs one at a time in file order would not be
+    // the same algorithm); this only reads that decision back.
     #[cfg(not(any(feature = "laxity", feature = "dagfluid")))]
     let sched_type = {
-        let assignment = admit_dag(config)?;
+        let assignment =
+            _federated_assignment.ok_or(BuildDagError::FederatedNotAdmitted(dag_id))?;
         let sched_type = assignment.scheduler_type;
         if let SchedulerType::ClusteredEDF(deadline, cluster) = sched_type {
             let cores: Vec<usize> = cluster.iter().collect();

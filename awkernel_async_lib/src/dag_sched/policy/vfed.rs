@@ -17,30 +17,30 @@
 //!
 //! # Scope of this module (current state)
 //!
-//! This module implements the paper's full admission algorithm
-//! (Algorithm 1/`AllocH` + Algorithm 2/`Allo_Both`) for a given task set:
-//! - [`sbf`]: the supply bound function (paper's Lemma 1), the minimal
-//!   guaranteed processing time a passive-VP provides in any interval.
-//! - [`plan_heavy`]/[`plan_light`]: pure planning functions implementing
-//!   Theorem 1 (pure active-VP), Theorem 2 (pure passive-VP) and Theorem 4
-//!   (mixed) via the shared [`mixed_schedulable`] check, plus the paper's
-//!   own greedy passive-VP-selection heuristic.
-//! - [`search_min_heavy_cores`]: the outer search over how many cores to
-//!   dedicate to heavy tasks as a whole (`M_h`), simulated purely — against
-//!   a local passive-VP pool addressed by placeholder slot ids, not real
-//!   cores — so the search costs no real resource churn.
-//! - [`choose_partition`]/[`PackingStrategy`]: the partitioned-EDF fallback
-//!   for a light task that fits no available passive-VP, bin-packed by
-//!   density (`C/D`) onto bare cores with a pluggable placement strategy.
-//! - [`admit_one`]: DAG-granularity, single-pass admission against whatever
-//!   is currently free — reusable as the incremental path, or as the inner
-//!   step of a batch run once the paper's sorted order and `M_h` are fixed.
-//! - [`admit_batch`]: the all-or-nothing batch entry point — runs the
-//!   search and the light-task pass as a dry run first (touching no real
-//!   resource), and only claims real cores once the *entire* input task set
-//!   is confirmed to fit, matching the paper's `Allo_Both` semantics (one
-//!   task failing to place fails the whole batch, unlike calling
-//!   [`admit_one`] repeatedly, which commits each task independently).
+//! The batch path ([`admit_batch`]/[`is_batch_feasible`], both built on
+//! [`plan_batch`]) follows the TPDS 2023 version's Algorithm 2
+//! (`Allo_Both`) and Algorithm 1 (`AllocH`) line by line:
+//! - [`sbf`]: the supply bound function (Lemma 1).
+//! - [`PassiveTest`]: Theorem 2 / condition (12) (passive-VPs only,
+//!   `C <= L + Σ max{H_j - L, 0}`) and Theorem 4 / condition (13) (active
+//!   plus passive, `C <= Σθ + Σ max{H_j - L, 0}`), kept as two distinct
+//!   conditions -- an earlier revision folded Theorem 2 into Theorem 4 with
+//!   `Σθ = 0`, silently dropping Theorem 2's `L_i` term.
+//! - [`try_alloc_heavy_within`]: Algorithm 1 as written, including the
+//!   partial-group branch (lines 10-17, run once, on whatever processors
+//!   remain -- possibly none) and the `goto line 19` switch to Theorem 2
+//!   for every heavy DAG after it.
+//! - [`search_min_heavy_cores`]: Algorithm 2's search over `M_h`.
+//! - [`plan_batch`]: Algorithm 2's light-task handling -- passive-VPs by
+//!   Theorem 2 first, then `Partition(L, M_l)` as best-fit partitioned EDF
+//!   with the DBF* test of the paper's reference \[15\] (see
+//!   [`crate::dag_sched::partition`]).
+//!
+//! [`admit_one`] is an incremental, one-DAG-at-a-time variant kept for
+//! callers that admit DAGs individually. It uses the same theorems but is
+//! *not* the paper's algorithm (no global sort, no `M_h` search, and a
+//! density-based partition test, since DBF* needs deadline-ordered
+//! insertion); the kernel's V-Fed build uses [`admit_batch`].
 //!
 //! The scheduler mechanism itself now exists too —
 //! [`crate::scheduler::active_vp`] (budget-gated active-VP dispatch,
@@ -63,6 +63,7 @@ use awkernel_lib::{
 use crate::{
     dag_sched::{
         metrics::DagMetrics,
+        partition,
         resource::{self, ResourceError},
     },
     scheduler::SchedulerType,
@@ -357,6 +358,9 @@ fn full_active_vp_budgets(volume: u64, critical_path: u64, deadline: u64, cores:
 /// passive-VPs (Theorem 4).
 fn partial_active_vp_budgets(critical_path: u64, deadline: u64, cores: u16) -> Vec<u64> {
     let mut budgets = Vec::with_capacity(cores as usize);
+    if cores == 0 {
+        return budgets;
+    }
     budgets.push(deadline);
     for _ in 1..cores {
         budgets.push(deadline - critical_path);
@@ -364,24 +368,38 @@ fn partial_active_vp_budgets(critical_path: u64, deadline: u64, cores: u16) -> V
     budgets
 }
 
-/// Theorem 2 (`active_budget_sum == 0`) / Theorem 4 (`active_budget_sum >
-/// 0`) schedulability check, unified: a DAG with volume `volume`, critical
-/// path `critical_path` and relative deadline `deadline`, served by active
-/// VPs totalling `active_budget_sum` plus the passive VPs in `passives`, is
-/// schedulable if
-/// `volume <= active_budget_sum + Σ max(sbf_x(deadline) - critical_path, 0)`.
-fn mixed_schedulable(
-    volume: u64,
-    critical_path: u64,
-    deadline: u64,
-    active_budget_sum: u64,
-    passives: &[&PassiveVp],
-) -> bool {
-    let passive_supply: u64 = passives
+/// `Σ_{j=1}^{|Π|} max{H_j(D_i, Π) - L_i, 0}`: the passive-VP term shared by
+/// Theorem 2 and Theorem 4. `H_j` of the hypothetical platform (`Π*` or
+/// `Π'`) is exactly the multiset of the passive-VPs' own `sbf` values, so
+/// the sum is order-independent.
+fn passive_supply(critical_path: u64, deadline: u64, passives: &[&PassiveVp]) -> u64 {
+    passives
         .iter()
         .map(|p| p.sbf(deadline).saturating_sub(critical_path))
-        .sum();
-    volume <= active_budget_sum.saturating_add(passive_supply)
+        .sum()
+}
+
+/// Which schedulability condition a passive-VP search tests against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassiveTest {
+    /// Theorem 2, condition (12) (task on a passive-VP group only):
+    /// `C_i <= L_i + Σ max{H_j(D_i, Π) - L_i, 0}`.
+    Theorem2,
+    /// Theorem 4, condition (13) (task on `⟨Θ, Π⟩`), with
+    /// `active_budget_sum = Σ_{θ_z ∈ Θ} θ_z`:
+    /// `C_i <= Σθ_z + Σ max{H_j(D_i, Π) - L_i, 0}`. Algorithm 1 line 17
+    /// applies this even when `Θ` ended up empty (`|P| = 0` at line 11).
+    Theorem4 { active_budget_sum: u64 },
+}
+
+impl PassiveTest {
+    fn holds(self, volume: u64, critical_path: u64, deadline: u64, passives: &[&PassiveVp]) -> bool {
+        let base = match self {
+            PassiveTest::Theorem2 => critical_path,
+            PassiveTest::Theorem4 { active_budget_sum } => active_budget_sum,
+        };
+        volume <= base.saturating_add(passive_supply(critical_path, deadline, passives))
+    }
 }
 
 /// A passive-VP is only ever worth pulling for a task with relative
@@ -404,12 +422,14 @@ pub struct HeavyPlan {
 }
 
 /// Plan a heavy DAG's admission against `cores_available` free cores and
-/// the current passive-VP `pool`, without mutating anything. Mirrors the
-/// paper's Algorithm 1 (`AllocH`) for a single task: a full active-VP group
-/// if enough cores are free (Theorem 1), otherwise every free core plus as
-/// many passive-VPs as needed (Theorem 4), pulled greedily in the pool's
-/// order — the first useful one each time, matching the paper's own
-/// tie-breaking choice (see its Section 6.2 worked example).
+/// the current passive-VP `pool`, without mutating anything -- the
+/// single-task step of the incremental [`admit_one`] path. (The
+/// paper-faithful batch path is [`try_alloc_heavy_within`], which follows
+/// Algorithm 1's control flow literally instead.) A full active-VP group if
+/// enough cores are free (Theorem 1); otherwise every free core plus as many
+/// passive-VPs as needed (Theorem 4), or passive-VPs alone (Theorem 2) if no
+/// core is free at all. Passive-VPs are pulled greedily in the pool's order,
+/// the first useful one each time (the paper's own Sec. 6.2 choice).
 pub fn plan_heavy(
     config: &DagMetrics,
     cores_available: u16,
@@ -436,36 +456,21 @@ pub fn plan_heavy(
     }
 
     if cores_available == 0 {
-        return plan_with_passives_only(config, pool).map(|passive_indices| HeavyPlan {
-            cores_used: 0,
-            active_budgets: Vec::new(),
-            passive_indices,
-        });
+        return pull_passives_until_schedulable(config, PassiveTest::Theorem2, pool).map(
+            |passive_indices| HeavyPlan {
+                cores_used: 0,
+                active_budgets: Vec::new(),
+                passive_indices,
+            },
+        );
     }
 
     let active_budgets =
         partial_active_vp_budgets(config.critical_path, config.relative_deadline, cores_available);
-    let active_sum: u64 = active_budgets.iter().sum();
-
-    if mixed_schedulable(
-        config.volume,
-        config.critical_path,
-        config.relative_deadline,
-        active_sum,
-        &[],
-    ) {
-        return Ok(HeavyPlan {
-            cores_used: cores_available,
-            active_budgets,
-            passive_indices: Vec::new(),
-        });
-    }
-
+    let active_budget_sum: u64 = active_budgets.iter().sum();
     let passive_indices = pull_passives_until_schedulable(
-        config.volume,
-        config.critical_path,
-        config.relative_deadline,
-        active_sum,
+        config,
+        PassiveTest::Theorem4 { active_budget_sum },
         pool,
     )?;
 
@@ -476,29 +481,18 @@ pub fn plan_heavy(
     })
 }
 
-fn plan_with_passives_only(
-    config: &DagMetrics,
-    pool: &[PassiveVp],
-) -> Result<Vec<usize>, VFedError> {
-    pull_passives_until_schedulable(
-        config.volume,
-        config.critical_path,
-        config.relative_deadline,
-        0,
-        pool,
-    )
-}
-
-/// Greedily pull passive-VPs from `pool` (first useful one each time, by
-/// index order) until [`mixed_schedulable`] holds, or fail if the pool runs
-/// out of useful entries first.
+/// The paper's passive-VP `do ... while` loop (Algorithm 1 lines 14-17 /
+/// 22-25, Algorithm 2 lines 12-15): repeatedly move the first passive-VP in
+/// `pool` satisfying condition (18) into `Π` until `test` holds, failing if
+/// no useful passive-VP is left. At least one passive-VP is always taken
+/// before `test` is first evaluated, as in the paper's `do`-`while`.
 fn pull_passives_until_schedulable(
-    volume: u64,
-    critical_path: u64,
-    deadline: u64,
-    active_sum: u64,
+    config: &DagMetrics,
+    test: PassiveTest,
     pool: &[PassiveVp],
 ) -> Result<Vec<usize>, VFedError> {
+    let (volume, critical_path, deadline) =
+        (config.volume, config.critical_path, config.relative_deadline);
     let mut used = Vec::new();
     let mut used_mask = alloc::vec![false; pool.len()];
 
@@ -513,67 +507,130 @@ fn pull_passives_until_schedulable(
         used.push(idx);
 
         let chosen_refs: Vec<&PassiveVp> = used.iter().map(|&i| &pool[i]).collect();
-        if mixed_schedulable(volume, critical_path, deadline, active_sum, &chosen_refs) {
+        if test.holds(volume, critical_path, deadline, &chosen_refs) {
             return Ok(used);
         }
     }
 }
 
-/// Plan a light DAG (`C <= D`) purely from passive-VPs (Theorem 2). Returns
-/// [`VFedError::NoFeasibleAllocation`] if no combination of the current
-/// pool's entries can schedule it; the caller (`admit_light`/`admit_batch`)
-/// falls back to the partitioned-EDF path in that case.
+/// Plan a DAG purely from passive-VPs (Theorem 2, condition (12)) -- the
+/// light-task step of Algorithm 2 (lines 11-17). Returns
+/// [`VFedError::NoFeasibleAllocation`] if the current pool's useful
+/// entries can't make it schedulable; the caller then leaves it for the
+/// partitioned-EDF step.
 pub fn plan_light(config: &DagMetrics, pool: &[PassiveVp]) -> Result<Vec<usize>, VFedError> {
-    pull_passives_until_schedulable(
-        config.volume,
-        config.critical_path,
-        config.relative_deadline,
-        0,
-        pool,
-    )
+    pull_passives_until_schedulable(config, PassiveTest::Theorem2, pool)
 }
 
-/// Simulate `AllocH(mh)` (paper's Algorithm 1) for every heavy DAG in
-/// `heavy_sorted` (already sorted ascending by `D - L`, the paper's
-/// "laxity"), using at most `mh` cores in total. Runs entirely against a
-/// local passive-VP pool addressed by placeholder slot ids (not real cpu
-/// ids: only [`search_min_heavy_cores`]'s caller, once a working `mh` is
-/// found, claims real cores and substitutes them in). Returns `None` if
-/// some heavy DAG in the list cannot be scheduled within the `mh`-core
-/// budget even with passive-VP top-up.
+/// The paper's Algorithm 1, `AllocH(M_h)`, transcribed line by line for the
+/// heavy DAGs in `heavy_sorted` (already sorted ascending by `D - L`, as
+/// line 1 does) on `mh` processors (line 2). Runs against a local passive-VP pool `V`
+/// addressed by placeholder slot ids, not real cpu ids (only the caller
+/// that commits a plan substitutes real cores). Returns `None` where the
+/// paper returns `false`.
+///
+/// Every plan it returns must be replayed as "append this task's own
+/// complementary passive-VPs to `V`, *then* remove `passive_indices` from
+/// `V`": in the partial branch (lines 11-12) the new passive-VPs enter `V`
+/// before the search at line 15 runs, so its indices refer to that
+/// extended `V`. (For the other two kinds of plan one of the two steps is
+/// empty, so the same replay order is correct for them too.)
 fn try_alloc_heavy_within(heavy_sorted: &[DagMetrics], mh: u16) -> Option<(Vec<HeavyPlan>, Vec<PassiveVp>)> {
-    let mut cores_remaining = mh;
+    let mut processors_left = mh; // |P|
     let mut next_slot: usize = 0;
-    let mut pool: Vec<PassiveVp> = Vec::new();
+    let mut pool: Vec<PassiveVp> = Vec::new(); // V
     let mut plans = Vec::with_capacity(heavy_sorted.len());
 
-    for config in heavy_sorted {
-        let plan = plan_heavy(config, cores_remaining, &pool).ok()?;
-        cores_remaining = cores_remaining.checked_sub(plan.cores_used)?;
+    let mut tasks = heavy_sorted.iter();
 
-        take_indices(&mut pool, &plan.passive_indices);
-        let n = plan.active_budgets.len();
+    // Lines 4-18.
+    for config in tasks.by_ref() {
+        let m_i = config.min_dedicated_cores()?; // line 6, eq. (1)
+        let (budgets, active_budget_sum) = if m_i <= processors_left {
+            // Lines 8-9: full active-VP group, Theorem 1.
+            let budgets = full_active_vp_budgets(
+                config.volume,
+                config.critical_path,
+                config.relative_deadline,
+                m_i,
+            );
+            (budgets, None)
+        } else {
+            // Lines 11-12: an active-VP group on all |P| remaining
+            // processors -- possibly none at all, in which case Θ is empty
+            // and line 17's condition (13) degenerates to Σθ = 0.
+            let budgets = partial_active_vp_budgets(
+                config.critical_path,
+                config.relative_deadline,
+                processors_left,
+            );
+            let sum = budgets.iter().sum();
+            (budgets, Some(sum))
+        };
+
+        let n = budgets.len();
         pool.extend(generate_passive_vps(
-            &plan.active_budgets,
+            &budgets,
             next_slot..next_slot + n,
             config.period,
             config.relative_deadline,
             config.max_parallelism,
         ));
         next_slot += n;
+        // `n` <= `processors_left` in both branches.
+        processors_left -= n as u16;
 
-        plans.push(plan);
+        let Some(active_budget_sum) = active_budget_sum else {
+            plans.push(HeavyPlan {
+                cores_used: n as u16,
+                active_budgets: budgets,
+                passive_indices: Vec::new(),
+            });
+            continue;
+        };
+
+        // Lines 13-17.
+        let passive_indices = pull_passives_until_schedulable(
+            config,
+            PassiveTest::Theorem4 { active_budget_sum },
+            &pool,
+        )
+        .ok()?;
+        take_indices(&mut pool, &passive_indices);
+        plans.push(HeavyPlan {
+            cores_used: n as u16,
+            active_budgets: budgets,
+            passive_indices,
+        });
+        break; // Line 18: goto line 19.
+    }
+
+    // Lines 19-25: every remaining heavy DAG on passive-VPs only, Theorem 2.
+    for config in tasks {
+        let passive_indices =
+            pull_passives_until_schedulable(config, PassiveTest::Theorem2, &pool).ok()?;
+        take_indices(&mut pool, &passive_indices);
+        plans.push(HeavyPlan {
+            cores_used: 0,
+            active_budgets: Vec::new(),
+            passive_indices,
+        });
     }
 
     Some((plans, pool))
 }
 
 /// The outer search from the paper's Algorithm 2 (lines 3-6): try
-/// dedicating `1, 2, ..., max_cores` cores to heavy tasks as a whole,
-/// returning the *smallest* count that fits every heavy DAG in
-/// `heavy_sorted` (already sorted ascending by `D - L`), together with the
-/// resulting plans and leftover (still placeholder-addressed) passive-VP
-/// pool. `None` if no core count up to `max_cores` works.
+/// `M_h = 1, 2, ..., max_cores`, returning the *smallest* one for which
+/// `AllocH(M_h)` succeeds, together with the resulting plans and leftover
+/// (still placeholder-addressed) passive-VP pool. `None` if no `M_h` up to
+/// `max_cores` works (line 6).
+///
+/// One deliberate deviation: with no heavy DAG at all this returns
+/// `M_h = 0`. Read literally, line 3 starts at `M_h = 1` and `AllocH(1)`
+/// trivially succeeds on an empty queue, which would withhold one processor
+/// (hosting no VP of any kind) from the light tasks' `M_l = m - M_h` for no
+/// reason -- an artifact of the pseudo-code, not of the method.
 fn search_min_heavy_cores(
     heavy_sorted: &[DagMetrics],
     max_cores: u16,
@@ -586,29 +643,20 @@ fn search_min_heavy_cores(
     })
 }
 
-/// How the partitioned-EDF fallback ([`choose_partition`]) picks which
-/// already-open partition to add a light task to, when more than one has
-/// room. Pluggable so a caller can trade off packing tightness against load
-/// spread without touching the placement mechanism itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PackingStrategy {
-    /// The first open partition (in the order they were opened) with room.
-    FirstFit,
-    /// The open partition with the *least* remaining room that still fits
-    /// (packs tightly, minimizing wasted slack).
-    BestFit,
-    /// The open partition with the *most* remaining room (spreads load
-    /// across partitions instead of packing tightly).
-    WorstFit,
-}
+/// How a partitioned-EDF step picks among processors a light task fits on.
+/// Shared with Federated; see [`crate::dag_sched::partition`]. The batch
+/// path ([`plan_batch`]) uses it for the paper's `Partition(L, M_l)`
+/// (Algorithm 2 line 20, which specifies best-fit); the incremental
+/// [`admit_one`] path uses it for [`choose_partition`].
+pub use crate::dag_sched::partition::PackingStrategy;
 
-/// One partitioned-EDF core: a bare (non-active-VP) core hosting zero or
-/// more light DAGs scheduled together by ordinary single-core EDF, admitted
-/// as long as their combined density (`C/D`, scaled by
-/// [`resource::UTILIZATION_SCALE`]) stays within one core's capacity — the
-/// standard sufficient test for partitioned EDF (Baruah & Fisher, "The
-/// partitioned multiprocessor scheduling of sporadic task systems", the
-/// same reference the paper's own Sec 6.2/VII cites for this step).
+/// One partitioned-EDF core as the incremental [`admit_one`] path tracks
+/// it: a bare (non-active-VP) core hosting zero or more light DAGs
+/// scheduled together by ordinary single-core EDF, admitted as long as
+/// their combined density (`C/D`, scaled by [`resource::UTILIZATION_SCALE`])
+/// stays within one core's capacity -- a sufficient uniprocessor-EDF test
+/// that, unlike the batch path's DBF* test, doesn't require the tasks to
+/// arrive in deadline order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Partition {
     committed_density_scaled: u64,
@@ -849,44 +897,53 @@ fn take_indices(pool: &mut Vec<PassiveVp>, indices: &[usize]) -> Vec<PassiveVp> 
 /// A light DAG's dry-run outcome inside [`admit_batch`]'s simulation,
 /// before any real core is claimed.
 enum LightOutcome {
-    /// Indices into the simulated leftover passive-VP pool at the moment
-    /// this task was considered (pool entries shrink as earlier light
-    /// tasks in the same batch consume them, exactly as real sequential
-    /// admission would).
+    /// Placed on passive-VPs (Algorithm 2 lines 11-17): indices into the
+    /// (placeholder-addressed) pool at the moment this DAG was planned,
+    /// exactly as [`plan_light`] returned them.
     Passive(Vec<usize>),
-    /// Index into the batch's local, placeholder-addressed partition list.
+    /// Placed by `Partition(L, M_l)` (Algorithm 2 line 20): index of the
+    /// processor among the `M_l` partitioned-EDF processors.
     Partitioned(usize),
 }
 
 /// The full decision for a batch, computed against an explicit `max_cores`
-/// budget rather than the live `resource` ledger — everything
+/// budget rather than the live `resource` ledger -- everything
 /// [`admit_batch`] needs to commit, and everything [`is_batch_feasible`]
 /// needs to answer yes/no, with no shared/global state touched to produce
-/// it. Fields are placeholder-addressed (`sim_partitions`' indices, `pool`
-/// entries) exactly as the dry run that built them, not real cpu ids.
+/// it. Fields are placeholder-addressed (`bins`' indices, `pool` entries)
+/// exactly as the dry run that built them, not real cpu ids.
 struct BatchPlan {
     /// `configs`' heavy entries, `(original_index, config)`, sorted
-    /// ascending by laxity `D - L` (paper's Algorithm 1 order).
+    /// ascending by laxity `D - L` (Algorithm 2 line 1).
     heavy: Vec<(usize, DagMetrics)>,
     /// `configs`' light entries, `(original_index, config)`, sorted
-    /// descending by density `C/D`.
+    /// descending by density `C/D` (Algorithm 2 line 8).
     light: Vec<(usize, DagMetrics)>,
     mh: u16,
     heavy_plans: Vec<HeavyPlan>,
     /// One outcome per `light` entry, same order.
     outcomes: Vec<LightOutcome>,
-    sim_partitions: Vec<Partition>,
+    /// The `M_l` partitioned-EDF processors as `Partition` left them.
+    bins: Vec<partition::Bin>,
 }
 
 /// Compute the full batch decision for `configs` against `max_cores` free
-/// cores, matching the paper's `Allo_Both` (Algorithm 2): heavy DAGs tried
-/// in ascending `D - L` order against a search over `M_h`
-/// ([`search_min_heavy_cores`]), then light DAGs in descending `C/D` order
-/// against the leftover passive-VP pool, falling back to partitioned EDF
-/// (bin-packed by `packing`) for any that fit neither. Pure: touches only
-/// local state (`max_cores` is a parameter, not
+/// cores -- the paper's Algorithm 2 (`Allo_Both`):
+///
+/// 1. heavy DAGs (`C > D`) sorted ascending by `D - L` (line 1), then the
+///    smallest `M_h` for which Algorithm 1 succeeds (lines 3-6,
+///    [`search_min_heavy_cores`]);
+/// 2. light DAGs sorted descending by `C/D` (line 8), each tried on the
+///    passive-VPs left in `V` by Theorem 2 (lines 10-19);
+/// 3. every light DAG still left, partitioned onto the remaining
+///    `M_l = m - M_h` processors by best-fit partitioned EDF with the test
+///    of the paper's reference \[15\] (line 20; see
+///    [`crate::dag_sched::partition`]). `packing` selects the fit rule --
+///    the paper specifies [`PackingStrategy::BestFit`].
+///
+/// Pure: touches only local state (`max_cores` is a parameter, not
 /// [`resource::free_core_count`]), so a task set that doesn't fit leaves
-/// nothing to undo — the single source of truth for both [`admit_batch`]'s
+/// nothing to undo -- the single source of truth for both [`admit_batch`]'s
 /// commit and [`is_batch_feasible`]'s pure yes/no.
 fn plan_batch(
     configs: &[DagMetrics],
@@ -901,9 +958,8 @@ fn plan_batch(
             TaskClass::Light => light.push((i, config)),
         }
     }
-    // Ascending "laxity" D - L, as the paper's Algorithm 1 requires.
+
     heavy.sort_by_key(|(_, c)| c.relative_deadline - c.critical_path);
-    // Descending C/D, cross-multiplied to compare exactly without floats.
     light.sort_by(|(_, a), (_, b)| {
         (b.volume * a.relative_deadline).cmp(&(a.volume * b.relative_deadline))
     });
@@ -912,36 +968,39 @@ fn plan_batch(
     let (mh, heavy_plans, mut pool) =
         search_min_heavy_cores(&heavy_configs, max_cores).ok_or(VFedError::NoFeasibleAllocation)?;
 
-    // Dry run every light DAG against the simulated leftover pool and a
-    // fresh, local set of partitions (placeholder-indexed: index into
-    // `sim_partitions`, not a real cpu).
-    let mut sim_partitions: Vec<Partition> = Vec::new();
-    let mut outcomes: Vec<LightOutcome> = Vec::with_capacity(light.len());
-    for (_, config) in &light {
-        if let Ok(indices) = pull_passives_until_schedulable(
-            config.volume,
-            config.critical_path,
-            config.relative_deadline,
-            0,
-            &pool,
-        ) {
-            take_indices(&mut pool, &indices);
-            outcomes.push(LightOutcome::Passive(indices));
-            continue;
+    // Lines 10-19: passive-VPs first, for every light DAG in density order.
+    let mut outcomes: Vec<Option<LightOutcome>> = Vec::with_capacity(light.len());
+    let mut leftover: Vec<usize> = Vec::new(); // positions in `light`
+    for (pos, (_, config)) in light.iter().enumerate() {
+        match plan_light(config, &pool) {
+            Ok(indices) => {
+                take_indices(&mut pool, &indices);
+                outcomes.push(Some(LightOutcome::Passive(indices)));
+            }
+            Err(_) => {
+                outcomes.push(None);
+                leftover.push(pos);
+            }
         }
+    }
 
-        let density_scaled = resource::utilization_scaled(config.volume, config.relative_deadline);
-        if let Some(idx) = choose_partition(packing, &sim_partitions, density_scaled) {
-            sim_partitions[idx].committed_density_scaled += density_scaled;
-            outcomes.push(LightOutcome::Partitioned(idx));
-        } else if (sim_partitions.len() as u16) < max_cores - mh {
-            sim_partitions.push(Partition {
-                committed_density_scaled: density_scaled,
-            });
-            outcomes.push(LightOutcome::Partitioned(sim_partitions.len() - 1));
-        } else {
-            return Err(VFedError::NoFeasibleAllocation);
-        }
+    // Line 20: Partition(L, M_l).
+    let ml = max_cores - mh;
+    let seq: Vec<partition::SeqTask> = leftover
+        .iter()
+        .map(|&pos| {
+            let c = &light[pos].1;
+            partition::SeqTask {
+                volume: c.volume,
+                deadline: c.relative_deadline,
+                period: c.period,
+            }
+        })
+        .collect();
+    let (placement, bins) = partition::partition(&seq, ml, partition::Condition::Demand, packing)
+        .ok_or(VFedError::NoFeasibleAllocation)?;
+    for (&pos, &bin) in leftover.iter().zip(placement.iter()) {
+        outcomes[pos] = Some(LightOutcome::Partitioned(bin));
     }
 
     Ok(BatchPlan {
@@ -949,8 +1008,13 @@ fn plan_batch(
         light,
         mh,
         heavy_plans,
-        outcomes,
-        sim_partitions,
+        // Every entry is `Some` by now: each light DAG was either placed on
+        // passive-VPs above or is in `leftover`, which `partition` placed.
+        outcomes: outcomes
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or(VFedError::NoFeasibleAllocation)?,
+        bins,
     })
 }
 
@@ -982,7 +1046,7 @@ pub fn admit_batch(
         mh,
         heavy_plans,
         outcomes,
-        sim_partitions,
+        bins,
         ..
     } = plan_batch(configs, max_cores, packing)?;
 
@@ -1014,7 +1078,8 @@ pub fn admit_batch(
             crate::scheduler::active_vp::set_initial_budget(a.cpu, a.budget);
         }
 
-        let consumed = take_indices(&mut real_pool, &plan.passive_indices);
+        // Same replay order as `try_alloc_heavy_within` planned against:
+        // this DAG's own passive-VPs enter `V` first, then its `Π` leaves.
         real_pool.extend(generate_passive_vps(
             &plan.active_budgets,
             active.iter().map(|a| a.cpu),
@@ -1022,6 +1087,7 @@ pub fn admit_batch(
             config.relative_deadline,
             config.max_parallelism,
         ));
+        let consumed = take_indices(&mut real_pool, &plan.passive_indices);
 
         results.push((
             *orig_idx,
@@ -1066,7 +1132,14 @@ pub fn admit_batch(
         let mut node = MCSNode::new();
         let mut global_partitions = PARTITIONS.lock(&mut node);
         for (i, &cpu) in real_partition_cpus.iter().enumerate() {
-            global_partitions.push((cpu, sim_partitions[i]));
+            // The incremental `admit_one` path tracks a partition by its
+            // committed density only.
+            let committed_density_scaled = bins[i]
+                .tasks()
+                .iter()
+                .map(|t| resource::utilization_scaled(t.volume, t.deadline))
+                .sum();
+            global_partitions.push((cpu, Partition { committed_density_scaled }));
         }
     }
 
@@ -1566,6 +1639,35 @@ mod tests {
             7,
             PackingStrategy::FirstFit
         ));
+    }
+
+    /// Theorem 2's condition (12) keeps the `L_i` term that Theorem 4's
+    /// condition (13) replaces with `Σθ`: with one always-available
+    /// passive-VP (`sbf(D) = D`), (12) reads `C <= L + (D - L) = D`, while
+    /// (13) with an empty `Θ` reads `C <= D - L`.
+    #[test]
+    fn test_theorem2_keeps_critical_path_term() {
+        let free = PassiveVp {
+            cpu: 0,
+            kind: PassiveVpKind::AlwaysFree,
+        };
+        let (c, l, d) = (8, 4, 10);
+        assert!(PassiveTest::Theorem2.holds(c, l, d, &[&free]));
+        assert!(!PassiveTest::Theorem4 { active_budget_sum: 0 }.holds(c, l, d, &[&free]));
+    }
+
+    /// The paper's Sec. 6.2 walkthrough for tau3 (C=10, L=2, D=9) after the
+    /// `goto line 19`: "Theorem 2 is not satisfied, i.e., 8 > 5" with p3
+    /// alone (sbf(9) - 2 = 5), then satisfied with p3 and p4 (8 < 5 + 5) --
+    /// i.e. the paper evaluates (12) as `C - L <= Σ(sbf - L)`.
+    #[test]
+    fn test_theorem2_matches_paper_walkthrough_for_tau3() {
+        let tau1 = DagMetrics::from_static(12, 7, 10, 8);
+        let p3 = vp(3, 1, tau1.period, tau1.relative_deadline);
+        let p4 = vp(4, 1, tau1.period, tau1.relative_deadline);
+        assert_eq!(p3.sbf(9), 7);
+        assert!(!PassiveTest::Theorem2.holds(10, 2, 9, &[&p3]));
+        assert!(PassiveTest::Theorem2.holds(10, 2, 9, &[&p3, &p4]));
     }
 
     #[test]

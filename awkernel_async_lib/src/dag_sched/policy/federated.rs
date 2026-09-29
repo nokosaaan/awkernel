@@ -1,5 +1,38 @@
-//! Federated Scheduling admission policy (Li et al., RTSS 2014, generalized
-//! to constrained/arbitrary-deadline DAGs by Baruah) for DAG tasks.
+//! Federated scheduling admission for DAG tasks.
+//!
+//! # Paper-faithful batch admission ([`admit_batch`] / [`is_batch_feasible`])
+//!
+//! Three published algorithms, each defined for one class of task system,
+//! chosen per task set by [`FederatedVariant::for_task_set`]:
+//!
+//! | task set        | variant                                  | paper |
+//! |-----------------|------------------------------------------|-------|
+//! | all `D = T`     | [`FederatedVariant::LiImplicit`]         | Li et al., ECRTS 2014 |
+//! | all `D <= T`    | [`FederatedVariant::BaruahConstrained`]  | Baruah, DATE 2015 (`FEDCONS`) |
+//! | some `D > T`    | [`FederatedVariant::BaruahArbitrary`]    | Baruah, IPDPS 2015 (`FEDERATED`) |
+//!
+//! All three share one shape ([`plan_batch`]): each high-density DAG
+//! (`δ = C / min(D, T) >= 1`) gets `MINPROCS` processors for its exclusive
+//! use; the low-density DAGs are then partitioned, as sequential tasks,
+//! onto the processors left over (partitioned EDF, see
+//! [`crate::dag_sched::partition`]). What differs is `MINPROCS` (Li's
+//! closed form `ceil((C-L)/(D-L))`; Baruah's list-scheduling search for
+//! `D <= T` ([`list_schedule_makespan`]); IPDPS 2015's Lemma 1 for
+//! `D > T`) and the partitioning condition (IPDPS 2015 adds a utilization
+//! check; Li et al. instead admit the low-utilization tasks by
+//! `m_low >= 2 * Σ U_low`). The decision is all-or-nothing for the whole task set, like the
+//! papers' `return FAILURE`.
+//!
+//! # Legacy per-DAG admission ([`classify_dag`] / [`admit_dag`])
+//!
+//! The functions below predate the batch path and are **not** any of the
+//! three papers: they admit one DAG at a time, size heavy DAGs by
+//! `ceil((C-L)/(D-L))` regardless of deadline type, and put every light DAG
+//! on a shared global-EDF pool admitted by total density
+//! (`Σ C/min(D, T) <= free cores`), which is not a sufficient test for
+//! global EDF. [`classify_dag`] remains useful as a per-DAG feasibility
+//! prefilter (it rejects `D < L`). The notes that follow describe that
+//! legacy path.
 //!
 //! Federated Scheduling classifies a DAG by its *density* `C / min(D, T)`
 //! (volume over the shorter of relative deadline and period — see
@@ -41,9 +74,14 @@
 //! go through the exact same admission logic — neither path is a special
 //! case of the other.
 
+use alloc::vec::Vec;
+
+use awkernel_lib::cpu::CpuSet;
+
 use crate::{
     dag_sched::{
         metrics::{DagMetrics, MetricsSource},
+        partition::{self, Condition, PackingStrategy, SeqTask},
         provision::Provision,
         resource::{self, ResourceError},
     },
@@ -90,6 +128,14 @@ pub enum FederatedError {
     /// The shared core/utilization ledger could not satisfy this DAG's
     /// resource request; see [`ResourceError`].
     Resource(ResourceError),
+    /// The batch algorithm returned `FAILURE`: some high-density DAG needs
+    /// more processors than remain, or the low-density DAGs could not be
+    /// partitioned onto the processors left over.
+    NoFeasibleAllocation,
+    /// The requested [`FederatedVariant`] is not defined for this task set
+    /// (Li et al. needs every `D = T`; Baruah DATE 2015 needs every
+    /// `D <= T`).
+    VariantNotApplicable,
 }
 
 impl From<ResourceError> for FederatedError {
@@ -109,6 +155,12 @@ impl core::fmt::Display for FederatedError {
                 "relative_deadline({relative_deadline}) <= critical_path({critical_path}); no core count can meet this deadline"
             ),
             FederatedError::Resource(e) => write!(f, "{e}"),
+            FederatedError::NoFeasibleAllocation => {
+                write!(f, "federated batch admission failed (MINPROCS or PARTITION returned FAILURE)")
+            }
+            FederatedError::VariantNotApplicable => {
+                write!(f, "federated variant not defined for this task set's deadline type")
+            }
         }
     }
 }
@@ -190,6 +242,393 @@ pub fn admit_dag(config: DagMetrics) -> Result<FederatedAssignment, FederatedErr
             })
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Paper-faithful batch admission (three published variants)
+// ---------------------------------------------------------------------------
+
+/// A DAG's precedence structure, as Graham's list scheduling needs it
+/// (Baruah's `MINPROCS` for `D <= T`). Nodes are addressed `0..len()`; that
+/// index order is also the list-scheduling *priority list* (the papers
+/// leave the list order unspecified -- any fixed order gives a valid LS
+/// schedule; callers pass their node-id order).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DagGraph {
+    wcet: Vec<u64>,
+    successors: Vec<Vec<usize>>,
+    in_degree: Vec<usize>,
+}
+
+impl DagGraph {
+    /// `wcet[v]` is node `v`'s WCET; each `(u, v)` in `edges` means `u`
+    /// must finish before `v` starts. `None` if an edge names a node
+    /// outside `0..wcet.len()`.
+    pub fn new(wcet: Vec<u64>, edges: &[(usize, usize)]) -> Option<Self> {
+        let n = wcet.len();
+        let mut successors = alloc::vec![Vec::new(); n];
+        let mut in_degree = alloc::vec![0usize; n];
+        for &(u, v) in edges {
+            if u >= n || v >= n {
+                return None;
+            }
+            successors[u].push(v);
+            in_degree[v] += 1;
+        }
+        Some(Self {
+            wcet,
+            successors,
+            in_degree,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.wcet.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.wcet.is_empty()
+    }
+}
+
+/// Makespan of one dag-job under Graham's (non-preemptive) list scheduling
+/// on `processors` identical unit-speed processors, every node executing
+/// for exactly its WCET: whenever a processor is idle and some node is
+/// available (all predecessors finished), the available node earliest in
+/// the priority list starts on it. `None` if `processors == 0` or the graph
+/// has a cycle.
+pub fn list_schedule_makespan(graph: &DagGraph, processors: u16) -> Option<u64> {
+    if processors == 0 {
+        return None;
+    }
+    let mut remaining_preds = graph.in_degree.clone();
+    let mut ready: alloc::collections::BTreeSet<usize> =
+        (0..graph.len()).filter(|&v| remaining_preds[v] == 0).collect();
+    let mut running: Vec<(u64, usize)> = Vec::new(); // (finish time, node)
+    let mut free = processors as usize;
+    let mut now = 0u64;
+    let mut finished = 0usize;
+
+    loop {
+        while free > 0 {
+            let Some(v) = ready.pop_first() else { break };
+            running.push((now + graph.wcet[v], v));
+            free -= 1;
+        }
+        let Some(next) = running.iter().map(|&(f, _)| f).min() else {
+            break;
+        };
+        now = next;
+        let mut i = 0;
+        while i < running.len() {
+            if running[i].0 == now {
+                let (_, v) = running.swap_remove(i);
+                finished += 1;
+                free += 1;
+                for &s in &graph.successors[v] {
+                    remaining_preds[s] -= 1;
+                    if remaining_preds[s] == 0 {
+                        ready.insert(s);
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    (finished == graph.len()).then_some(now)
+}
+
+/// Which published federated-scheduling algorithm decides admission. Each
+/// is defined for one class of task system, so [`Self::for_task_set`]
+/// picks the one matching the task set's deadlines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FederatedVariant {
+    /// Li, Chen, Agrawal, Lu, Gill, Saifullah, "Analysis of federated and
+    /// global scheduling for parallel real-time tasks", ECRTS 2014 --
+    /// implicit deadlines (`D = T`). High-utilization tasks (`U_i >= 1`)
+    /// get `n_i = ceil((C_i - L_i)/(D_i - L_i))` dedicated processors; the
+    /// low-utilization tasks are admitted iff `m_low >= 2 * Σ U_low` on the
+    /// `m_low` processors left (Theorem 5.1 as restated in the Verucchi et
+    /// al. 2023 survey), then placed first-fit for run time.
+    LiImplicit,
+    /// Baruah, "The federated scheduling of constrained-deadline sporadic
+    /// DAG task systems", DATE 2015 (`FEDCONS`) -- constrained deadlines
+    /// (`D <= T`). `MINPROCS` = smallest `μ >= ceil(δ_i)` for which list
+    /// scheduling meets `D_i` (Fig. 3); low-density tasks by `PARTITION`
+    /// (Fig. 4: deadline-ordered first-fit, DBF* test).
+    BaruahConstrained,
+    /// Baruah, "Federated scheduling of sporadic DAG task systems", IPDPS
+    /// 2015 (`FEDERATED`) -- arbitrary deadlines. `MINPROCS` (Fig. 3) is list
+    /// scheduling for `D <= T` and Lemma 1's Condition 1 for `D > T`;
+    /// `PARTITION` (Fig. 4) adds the utilization condition.
+    BaruahArbitrary,
+}
+
+impl FederatedVariant {
+    /// Every `D = T` -> [`Self::LiImplicit`]; else every `D <= T` ->
+    /// [`Self::BaruahConstrained`]; else [`Self::BaruahArbitrary`].
+    pub fn for_task_set<'a>(configs: impl IntoIterator<Item = &'a DagMetrics>) -> Self {
+        let mut all_implicit = true;
+        let mut all_constrained = true;
+        for c in configs {
+            all_implicit &= c.relative_deadline == c.period;
+            all_constrained &= c.relative_deadline <= c.period;
+        }
+        if all_implicit {
+            FederatedVariant::LiImplicit
+        } else if all_constrained {
+            FederatedVariant::BaruahConstrained
+        } else {
+            FederatedVariant::BaruahArbitrary
+        }
+    }
+}
+
+/// One DAG as the batch admission sees it: its metrics plus, for
+/// list scheduling, its precedence structure.
+#[derive(Debug, Clone, Copy)]
+pub struct FedTask<'a> {
+    pub metrics: DagMetrics,
+    pub graph: &'a DagGraph,
+}
+
+/// Where one DAG of a batch goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FedPlan {
+    /// High-density: `cores` processors for its exclusive use.
+    Heavy { cores: u16 },
+    /// Low-density: partitioned onto shared processor `processor` (an index
+    /// among the batch's shared processors, not a cpu id).
+    Light { processor: usize },
+}
+
+/// The whole batch decision, in the input's order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FederatedBatchPlan {
+    pub variant: FederatedVariant,
+    pub plans: Vec<FedPlan>,
+    /// `Σ m_i` over the high-density tasks.
+    pub heavy_cores: u16,
+}
+
+/// `δ_i >= 1` with `δ_i = vol_i / min(D_i, T_i)` -- Baruah's high-density
+/// test (DATE/IPDPS 2015 Sec. II). For [`FederatedVariant::LiImplicit`]
+/// (`D = T`) this is Li et al.'s high-utilization test `u_i >= 1`, using
+/// the `>= 1` boundary as Baruah restates Li et al.'s terminology; a task
+/// with exactly `u_i = 1` needs one whole processor either way.
+fn is_high_density(c: &DagMetrics) -> bool {
+    c.volume >= density_window(c)
+}
+
+/// `MINPROCS(τ_i, m_r)` for `variant`: the number of processors to dedicate
+/// to high-density `task`, or `None` if it needs more than `m_r` (the
+/// papers' `∞`).
+fn min_procs(variant: FederatedVariant, task: &FedTask<'_>, m_r: u16) -> Option<u16> {
+    let c = &task.metrics;
+    let (vol, len, d, t) = (c.volume, c.critical_path, c.relative_deadline, c.period);
+    if len > d {
+        return None;
+    }
+
+    if variant == FederatedVariant::LiImplicit {
+        // Li et al.: n_i = ceil((C_i - L_i) / (D_i - L_i)).
+        let n = if d == len {
+            // No slack at all: only a purely sequential DAG (C = L) fits,
+            // on one processor.
+            (vol == len).then_some(1u64)?
+        } else {
+            (vol - len).div_ceil(d - len).max(1)
+        };
+        return u16::try_from(n).ok().filter(|&n| n <= m_r);
+    }
+
+    // Baruah (Fig. 3): for μ <- ceil(δ_i) to m_r.
+    let first = vol.div_ceil(density_window(c)).max(1);
+    let first = u16::try_from(first).ok()?;
+    if d <= t {
+        // Lines 2-4: list scheduling makespan <= D_i.
+        (first..=m_r).find(|&mu| list_schedule_makespan(task.graph, mu).is_some_and(|ms| ms <= d))
+    } else {
+        // Lines 7-8 (IPDPS only): Lemma 1's Condition 1,
+        // (D div T)·vol + min(μ·(D mod T), vol) <= μ·D - (μ-1)·len.
+        (first..=m_r).find(|&mu| {
+            let mu = mu as i128;
+            let (vol, len, d, t) = (vol as i128, len as i128, d as i128, t as i128);
+            let lhs = (d / t) * vol + (mu * (d % t)).min(vol);
+            let rhs = mu * d - (mu - 1) * len;
+            lhs <= rhs
+        })
+    }
+}
+
+/// Decide `tasks` as one task system on `m` processors under `variant`
+/// (`FEDERATED(τ, m)` / `FEDCONS(τ, m)`): every high-density task gets
+/// `MINPROCS` processors (in input order, `m_r` shrinking as it goes;
+/// `FAILURE` once one needs more than `m_r`), then every low-density task
+/// is partitioned onto the `m_r` processors left. Pure -- no resource
+/// ledger is touched.
+pub fn plan_batch(
+    tasks: &[FedTask<'_>],
+    m: u16,
+    variant: FederatedVariant,
+) -> Result<FederatedBatchPlan, FederatedError> {
+    let applicable = match variant {
+        FederatedVariant::LiImplicit => tasks
+            .iter()
+            .all(|t| t.metrics.relative_deadline == t.metrics.period),
+        FederatedVariant::BaruahConstrained => tasks
+            .iter()
+            .all(|t| t.metrics.relative_deadline <= t.metrics.period),
+        FederatedVariant::BaruahArbitrary => true,
+    };
+    if !applicable {
+        return Err(FederatedError::VariantNotApplicable);
+    }
+
+    let mut plans: Vec<Option<FedPlan>> = alloc::vec![None; tasks.len()];
+    let mut m_r = m;
+
+    for (i, task) in tasks.iter().enumerate() {
+        let c = &task.metrics;
+        if c.critical_path > c.relative_deadline {
+            return Err(FederatedError::Infeasible {
+                critical_path: c.critical_path,
+                relative_deadline: c.relative_deadline,
+            });
+        }
+        if !is_high_density(c) {
+            continue;
+        }
+        let m_i = min_procs(variant, task, m_r).ok_or(FederatedError::NoFeasibleAllocation)?;
+        m_r -= m_i;
+        plans[i] = Some(FedPlan::Heavy { cores: m_i });
+    }
+
+    let light: Vec<usize> = (0..tasks.len()).filter(|&i| plans[i].is_none()).collect();
+    let seq: Vec<SeqTask> = light
+        .iter()
+        .map(|&i| SeqTask {
+            volume: tasks[i].metrics.volume,
+            deadline: tasks[i].metrics.relative_deadline,
+            period: tasks[i].metrics.period,
+        })
+        .collect();
+    let condition = match variant {
+        FederatedVariant::LiImplicit => {
+            // Li et al. (ECRTS 2014) admit the low-utilization tasks by
+            // total utilization alone, `m_low >= 2 * Σ_{low} U_x` (as
+            // restated in Verucchi et al., RTS 2023, Theorem 5.1), and then
+            // allow "any multiprocessor scheduling algorithm" for them.
+            // That condition is the admission test here; the first-fit
+            // partition below only picks the run-time placement, and with
+            // every u_x < 1 it cannot fail once `Σ U <= m_low / 2` holds
+            // (first-fit EDF succeeds whenever `Σ U <= (m_low + 1) / 2`,
+            // López et al.'s bound for u_max <= 1).
+            const EPS: f64 = 1e-9;
+            let u_low: f64 = seq.iter().map(|t| t.volume as f64 / t.period as f64).sum();
+            if 2.0 * u_low > m_r as f64 + EPS {
+                return Err(FederatedError::NoFeasibleAllocation);
+            }
+            Condition::Demand
+        }
+        FederatedVariant::BaruahConstrained => Condition::Demand,
+        FederatedVariant::BaruahArbitrary => Condition::DemandAndUtilization,
+    };
+    let (placement, _) = partition::partition(&seq, m_r, condition, PackingStrategy::FirstFit)
+        .ok_or(FederatedError::NoFeasibleAllocation)?;
+    for (&i, &processor) in light.iter().zip(placement.iter()) {
+        plans[i] = Some(FedPlan::Light { processor });
+    }
+
+    Ok(FederatedBatchPlan {
+        variant,
+        plans: plans
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or(FederatedError::NoFeasibleAllocation)?,
+        heavy_cores: m - m_r,
+    })
+}
+
+/// Pure yes/no: would `tasks` be accepted on `m` processors under the
+/// variant matching its deadlines ([`FederatedVariant::for_task_set`])?
+pub fn is_batch_feasible(tasks: &[FedTask<'_>], m: u16) -> bool {
+    let variant = FederatedVariant::for_task_set(tasks.iter().map(|t| &t.metrics));
+    plan_batch(tasks, m, variant).is_ok()
+}
+
+/// Admit `tasks` as one all-or-nothing batch against the cores currently
+/// free in [`resource`], under the variant matching its deadlines. Only
+/// once the whole plan fits are real cores claimed: one exclusive cluster
+/// per high-density DAG, and one core per shared processor that received
+/// at least one low-density DAG.
+///
+/// Run-time mapping: a high-density DAG runs EDF restricted to its own
+/// cluster ([`SchedulerType::ClusteredEDF`]), a low-density DAG
+/// uniprocessor EDF on its partition's single core (the same scheduler on a
+/// one-core set). For Li et al. and for IPDPS 2015's `D > T` case that is
+/// the papers' own run-time rule (any greedy scheduler / EDF). For
+/// `D <= T` under Baruah's algorithms the papers instead replay the
+/// list-scheduling template `σ_i` as a lookup table (DATE 2015 Sec. IV-A),
+/// which this kernel does not implement -- the *admission* decision is
+/// the paper's, the high-density dispatch is not.
+///
+/// Returns the variant used and one [`FederatedAssignment`] per input, in
+/// order.
+pub fn admit_batch(
+    tasks: &[FedTask<'_>],
+) -> Result<(FederatedVariant, Vec<FederatedAssignment>), FederatedError> {
+    let m = resource::free_core_count();
+    let variant = FederatedVariant::for_task_set(tasks.iter().map(|t| &t.metrics));
+    let plan = plan_batch(tasks, m, variant)?;
+
+    let mut shared_cpus: Vec<Option<usize>> = Vec::new();
+    let mut out = Vec::with_capacity(tasks.len());
+    for (task, fed_plan) in tasks.iter().zip(plan.plans.iter()) {
+        let c = &task.metrics;
+        let (class, provision) = match *fed_plan {
+            FedPlan::Heavy { cores } => (
+                TaskClass::Heavy {
+                    required_cores: cores,
+                },
+                Provision::Dedicated {
+                    cores: resource::allocate_cluster(cores)?,
+                },
+            ),
+            FedPlan::Light { processor } => {
+                if shared_cpus.len() <= processor {
+                    shared_cpus.resize(processor + 1, None);
+                }
+                let cpu = match shared_cpus[processor] {
+                    Some(cpu) => cpu,
+                    None => {
+                        let cpu = resource::allocate_cluster(1)?
+                            .iter()
+                            .next()
+                            .ok_or(FederatedError::NoFeasibleAllocation)?;
+                        shared_cpus[processor] = Some(cpu);
+                        cpu
+                    }
+                };
+                (
+                    TaskClass::Light,
+                    Provision::Partitioned {
+                        cpu: CpuSet::empty().with(cpu),
+                    },
+                )
+            }
+        };
+        out.push(FederatedAssignment {
+            class,
+            scheduler_type: provision.into_scheduler_type(c.relative_deadline),
+            provision,
+            source: c.source,
+        });
+    }
+
+    Ok((variant, out))
 }
 
 #[cfg(test)]
@@ -396,5 +835,202 @@ mod tests {
         resource::release_light_utilization(50, 100);
 
         resource::release_cluster(heavy_big);
+    }
+
+    // ----- batch admission (Li / DATE 2015 / IPDPS 2015) -----
+
+    /// DATE 2015's Fig. 1 task: WCETs 1 and 2 feeding a 2, which fans out
+    /// to 1, 1 and 2 (len = 6, vol = 9).
+    fn date15_fig1_graph() -> DagGraph {
+        DagGraph::new(
+            alloc::vec![1, 2, 2, 1, 1, 2],
+            &[(0, 2), (1, 2), (2, 3), (2, 4), (2, 5)],
+        )
+        .unwrap()
+    }
+
+    fn chain(wcets: &[u64]) -> DagGraph {
+        let edges: Vec<(usize, usize)> = (1..wcets.len()).map(|i| (i - 1, i)).collect();
+        DagGraph::new(wcets.to_vec(), &edges).unwrap()
+    }
+
+    /// `k` independent nodes of WCET `w` (a fully parallel DAG).
+    fn parallel(k: usize, w: u64) -> DagGraph {
+        DagGraph::new(alloc::vec![w; k], &[]).unwrap()
+    }
+
+    #[test]
+    fn test_list_schedule_makespan_date15_fig1() {
+        let g = date15_fig1_graph();
+        assert_eq!(list_schedule_makespan(&g, 1), Some(9)); // = vol
+        // 2 procs: {0,1} -> 2 starts at 2, ends 4 -> {3,4} 4..5 -> 5 5..7.
+        assert_eq!(list_schedule_makespan(&g, 2), Some(7));
+        assert_eq!(list_schedule_makespan(&g, 3), Some(6)); // = len
+        assert_eq!(list_schedule_makespan(&g, 0), None);
+    }
+
+    #[test]
+    fn test_list_schedule_makespan_rejects_cycle() {
+        let g = DagGraph::new(alloc::vec![1, 1], &[(0, 1), (1, 0)]).unwrap();
+        assert_eq!(list_schedule_makespan(&g, 2), None);
+    }
+
+    #[test]
+    fn test_variant_for_task_set() {
+        let implicit = DagMetrics::from_static(10, 5, 20, 20);
+        let constrained = DagMetrics::from_static(10, 5, 20, 15);
+        let arbitrary = DagMetrics::from_static(10, 5, 20, 30);
+        assert_eq!(
+            FederatedVariant::for_task_set([&implicit, &implicit]),
+            FederatedVariant::LiImplicit
+        );
+        assert_eq!(
+            FederatedVariant::for_task_set([&implicit, &constrained]),
+            FederatedVariant::BaruahConstrained
+        );
+        assert_eq!(
+            FederatedVariant::for_task_set([&constrained, &arbitrary]),
+            FederatedVariant::BaruahArbitrary
+        );
+    }
+
+    #[test]
+    fn test_li_uses_closed_form_core_count() {
+        // C=100, L=20, D=T=50: n = ceil(80/30) = 3.
+        let g = parallel(1, 1); // structure unused by Li et al.
+        let task = FedTask {
+            metrics: DagMetrics::from_static(100, 20, 50, 50),
+            graph: &g,
+        };
+        assert_eq!(min_procs(FederatedVariant::LiImplicit, &task, 16), Some(3));
+        assert_eq!(min_procs(FederatedVariant::LiImplicit, &task, 2), None);
+    }
+
+    #[test]
+    fn test_baruah_constrained_minprocs_is_list_scheduling() {
+        // 4 parallel nodes of 10, D = 20 <= T = 100: δ = 40/20 = 2, and LS
+        // on 2 processors finishes at 20 <= D, so μ = 2 -- where Li's
+        // closed form would give ceil((40-10)/(20-10)) = 3.
+        let g = parallel(4, 10);
+        let task = FedTask {
+            metrics: DagMetrics::from_static(40, 10, 100, 20),
+            graph: &g,
+        };
+        assert_eq!(min_procs(FederatedVariant::BaruahConstrained, &task, 16), Some(2));
+        assert_eq!(min_procs(FederatedVariant::BaruahConstrained, &task, 1), None);
+    }
+
+    #[test]
+    fn test_baruah_arbitrary_condition1() {
+        // D=25 > T=10, vol=30, len=5, δ = 30/10 = 3.
+        // μ=3: 2·30 + min(3·5, 30) = 75 > 3·25 - 2·5 = 65.
+        // μ=4: 2·30 + min(4·5, 30) = 80 <= 4·25 - 3·5 = 85.
+        let g = chain(&[5]);
+        let task = FedTask {
+            metrics: DagMetrics::from_static(30, 5, 10, 25),
+            graph: &g,
+        };
+        assert_eq!(min_procs(FederatedVariant::BaruahArbitrary, &task, 16), Some(4));
+        assert_eq!(min_procs(FederatedVariant::BaruahArbitrary, &task, 3), None);
+    }
+
+    #[test]
+    fn test_plan_batch_partitions_low_density_tasks() {
+        let g = chain(&[3]);
+        // Three low-density implicit tasks, u = 0.3, 0.4, 0.5: first-fit
+        // puts 0.3+0.4 on processor 0 and 0.5 on processor 1.
+        let tasks: Vec<FedTask<'_>> = [3u64, 4, 5]
+            .iter()
+            .map(|&c| FedTask {
+                metrics: DagMetrics::from_static(c, 1, 10, 10),
+                graph: &g,
+            })
+            .collect();
+        let plan = plan_batch(&tasks, 2, FederatedVariant::BaruahConstrained).unwrap();
+        assert_eq!(
+            plan.plans,
+            alloc::vec![
+                FedPlan::Light { processor: 0 },
+                FedPlan::Light { processor: 0 },
+                FedPlan::Light { processor: 1 },
+            ]
+        );
+        assert!(plan_batch(&tasks, 1, FederatedVariant::BaruahConstrained).is_err());
+    }
+
+    #[test]
+    fn test_li_admits_low_utilization_tasks_by_twice_total_utilization() {
+        // Same three tasks, Σ U = 1.2: a first-fit partition fits them on 2
+        // processors, but Li et al.'s condition needs m_low >= 2 * 1.2 = 2.4.
+        let g = chain(&[3]);
+        let tasks: Vec<FedTask<'_>> = [3u64, 4, 5]
+            .iter()
+            .map(|&c| FedTask {
+                metrics: DagMetrics::from_static(c, 1, 10, 10),
+                graph: &g,
+            })
+            .collect();
+        assert!(plan_batch(&tasks, 2, FederatedVariant::LiImplicit).is_err());
+        assert!(plan_batch(&tasks, 3, FederatedVariant::LiImplicit).is_ok());
+    }
+
+    #[test]
+    fn test_plan_batch_heavy_then_light_on_remaining() {
+        let heavy_g = parallel(4, 10);
+        let light_g = chain(&[5]);
+        let tasks = [
+            FedTask {
+                metrics: DagMetrics::from_static(40, 10, 100, 20), // μ = 2
+                graph: &heavy_g,
+            },
+            FedTask {
+                metrics: DagMetrics::from_static(5, 5, 100, 50),
+                graph: &light_g,
+            },
+        ];
+        let plan = plan_batch(&tasks, 3, FederatedVariant::BaruahConstrained).unwrap();
+        assert_eq!(plan.plans[0], FedPlan::Heavy { cores: 2 });
+        assert_eq!(plan.plans[1], FedPlan::Light { processor: 0 });
+        assert_eq!(plan.heavy_cores, 2);
+        // Only 2 processors: the heavy task takes both, nothing left.
+        assert!(plan_batch(&tasks, 2, FederatedVariant::BaruahConstrained).is_err());
+    }
+
+    #[test]
+    fn test_plan_batch_rejects_variant_outside_its_deadline_class() {
+        let g = chain(&[5]);
+        let constrained = [FedTask {
+            metrics: DagMetrics::from_static(5, 5, 100, 50),
+            graph: &g,
+        }];
+        let arbitrary = [FedTask {
+            metrics: DagMetrics::from_static(5, 5, 100, 150),
+            graph: &g,
+        }];
+        assert_eq!(
+            plan_batch(&constrained, 4, FederatedVariant::LiImplicit),
+            Err(FederatedError::VariantNotApplicable)
+        );
+        assert_eq!(
+            plan_batch(&arbitrary, 4, FederatedVariant::BaruahConstrained),
+            Err(FederatedError::VariantNotApplicable)
+        );
+        assert!(plan_batch(&arbitrary, 4, FederatedVariant::BaruahArbitrary).is_ok());
+    }
+
+    #[test]
+    fn test_plan_batch_rejects_critical_path_past_deadline() {
+        let g = chain(&[30]);
+        let tasks = [FedTask {
+            metrics: DagMetrics::from_static(30, 30, 100, 20),
+            graph: &g,
+        }];
+        assert_eq!(
+            plan_batch(&tasks, 4, FederatedVariant::BaruahConstrained),
+            Err(FederatedError::Infeasible {
+                critical_path: 30,
+                relative_deadline: 20,
+            })
+        );
     }
 }

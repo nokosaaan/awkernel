@@ -23,6 +23,7 @@
 //!   measurement probe, not a scheduling mechanism; see its own module doc.
 pub mod dp_partition;
 pub mod metrics;
+pub mod partition;
 pub mod policy;
 pub mod provision;
 pub mod resource;

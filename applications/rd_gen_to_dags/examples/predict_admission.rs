@@ -9,10 +9,10 @@
 //!
 //! Prints each DAG's own classification under both policies, then whether
 //! the whole set (all of it, exactly as given — no resampling) is jointly
-//! admittable under each, mirroring `dag_sched::policy::federated`'s and
-//! `dag_sched::policy::vfed`'s own real batch semantics but as pure
-//! functions of the parsed `DagMetrics` (see `acceptance_ratio.rs`'s own
-//! doc for why: no `resource`/`PASSIVE_POOL` ledger side effects).
+//! admittable under each -- the same pure batch decisions the kernel's own
+//! `federated::admit_batch` / `vfed::admit_batch` make at boot
+//! (`federated::is_batch_feasible`, `vfed::is_batch_feasible` with
+//! best-fit), with no `resource`/`PASSIVE_POOL` ledger side effects.
 //!
 //! Usage: `predict_admission <dag_dir> <num_cores>`
 
@@ -21,7 +21,7 @@ use std::{env, fs, process::ExitCode};
 use awkernel_async_lib::dag_sched::{
     metrics::DagMetrics,
     policy::{
-        federated::{self, TaskClass as FedTaskClass},
+        federated::{self, DagGraph, FedTask, FederatedVariant},
         vfed::{self, PackingStrategy},
     },
 };
@@ -40,7 +40,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let configs = match load_configs(dag_dir) {
+    let (configs, graphs) = match load_configs(dag_dir) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{e}");
@@ -58,10 +58,20 @@ fn main() -> ExitCode {
         );
     }
 
-    let fed_ok = federated_batch_feasible(&configs, num_cores);
-    let vfed_ok = vfed::is_batch_feasible(&configs, num_cores, PackingStrategy::FirstFit);
+    let fed_tasks: Vec<FedTask<'_>> = configs
+        .iter()
+        .zip(graphs.iter())
+        .map(|(&metrics, graph)| FedTask { metrics, graph })
+        .collect();
+    let fed_variant = FederatedVariant::for_task_set(configs.iter());
+    let fed_ok = federated::is_batch_feasible(&fed_tasks, num_cores);
+    let vfed_ok = vfed::is_batch_feasible(&configs, num_cores, PackingStrategy::BestFit);
     println!();
-    println!("PREDICTION federated={} vfed={}", verdict(fed_ok), verdict(vfed_ok));
+    println!(
+        "PREDICTION federated={} ({fed_variant:?}) vfed={}",
+        verdict(fed_ok),
+        verdict(vfed_ok)
+    );
 
     ExitCode::SUCCESS
 }
@@ -74,7 +84,7 @@ fn verdict(ok: bool) -> &'static str {
     }
 }
 
-fn load_configs(dag_dir: &str) -> Result<Vec<DagMetrics>, String> {
+fn load_configs(dag_dir: &str) -> Result<(Vec<DagMetrics>, Vec<DagGraph>), String> {
     let mut yaml_paths: Vec<_> = fs::read_dir(dag_dir)
         .map_err(|e| format!("cannot read directory '{dag_dir}': {e}"))?
         .filter_map(|entry| entry.ok().map(|e| e.path()))
@@ -97,32 +107,9 @@ fn load_configs(dag_dir: &str) -> Result<Vec<DagMetrics>, String> {
         .collect::<Result<_, _>>()?;
     let yaml_refs: Vec<&str> = yaml_contents.iter().map(String::as_str).collect();
 
-    rd_gen_to_dags::dag_metrics_from_yaml(&yaml_refs)
-        .map_err(|e| format!("failed to parse DAG set in '{dag_dir}': {e}"))
-}
-
-/// Verbatim copy of `acceptance_ratio.rs`'s own pure Federated batch check
-/// (see that file for why it's reimplemented rather than calling the real
-/// `resource`-ledger-backed `federated::admit_dag`).
-fn federated_batch_feasible(configs: &[DagMetrics], num_cores: u16) -> bool {
-    let mut heavy_cores: u32 = 0;
-    let mut light_utilization: f64 = 0.0;
-
-    for &config in configs {
-        match federated::classify_dag(&config) {
-            Ok(FedTaskClass::Heavy { required_cores }) => {
-                heavy_cores += required_cores as u32;
-            }
-            Ok(FedTaskClass::Light) => {
-                let window = config.relative_deadline.min(config.period) as f64;
-                light_utilization += config.volume as f64 / window;
-            }
-            Err(_) => return false,
-        }
-    }
-
-    if heavy_cores > num_cores as u32 {
-        return false;
-    }
-    light_utilization <= (num_cores as u32 - heavy_cores) as f64
+    let configs = rd_gen_to_dags::dag_metrics_from_yaml(&yaml_refs)
+        .map_err(|e| format!("failed to parse DAG set in '{dag_dir}': {e}"))?;
+    let graphs = rd_gen_to_dags::dag_graphs_from_yaml(&yaml_refs)
+        .map_err(|e| format!("failed to parse DAG set in '{dag_dir}': {e}"))?;
+    Ok((configs, graphs))
 }

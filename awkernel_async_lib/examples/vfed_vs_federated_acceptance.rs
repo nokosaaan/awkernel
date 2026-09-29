@@ -169,6 +169,9 @@ fn federated_batch_feasible(configs: &[DagMetrics]) -> bool {
     for (provision, config) in committed {
         match provision {
             Provision::Dedicated { cores } => resource::release_cluster(cores),
+            // Only `federated::admit_batch` produces this; `admit_dag` above
+            // never does.
+            Provision::Partitioned { cpu } => resource::release_cluster(cpu),
             Provision::Shared { .. } => {
                 let window = config.relative_deadline.min(config.period);
                 resource::release_light_utilization(config.volume, window);
