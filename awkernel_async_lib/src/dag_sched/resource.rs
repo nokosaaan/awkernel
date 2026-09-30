@@ -226,7 +226,7 @@ pub fn release_light_utilization(volume: u64, window: u64) {
 }
 
 /// DAG-Fluid's counterpart to [`reserve_light_utilization`]: commit
-/// `required_capacity` (a [`crate`]-external `dag_fluid::required_capacity`
+/// `required_capacity` (a [`crate::dag_sched::policy::dag_fluid::required_capacity`]
 /// value — already denominated in core-units, e.g. `1.5` means "one and a
 /// half cores' worth", not a `0..1` ratio) against the same shared pool
 /// Federated's light tasks would otherwise use. Mutually exclusive with

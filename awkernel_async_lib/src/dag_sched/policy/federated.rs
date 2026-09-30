@@ -80,10 +80,13 @@ use awkernel_lib::cpu::CpuSet;
 
 use crate::{
     dag_sched::{
+        admission::AdmissionError,
+        graph::DagGraph,
         metrics::{DagMetrics, MetricsSource},
         partition::{self, Condition, PackingStrategy, SeqTask},
+        precondition::{self, Check, Policy},
         provision::Provision,
-        resource::{self, ResourceError},
+        resource,
     },
     scheduler::SchedulerType,
 };
@@ -110,61 +113,6 @@ pub struct FederatedAssignment {
     pub source: MetricsSource,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FederatedError {
-    /// `relative_deadline < critical_path` (traversing the critical path
-    /// alone already exceeds the deadline, so no core count can help), or
-    /// `relative_deadline == critical_path` with exploitable parallelism
-    /// (`volume > critical_path`, i.e. Heavy): the implicit-deadline
-    /// boundary `D == L` is only feasible when `volume == critical_path`
-    /// (a purely sequential DAG needs exactly one core to run its own
-    /// critical path in `D == L` time; see [`classify_dag`]'s `is_heavy`
-    /// check, which lets that case through as Light), never when there is
-    /// other work to also finish in a now-zero slack window.
-    Infeasible {
-        critical_path: u64,
-        relative_deadline: u64,
-    },
-    /// The shared core/utilization ledger could not satisfy this DAG's
-    /// resource request; see [`ResourceError`].
-    Resource(ResourceError),
-    /// The batch algorithm returned `FAILURE`: some high-density DAG needs
-    /// more processors than remain, or the low-density DAGs could not be
-    /// partitioned onto the processors left over.
-    NoFeasibleAllocation,
-    /// The requested [`FederatedVariant`] is not defined for this task set
-    /// (Li et al. needs every `D = T`; Baruah DATE 2015 needs every
-    /// `D <= T`).
-    VariantNotApplicable,
-}
-
-impl From<ResourceError> for FederatedError {
-    fn from(e: ResourceError) -> Self {
-        FederatedError::Resource(e)
-    }
-}
-
-impl core::fmt::Display for FederatedError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            FederatedError::Infeasible {
-                critical_path,
-                relative_deadline,
-            } => write!(
-                f,
-                "relative_deadline({relative_deadline}) <= critical_path({critical_path}); no core count can meet this deadline"
-            ),
-            FederatedError::Resource(e) => write!(f, "{e}"),
-            FederatedError::NoFeasibleAllocation => {
-                write!(f, "federated batch admission failed (MINPROCS or PARTITION returned FAILURE)")
-            }
-            FederatedError::VariantNotApplicable => {
-                write!(f, "federated variant not defined for this task set's deadline type")
-            }
-        }
-    }
-}
-
 /// `density = C / window`: a DAG is heavy iff its WCET volume exceeds
 /// `window`, which the caller has already narrowed to `min(D, T)` (see
 /// [`density_window`]) so this reduces to the classical `u = C/T` test for
@@ -186,24 +134,22 @@ const fn density_window(config: &DagMetrics) -> u64 {
 
 /// Classify a DAG and, if heavy, compute its required core count. Does not
 /// claim any cores; see [`resource::allocate_cluster`] / [`admit_dag`] for
-/// that.
-pub fn classify_dag(config: &DagMetrics) -> Result<TaskClass, FederatedError> {
-    if config.relative_deadline < config.critical_path {
-        return Err(FederatedError::Infeasible {
-            critical_path: config.critical_path,
-            relative_deadline: config.relative_deadline,
-        });
-    }
+/// that. This legacy per-DAG path uses Li et al.'s core count for any
+/// deadline model, so it applies Li's timing preconditions except the
+/// implicit-deadline one ([`Check::CriticalPathWithinDeadline`],
+/// [`Check::SlackForParallelWork`]); a precondition error reports DAG 0
+/// (see [`AdmissionError::with_dag_id`]).
+pub fn classify_dag(config: &DagMetrics) -> Result<TaskClass, AdmissionError> {
+    Check::CriticalPathWithinDeadline.verify(0, config)?;
+    Check::SlackForParallelWork.verify(0, config)?;
 
     if !is_heavy(config.volume, density_window(config)) {
         return Ok(TaskClass::Light);
     }
 
+    // `None` here only on a core count beyond `u16`.
     let Some(required_cores) = config.min_dedicated_cores() else {
-        return Err(FederatedError::Infeasible {
-            critical_path: config.critical_path,
-            relative_deadline: config.relative_deadline,
-        });
+        return Err(AdmissionError::NoFeasibleAllocation);
     };
 
     Ok(TaskClass::Heavy { required_cores })
@@ -218,7 +164,7 @@ pub fn classify_dag(config: &DagMetrics) -> Result<TaskClass, FederatedError> {
 ///   none of this test bed's DAGs currently are).
 /// - Light: commits its utilization against the shared ledger (release it
 ///   with [`resource::release_light_utilization`] likewise).
-pub fn admit_dag(config: DagMetrics) -> Result<FederatedAssignment, FederatedError> {
+pub fn admit_dag(config: DagMetrics) -> Result<FederatedAssignment, AdmissionError> {
     match classify_dag(&config)? {
         TaskClass::Light => {
             let utilization_scaled =
@@ -248,64 +194,6 @@ pub fn admit_dag(config: DagMetrics) -> Result<FederatedAssignment, FederatedErr
 // Paper-faithful batch admission (three published variants)
 // ---------------------------------------------------------------------------
 
-/// A DAG's precedence structure, as Graham's list scheduling needs it
-/// (Baruah's `MINPROCS` for `D <= T`). Nodes are addressed `0..len()`; that
-/// index order is also the list-scheduling *priority list* (the papers
-/// leave the list order unspecified -- any fixed order gives a valid LS
-/// schedule; callers pass their node-id order).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DagGraph {
-    wcet: Vec<u64>,
-    successors: Vec<Vec<usize>>,
-    in_degree: Vec<usize>,
-}
-
-impl DagGraph {
-    /// `wcet[v]` is node `v`'s WCET; each `(u, v)` in `edges` means `u`
-    /// must finish before `v` starts. `None` if an edge names a node
-    /// outside `0..wcet.len()`.
-    pub fn new(wcet: Vec<u64>, edges: &[(usize, usize)]) -> Option<Self> {
-        let n = wcet.len();
-        let mut successors = alloc::vec![Vec::new(); n];
-        let mut in_degree = alloc::vec![0usize; n];
-        for &(u, v) in edges {
-            if u >= n || v >= n {
-                return None;
-            }
-            successors[u].push(v);
-            in_degree[v] += 1;
-        }
-        Some(Self {
-            wcet,
-            successors,
-            in_degree,
-        })
-    }
-
-    pub fn len(&self) -> usize {
-        self.wcet.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.wcet.is_empty()
-    }
-
-    /// Node `v`'s WCET.
-    pub fn wcet(&self, v: usize) -> u64 {
-        self.wcet[v]
-    }
-
-    /// Node `v`'s immediate successors, in edge-insertion order.
-    pub fn successors(&self, v: usize) -> &[usize] {
-        &self.successors[v]
-    }
-
-    /// Number of immediate predecessors of node `v`.
-    pub fn in_degree(&self, v: usize) -> usize {
-        self.in_degree[v]
-    }
-}
-
 /// Makespan of one dag-job under Graham's (non-preemptive) list scheduling
 /// on `processors` identical unit-speed processors, every node executing
 /// for exactly its WCET: whenever a processor is idle and some node is
@@ -316,7 +204,7 @@ pub fn list_schedule_makespan(graph: &DagGraph, processors: u16) -> Option<u64> 
     if processors == 0 {
         return None;
     }
-    let mut remaining_preds = graph.in_degree.clone();
+    let mut remaining_preds: Vec<usize> = (0..graph.len()).map(|v| graph.in_degree(v)).collect();
     let mut ready: alloc::collections::BTreeSet<usize> = (0..graph.len())
         .filter(|&v| remaining_preds[v] == 0)
         .collect();
@@ -328,7 +216,7 @@ pub fn list_schedule_makespan(graph: &DagGraph, processors: u16) -> Option<u64> 
     loop {
         while free > 0 {
             let Some(v) = ready.pop_first() else { break };
-            running.push((now + graph.wcet[v], v));
+            running.push((now + graph.wcet(v), v));
             free -= 1;
         }
         let Some(next) = running.iter().map(|&(f, _)| f).min() else {
@@ -341,7 +229,7 @@ pub fn list_schedule_makespan(graph: &DagGraph, processors: u16) -> Option<u64> 
                 let (_, v) = running.swap_remove(i);
                 finished += 1;
                 free += 1;
-                for &s in &graph.successors[v] {
+                for &s in graph.successors(v) {
                     remaining_preds[s] -= 1;
                     if remaining_preds[s] == 0 {
                         ready.insert(s);
@@ -489,35 +377,21 @@ pub fn plan_batch(
     tasks: &[FedTask<'_>],
     m: u16,
     variant: FederatedVariant,
-) -> Result<FederatedBatchPlan, FederatedError> {
-    let applicable = match variant {
-        FederatedVariant::LiImplicit => tasks
-            .iter()
-            .all(|t| t.metrics.relative_deadline == t.metrics.period),
-        FederatedVariant::BaruahConstrained => tasks
-            .iter()
-            .all(|t| t.metrics.relative_deadline <= t.metrics.period),
-        FederatedVariant::BaruahArbitrary => true,
-    };
-    if !applicable {
-        return Err(FederatedError::VariantNotApplicable);
-    }
+) -> Result<FederatedBatchPlan, AdmissionError> {
+    // The variant's preconditions (deadline model, `L <= D`, and for Li
+    // `D > L` whenever there is parallel work), each DAG reported by its
+    // position in `tasks`.
+    precondition::check_all(Policy::Federated(variant), tasks.iter().map(|t| &t.metrics))?;
 
     let mut plans: Vec<Option<FedPlan>> = alloc::vec![None; tasks.len()];
     let mut m_r = m;
 
     for (i, task) in tasks.iter().enumerate() {
         let c = &task.metrics;
-        if c.critical_path > c.relative_deadline {
-            return Err(FederatedError::Infeasible {
-                critical_path: c.critical_path,
-                relative_deadline: c.relative_deadline,
-            });
-        }
         if !is_high_density(c) {
             continue;
         }
-        let m_i = min_procs(variant, task, m_r).ok_or(FederatedError::NoFeasibleAllocation)?;
+        let m_i = min_procs(variant, task, m_r).ok_or(AdmissionError::NoFeasibleAllocation)?;
         m_r -= m_i;
         plans[i] = Some(FedPlan::Heavy { cores: m_i });
     }
@@ -545,7 +419,7 @@ pub fn plan_batch(
             const EPS: f64 = 1e-9;
             let u_low: f64 = seq.iter().map(|t| t.volume as f64 / t.period as f64).sum();
             if 2.0 * u_low > m_r as f64 + EPS {
-                return Err(FederatedError::NoFeasibleAllocation);
+                return Err(AdmissionError::NoFeasibleAllocation);
             }
             Condition::Demand
         }
@@ -553,7 +427,7 @@ pub fn plan_batch(
         FederatedVariant::BaruahArbitrary => Condition::DemandAndUtilization,
     };
     let (placement, _) = partition::partition(&seq, m_r, condition, PackingStrategy::FirstFit)
-        .ok_or(FederatedError::NoFeasibleAllocation)?;
+        .ok_or(AdmissionError::NoFeasibleAllocation)?;
     for (&i, &processor) in light.iter().zip(placement.iter()) {
         plans[i] = Some(FedPlan::Light { processor });
     }
@@ -563,7 +437,7 @@ pub fn plan_batch(
         plans: plans
             .into_iter()
             .collect::<Option<Vec<_>>>()
-            .ok_or(FederatedError::NoFeasibleAllocation)?,
+            .ok_or(AdmissionError::NoFeasibleAllocation)?,
         heavy_cores: m - m_r,
     })
 }
@@ -595,7 +469,7 @@ pub fn is_batch_feasible(tasks: &[FedTask<'_>], m: u16) -> bool {
 /// order.
 pub fn admit_batch(
     tasks: &[FedTask<'_>],
-) -> Result<(FederatedVariant, Vec<FederatedAssignment>), FederatedError> {
+) -> Result<(FederatedVariant, Vec<FederatedAssignment>), AdmissionError> {
     let m = resource::free_core_count();
     let variant = FederatedVariant::for_task_set(tasks.iter().map(|t| &t.metrics));
     let plan = plan_batch(tasks, m, variant)?;
@@ -623,7 +497,7 @@ pub fn admit_batch(
                         let cpu = resource::allocate_cluster(1)?
                             .iter()
                             .next()
-                            .ok_or(FederatedError::NoFeasibleAllocation)?;
+                            .ok_or(AdmissionError::NoFeasibleAllocation)?;
                         shared_cpus[processor] = Some(cpu);
                         cpu
                     }
@@ -647,9 +521,16 @@ pub fn admit_batch(
     Ok((variant, out))
 }
 
+/// Paper-conformance tests: worked examples of Li et al. (ECRTS 2014) and
+/// Baruah (DATE 2015, IPDPS 2015).
+#[cfg(test)]
+mod paper_examples;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dag::DagError;
+    use crate::dag_sched::resource::ResourceError;
 
     #[test]
     fn test_is_heavy_boundary() {
@@ -692,10 +573,13 @@ mod tests {
         let config = DagMetrics::from_static(10, 50, 1000, 40);
         assert_eq!(
             classify_dag(&config),
-            Err(FederatedError::Infeasible {
-                critical_path: 50,
-                relative_deadline: 40,
-            })
+            Err(AdmissionError::Precondition(
+                DagError::CriticalPathExceedsDeadline {
+                    dag_id: 0,
+                    critical_path: 50,
+                    relative_deadline: 40,
+                }
+            ))
         );
     }
 
@@ -717,10 +601,13 @@ mod tests {
         let config = DagMetrics::from_static(100, 50, 1000, 50);
         assert_eq!(
             classify_dag(&config),
-            Err(FederatedError::Infeasible {
-                critical_path: 50,
-                relative_deadline: 50,
-            })
+            Err(AdmissionError::Precondition(
+                DagError::NoSlackForParallelWork {
+                    dag_id: 0,
+                    volume: 100,
+                    critical_path: 50,
+                }
+            ))
         );
     }
 
@@ -855,16 +742,6 @@ mod tests {
 
     // ----- batch admission (Li / DATE 2015 / IPDPS 2015) -----
 
-    /// DATE 2015's Fig. 1 task: WCETs 1 and 2 feeding a 2, which fans out
-    /// to 1, 1 and 2 (len = 6, vol = 9).
-    fn date15_fig1_graph() -> DagGraph {
-        DagGraph::new(
-            alloc::vec![1, 2, 2, 1, 1, 2],
-            &[(0, 2), (1, 2), (2, 3), (2, 4), (2, 5)],
-        )
-        .unwrap()
-    }
-
     fn chain(wcets: &[u64]) -> DagGraph {
         let edges: Vec<(usize, usize)> = (1..wcets.len()).map(|i| (i - 1, i)).collect();
         DagGraph::new(wcets.to_vec(), &edges).unwrap()
@@ -876,13 +753,8 @@ mod tests {
     }
 
     #[test]
-    fn test_list_schedule_makespan_date15_fig1() {
-        let g = date15_fig1_graph();
-        assert_eq!(list_schedule_makespan(&g, 1), Some(9)); // = vol
-                                                            // 2 procs: {0,1} -> 2 starts at 2, ends 4 -> {3,4} 4..5 -> 5 5..7.
-        assert_eq!(list_schedule_makespan(&g, 2), Some(7));
-        assert_eq!(list_schedule_makespan(&g, 3), Some(6)); // = len
-        assert_eq!(list_schedule_makespan(&g, 0), None);
+    fn test_list_schedule_makespan_rejects_zero_processors() {
+        assert_eq!(list_schedule_makespan(&chain(&[1, 2]), 0), None);
     }
 
     #[test]
@@ -1034,11 +906,23 @@ mod tests {
         }];
         assert_eq!(
             plan_batch(&constrained, 4, FederatedVariant::LiImplicit),
-            Err(FederatedError::VariantNotApplicable)
+            Err(AdmissionError::Precondition(
+                DagError::ImplicitDeadlineRequired {
+                    dag_id: 0,
+                    relative_deadline: 50,
+                    period: 100,
+                }
+            ))
         );
         assert_eq!(
             plan_batch(&arbitrary, 4, FederatedVariant::BaruahConstrained),
-            Err(FederatedError::VariantNotApplicable)
+            Err(AdmissionError::Precondition(
+                DagError::ConstrainedDeadlineRequired {
+                    dag_id: 0,
+                    relative_deadline: 150,
+                    period: 100,
+                }
+            ))
         );
         assert!(plan_batch(&arbitrary, 4, FederatedVariant::BaruahArbitrary).is_ok());
     }
@@ -1052,10 +936,13 @@ mod tests {
         }];
         assert_eq!(
             plan_batch(&tasks, 4, FederatedVariant::BaruahConstrained),
-            Err(FederatedError::Infeasible {
-                critical_path: 30,
-                relative_deadline: 20,
-            })
+            Err(AdmissionError::Precondition(
+                DagError::CriticalPathExceedsDeadline {
+                    dag_id: 0,
+                    critical_path: 30,
+                    relative_deadline: 20,
+                }
+            ))
         );
     }
 }

@@ -26,6 +26,12 @@
 //!   plus passive, `C <= Σθ + Σ max{H_j - L, 0}`), kept as two distinct
 //!   conditions -- an earlier revision folded Theorem 2 into Theorem 4 with
 //!   `Σθ = 0`, silently dropping Theorem 2's `L_i` term.
+//! - [`pi_star_supply`]/[`pi_prime_supply`]: the passive-VP term of both
+//!   conditions on the hypothetical platforms `Π*` (OURS1) and `Π'`
+//!   (OURS2, only when an owner's maximum parallelism is known), accepted
+//!   "with either" as Algorithm 1 lines 17/25 say. `Π'` replaces an owner's
+//!   sbf values only when *all* passive-VPs complementary to its
+//!   active-VPs are in the same `Π` (Sec. 4.2, p. 38).
 //! - [`try_alloc_heavy_within`]: Algorithm 1 as written, including the
 //!   partial-group branch (lines 10-17, run once, on whatever processors
 //!   remain -- possibly none) and the `goto line 19` switch to Theorem 2
@@ -35,6 +41,14 @@
 //!   Theorem 2 first, then `Partition(L, M_l)` as best-fit partitioned EDF
 //!   with the DBF* test of the paper's reference \[15\] (see
 //!   [`crate::dag_sched::partition`]).
+//!
+//! Numbering: this module cites the TPDS 2023 version. The RTSS 2021
+//! version covers heavy tasks only, with the same analysis under other
+//! numbers -- Lemma 3 = Lemma 1 (sbf), Theorem 1 conditions (4)-(6) =
+//! (8)-(10), Theorem 2 condition (8) = (12), Theorem 3 condition (10) =
+//! (13), usefulness condition (17) = (18), Lemma 6 = Lemma 9 -- and a
+//! single Algorithm 1 that equals `AllocH(m)`: no `M_h` search, no light
+//! tasks, no `Π'` (OURS2). See `vfed/paper_examples.rs`.
 //!
 //! [`admit_one`] is an incremental, one-DAG-at-a-time variant kept for
 //! callers that admit DAGs individually. It uses the same theorems but is
@@ -62,9 +76,11 @@ use awkernel_lib::{
 
 use crate::{
     dag_sched::{
+        admission::AdmissionError,
         metrics::DagMetrics,
         partition,
-        resource::{self, ResourceError},
+        precondition::{self, Policy},
+        resource,
     },
     scheduler::SchedulerType,
 };
@@ -74,37 +90,6 @@ use crate::{
 pub enum TaskClass {
     Light,
     Heavy { required_cores: u16 },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VFedError {
-    /// `relative_deadline < critical_path` (traversing the critical path
-    /// alone already exceeds the deadline, so no core count can help), or
-    /// `relative_deadline == critical_path` with exploitable parallelism
-    /// (`volume > critical_path`, i.e. Heavy): see
-    /// [`super::federated::FederatedError::Infeasible`]'s doc for why the
-    /// implicit-deadline boundary `D == L` is only feasible when
-    /// `volume == critical_path` (Light).
-    Infeasible {
-        critical_path: u64,
-        relative_deadline: u64,
-    },
-    /// V-Fed's theorems all assume constrained deadlines (`D <= T`); see the
-    /// module doc. A DAG with `D > T` must go through
-    /// [`super::federated`] instead.
-    ArbitraryDeadlineNotSupported { relative_deadline: u64, period: u64 },
-    /// No combination of currently-available cores/passive-VPs/partitions
-    /// can schedule this DAG (or, for [`admit_batch`], the whole task set).
-    NoFeasibleAllocation,
-    /// The shared core ledger could not satisfy a core request; see
-    /// [`ResourceError`].
-    Resource(ResourceError),
-}
-
-impl From<ResourceError> for VFedError {
-    fn from(e: ResourceError) -> Self {
-        VFedError::Resource(e)
-    }
 }
 
 /// The supply bound function (Lemma 1): the minimum processing time a
@@ -145,105 +130,60 @@ pub struct ActiveVp {
 }
 
 /// A physical core's leftover capacity once its active-VP has been
-/// accounted for. Characterized entirely by [`PassiveVpKind`] (in turn by
-/// the owning active-VP group's own budgets/period/deadline, per [`sbf`]) —
-/// not by which task the *active* side happens to serve, which is
-/// irrelevant to what the *passive* side can guarantee.
+/// accounted for: the passive-VP complementary to that active-VP.
+/// Characterized by the owning active-VP's budget and its task's
+/// period/deadline (Lemma 1) — not by which task the passive side ends up
+/// serving.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PassiveVp {
     pub cpu: usize,
-    kind: PassiveVpKind,
+    active_budget: u64,
+    owner_period: u64,
+    owner_deadline: u64,
+    /// `Some` when the owner's maximum parallelism `L_i` is known and below
+    /// its active-VP count `m_i` — the precondition of `Π'` (TPDS23
+    /// Sec. 4.2, OURS2). Every passive-VP of the same owner carries the
+    /// same value.
+    group: Option<OwnerGroup>,
 }
 
-/// How a [`PassiveVp`]'s supply is characterized. `Independent` is TPDS2023
-/// OURS1 (== RTSS2021's Theorem 2/4, mathematically: summing
-/// `max(sbf_x(D) - L, 0)` over a set doesn't depend on order, so the naive
-/// per-VP sum this variant produces IS the paper's `Π*` construction, not a
-/// downgrade from it). `AlwaysFree`/`Shared` together are OURS2 (`Π'`,
-/// TPDS2023 Section 4.2): when a heavy DAG's own maximum parallelism `Li` is
-/// known and less than how many active-VPs it has (`mi`), at least
-/// `mi - Li` of them are *structurally* never used by that DAG itself (its
-/// workload can never exceed `Li`-way parallelism), so their complementary
-/// passive-VPs are unconditionally available — strictly more than the usual
-/// SBF pattern promises. See [`generate_passive_vps`] for the split that
-/// produces this.
+/// What `Π'` needs to know about the task `τ_i` a passive-VP's active-VP
+/// serves: which passive-VPs form `Π_{τ_i}` (all `m_i` passive-VPs
+/// complementary to its active-VPs) and its maximum parallelism `L_i`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum PassiveVpKind {
-    /// OURS1: this VP's own `(budget, period, deadline)`.
-    Independent {
-        active_budget: u64,
-        owner_period: u64,
-        owner_deadline: u64,
-    },
-    /// OURS2: one of a group's `mi - Li` structurally-always-idle slots —
-    /// `sbf(Δ) = Δ` unconditionally.
-    AlwaysFree,
-    /// OURS2: one of a group's `Li` "shared" slots. Every sibling slot in
-    /// the same group is identical by construction (same `budgets`/`li`), so
-    /// each carries its own copy rather than the group being deduplicated —
-    /// pools here are bounded by core count, never large enough for that to
-    /// matter.
-    Shared {
-        /// Every active-VP budget in the *whole* group (not just this
-        /// slot's own) — `Π'`'s formula sums over all of them.
-        budgets: Vec<u64>,
-        owner_period: u64,
-        owner_deadline: u64,
-        /// This group's `Li`: how many `Shared` slots divide up the
-        /// aggregate leftover supply (`budgets.len()` is the group's `mi`).
-        li: u16,
-    },
+struct OwnerGroup {
+    /// Identifies `Π_{τ_i}`: the cpu (or dry-run slot) of the owner's first
+    /// active-VP. Unique within one pool, since a core hosts at most one
+    /// active-VP.
+    id: usize,
+    /// `m_i`: the number of active-VPs serving `τ_i`.
+    mi: u16,
+    /// `L_i`, with `1 <= L_i < m_i`.
+    li: u16,
 }
 
 impl PassiveVp {
-    /// The minimum processing time this passive-VP is guaranteed to provide
-    /// in any interval of length `delta` — [`PassiveVpKind::Independent`]
-    /// via the plain [`sbf`] (Lemma 1); [`PassiveVpKind::AlwaysFree`]
-    /// trivially (`delta`); [`PassiveVpKind::Shared`] via TPDS2023's `Π'`
-    /// formula: `max((Σ sbf_z(Δ) - Δ·(mi - li)) / li, 0)`, `mi =
-    /// budgets.len()` — identical for every sibling slot in the group.
+    /// `sbf_{π_x}(Δ)` of Lemma 1 (RTSS21 Lemma 3). Used for condition (18)
+    /// and for `Π*`, whose PSFs are exactly these values.
     fn sbf(&self, delta: u64) -> u64 {
-        match &self.kind {
-            PassiveVpKind::Independent {
-                active_budget,
-                owner_period,
-                owner_deadline,
-            } => sbf(delta, *active_budget, *owner_period, *owner_deadline),
-            PassiveVpKind::AlwaysFree => delta,
-            PassiveVpKind::Shared {
-                budgets,
-                owner_period,
-                owner_deadline,
-                li,
-            } => {
-                if *li == 0 {
-                    // Never constructed this way (see `generate_passive_vps`);
-                    // defensive rather than a silent divide-by-zero.
-                    return 0;
-                }
-                let raw: u64 = budgets
-                    .iter()
-                    .map(|&b| sbf(delta, b, *owner_period, *owner_deadline))
-                    .sum();
-                let mi_minus_li = (budgets.len() as u64).saturating_sub(*li as u64);
-                raw.saturating_sub(delta.saturating_mul(mi_minus_li)) / (*li as u64)
-            }
-        }
+        sbf(
+            delta,
+            self.active_budget,
+            self.owner_period,
+            self.owner_deadline,
+        )
     }
 }
 
-/// Turn one heavy DAG's active-VP budgets into the passive-VPs left over on
-/// those same cores, applying OURS2's split (per [`PassiveVpKind`]'s doc)
-/// whenever `max_parallelism` is known and satisfies the paper's own
-/// precondition `Li < mi` (`mi = budgets.len()`, the *actual* count this
-/// call received — a partial active-VP group works too: the "structurally
-/// idle" argument only needs `mi_actual > Li`, not a full group). Falls back
-/// to `mi` independent (OURS1) entries otherwise — including the sentinel
-/// `u16::MAX` ("unknown") [`crate::dag_sched::metrics::DagMetrics`] sets by
-/// default, so every existing caller that never supplies `max_parallelism`
-/// is unaffected. One shared helper for the three sites that used to
-/// duplicate this loop (`try_alloc_heavy_within`, `admit_heavy`,
-/// `admit_batch`'s commit).
+/// The passive-VPs complementary to one task's active-VP group (`budgets`,
+/// on `cpus`), one per active-VP, each with its own Lemma 1 parameters.
+/// When `max_parallelism` (`L_i`) is known and below the number of
+/// active-VPs actually built (`m_i = budgets.len()`, a partial group
+/// included), they also record their group, so a later test may use `Π'`
+/// — but only once all of them are in the same `Π` (see
+/// [`pi_prime_supply`]). The sentinel `u16::MAX` ("unknown") never
+/// qualifies. One shared helper for the three sites that build passive-VPs
+/// (`try_alloc_heavy_within`, `admit_heavy`, `admit_batch`'s commit).
 fn generate_passive_vps(
     budgets: &[u64],
     cpus: impl Iterator<Item = usize>,
@@ -251,39 +191,27 @@ fn generate_passive_vps(
     deadline: u64,
     max_parallelism: u16,
 ) -> Vec<PassiveVp> {
-    let mi = budgets.len() as u16;
-    if max_parallelism < mi {
-        let li = max_parallelism;
-        let always_free = mi - li;
-        cpus.enumerate()
-            .map(|(i, cpu)| {
-                let kind = if (i as u16) < always_free {
-                    PassiveVpKind::AlwaysFree
-                } else {
-                    PassiveVpKind::Shared {
-                        budgets: budgets.to_vec(),
-                        owner_period: period,
-                        owner_deadline: deadline,
-                        li,
-                    }
-                };
-                PassiveVp { cpu, kind }
-            })
-            .collect()
-    } else {
-        budgets
-            .iter()
-            .zip(cpus)
-            .map(|(&active_budget, cpu)| PassiveVp {
-                cpu,
-                kind: PassiveVpKind::Independent {
-                    active_budget,
-                    owner_period: period,
-                    owner_deadline: deadline,
-                },
-            })
-            .collect()
-    }
+    let cpus: Vec<usize> = cpus.take(budgets.len()).collect();
+    let mi = u16::try_from(budgets.len()).unwrap_or(u16::MAX);
+    let group = match cpus.first() {
+        Some(&id) if (1..mi).contains(&max_parallelism) => Some(OwnerGroup {
+            id,
+            mi,
+            li: max_parallelism,
+        }),
+        _ => None,
+    };
+    budgets
+        .iter()
+        .zip(cpus)
+        .map(|(&active_budget, cpu)| PassiveVp {
+            cpu,
+            active_budget,
+            owner_period: period,
+            owner_deadline: deadline,
+            group: group.clone(),
+        })
+        .collect()
 }
 
 /// `density = C/D`: a constrained-deadline DAG is heavy iff its volume
@@ -295,30 +223,20 @@ const fn is_heavy(volume: u64, deadline: u64) -> bool {
 }
 
 /// Classify a DAG. Does not claim any cores or passive-VPs; see
-/// [`plan_heavy`]/[`plan_light`]/[`admit_one`] for that.
-pub fn classify(config: &DagMetrics) -> Result<TaskClass, VFedError> {
-    if config.relative_deadline > config.period {
-        return Err(VFedError::ArbitraryDeadlineNotSupported {
-            relative_deadline: config.relative_deadline,
-            period: config.period,
-        });
-    }
-    if config.relative_deadline < config.critical_path {
-        return Err(VFedError::Infeasible {
-            critical_path: config.critical_path,
-            relative_deadline: config.relative_deadline,
-        });
-    }
+/// [`plan_heavy`]/[`plan_light`]/[`admit_one`] for that. Checks V-Fed's
+/// preconditions first ([`Policy::VFed`]: `D <= T`, `L <= D`, and `D > L`
+/// whenever there is parallel work); a precondition error reports DAG 0
+/// (see [`AdmissionError::with_dag_id`]).
+pub fn classify(config: &DagMetrics) -> Result<TaskClass, AdmissionError> {
+    precondition::check(Policy::VFed, 0, config)?;
 
     if !is_heavy(config.volume, config.relative_deadline) {
         return Ok(TaskClass::Light);
     }
 
+    // `None` here only on a core count beyond `u16`.
     let Some(required_cores) = config.min_dedicated_cores() else {
-        return Err(VFedError::Infeasible {
-            critical_path: config.critical_path,
-            relative_deadline: config.relative_deadline,
-        });
+        return Err(AdmissionError::NoFeasibleAllocation);
     };
 
     Ok(TaskClass::Heavy { required_cores })
@@ -368,15 +286,61 @@ fn partial_active_vp_budgets(critical_path: u64, deadline: u64, cores: u16) -> V
     budgets
 }
 
-/// `Σ_{j=1}^{|Π|} max{H_j(D_i, Π) - L_i, 0}`: the passive-VP term shared by
-/// Theorem 2 and Theorem 4. `H_j` of the hypothetical platform (`Π*` or
-/// `Π'`) is exactly the multiset of the passive-VPs' own `sbf` values, so
-/// the sum is order-independent.
-fn passive_supply(critical_path: u64, deadline: u64, passives: &[&PassiveVp]) -> u64 {
+/// `Σ_j max{H_j(D_i, Π*) - L_i, 0}` (TPDS23 Sec. 4.2, OURS1):
+/// `{H_j(t, Π*)}` is the set of the passive-VPs' own sbf values, so the sum
+/// is order-independent. This is also RTSS21's `Σ max(sbf(D_i) - L_i, 0)`.
+fn pi_star_supply(critical_path: u64, deadline: u64, passives: &[&PassiveVp]) -> u64 {
     passives
         .iter()
         .map(|p| p.sbf(deadline).saturating_sub(critical_path))
         .sum()
+}
+
+/// `Σ_j max{H_j(D_i, Π') - L_i, 0}` (TPDS23 Sec. 4.2, OURS2). For every
+/// owner `τ_k` whose whole `Π_{τ_k}` is in `passives` (and whose
+/// `L_k < m_k` is known), its `m_k` sbf values are replaced by
+/// `f_1..f_{m_k}`: `f_j(t) = t` for `j <= m_k - L_k`, and
+/// `f_j(t) = max{(Σ_{π_x ∈ Π_{τ_k}} sbf_{π_x}(t) - t (m_k - L_k)) / L_k, 0}`
+/// for the other `L_k`; every other passive-VP keeps its sbf (`S'(t)`).
+///
+/// "Passive-VPs complementary to all active-VPs of `τ_i` must be included
+/// in `Π'`" (p. 38): Lemma 3 only guarantees that *some* `m_k - L_k` of
+/// the group's cores are free at any time, not which ones, so a group only
+/// partly in `passives` contributes its members' plain sbf values. The
+/// division floors, which only lowers the bound.
+fn pi_prime_supply(critical_path: u64, deadline: u64, passives: &[&PassiveVp]) -> u64 {
+    let t = deadline;
+    let mut total: u64 = 0;
+    let mut seen: Vec<usize> = Vec::new();
+    for p in passives {
+        let Some(group) = &p.group else {
+            total += p.sbf(t).saturating_sub(critical_path);
+            continue;
+        };
+        if seen.contains(&group.id) {
+            continue;
+        }
+        seen.push(group.id);
+        let members: Vec<&PassiveVp> = passives
+            .iter()
+            .copied()
+            .filter(|q| q.group.as_ref().is_some_and(|g| g.id == group.id))
+            .collect();
+        if members.len() == usize::from(group.mi) {
+            let raw: u64 = members.iter().map(|q| q.sbf(t)).sum();
+            let free = u64::from(group.mi - group.li);
+            let li = u64::from(group.li);
+            let shared = raw.saturating_sub(t.saturating_mul(free)) / li;
+            total +=
+                free * t.saturating_sub(critical_path) + li * shared.saturating_sub(critical_path);
+        } else {
+            total += members
+                .iter()
+                .map(|q| q.sbf(t).saturating_sub(critical_path))
+                .sum::<u64>();
+        }
+    }
+    total
 }
 
 /// Which schedulability condition a passive-VP search tests against.
@@ -392,6 +356,10 @@ enum PassiveTest {
     Theorem4 { active_budget_sum: u64 },
 }
 
+// Algorithm 1 lines 17 and 25 accept a task if its condition holds "with
+// either" `Π'` or `Π*` (Theorems 3 and 5 make both sound); neither PSF set
+// dominates the other in general, so `holds` takes the larger supply.
+
 impl PassiveTest {
     fn holds(
         self,
@@ -404,7 +372,12 @@ impl PassiveTest {
             PassiveTest::Theorem2 => critical_path,
             PassiveTest::Theorem4 { active_budget_sum } => active_budget_sum,
         };
-        volume <= base.saturating_add(passive_supply(critical_path, deadline, passives))
+        let supply = pi_star_supply(critical_path, deadline, passives).max(pi_prime_supply(
+            critical_path,
+            deadline,
+            passives,
+        ));
+        volume <= base.saturating_add(supply)
     }
 }
 
@@ -440,12 +413,10 @@ pub fn plan_heavy(
     config: &DagMetrics,
     cores_available: u16,
     pool: &[PassiveVp],
-) -> Result<HeavyPlan, VFedError> {
+) -> Result<HeavyPlan, AdmissionError> {
+    precondition::check(Policy::VFed, 0, config)?;
     let Some(required_cores) = config.min_dedicated_cores() else {
-        return Err(VFedError::Infeasible {
-            critical_path: config.critical_path,
-            relative_deadline: config.relative_deadline,
-        });
+        return Err(AdmissionError::NoFeasibleAllocation);
     };
 
     if cores_available >= required_cores {
@@ -488,7 +459,8 @@ pub fn plan_heavy(
 }
 
 /// The paper's passive-VP `do ... while` loop (Algorithm 1 lines 14-17 /
-/// 22-25, Algorithm 2 lines 12-15): repeatedly move the first passive-VP in
+/// 22-25, Algorithm 2 lines 12-17 -- whose Theorem 2 check at line 15 sits
+/// inside the line-12 loop, i.e. after every added passive-VP): repeatedly move the first passive-VP in
 /// `pool` satisfying condition (18) into `Π` until `test` holds, failing if
 /// no useful passive-VP is left. At least one passive-VP is always taken
 /// before `test` is first evaluated, as in the paper's `do`-`while`.
@@ -496,7 +468,7 @@ fn pull_passives_until_schedulable(
     config: &DagMetrics,
     test: PassiveTest,
     pool: &[PassiveVp],
-) -> Result<Vec<usize>, VFedError> {
+) -> Result<Vec<usize>, AdmissionError> {
     let (volume, critical_path, deadline) = (
         config.volume,
         config.critical_path,
@@ -511,7 +483,7 @@ fn pull_passives_until_schedulable(
             .enumerate()
             .find(|(i, vp)| !used_mask[*i] && passive_vp_is_useful(vp, critical_path, deadline));
         let Some((idx, _)) = chosen else {
-            return Err(VFedError::NoFeasibleAllocation);
+            return Err(AdmissionError::NoFeasibleAllocation);
         };
         used_mask[idx] = true;
         used.push(idx);
@@ -525,10 +497,10 @@ fn pull_passives_until_schedulable(
 
 /// Plan a DAG purely from passive-VPs (Theorem 2, condition (12)) -- the
 /// light-task step of Algorithm 2 (lines 11-17). Returns
-/// [`VFedError::NoFeasibleAllocation`] if the current pool's useful
+/// [`AdmissionError::NoFeasibleAllocation`] if the current pool's useful
 /// entries can't make it schedulable; the caller then leaves it for the
 /// partitioned-EDF step.
-pub fn plan_light(config: &DagMetrics, pool: &[PassiveVp]) -> Result<Vec<usize>, VFedError> {
+pub fn plan_light(config: &DagMetrics, pool: &[PassiveVp]) -> Result<Vec<usize>, AdmissionError> {
     pull_passives_until_schedulable(config, PassiveTest::Theorem2, pool)
 }
 
@@ -798,14 +770,14 @@ impl VFedAssignment {
 pub fn admit_one(
     config: DagMetrics,
     packing: PackingStrategy,
-) -> Result<VFedAssignment, VFedError> {
+) -> Result<VFedAssignment, AdmissionError> {
     match classify(&config)? {
         TaskClass::Heavy { .. } => admit_heavy(config),
         TaskClass::Light => admit_light(config, packing),
     }
 }
 
-fn admit_heavy(config: DagMetrics) -> Result<VFedAssignment, VFedError> {
+fn admit_heavy(config: DagMetrics) -> Result<VFedAssignment, AdmissionError> {
     // Held for the whole decide-and-commit sequence below (including the
     // nested `resource::allocate_cluster` call, which takes its own,
     // separate lock), so a concurrent `admit_one` can never plan against a
@@ -855,7 +827,10 @@ fn admit_heavy(config: DagMetrics) -> Result<VFedAssignment, VFedError> {
     })
 }
 
-fn admit_light(config: DagMetrics, packing: PackingStrategy) -> Result<VFedAssignment, VFedError> {
+fn admit_light(
+    config: DagMetrics,
+    packing: PackingStrategy,
+) -> Result<VFedAssignment, AdmissionError> {
     {
         let mut node = MCSNode::new();
         let mut pool = PASSIVE_POOL.lock(&mut node);
@@ -873,7 +848,7 @@ fn admit_light(config: DagMetrics, packing: PackingStrategy) -> Result<VFedAssig
 fn admit_light_partitioned(
     config: DagMetrics,
     packing: PackingStrategy,
-) -> Result<VFedAssignment, VFedError> {
+) -> Result<VFedAssignment, AdmissionError> {
     let density_scaled = resource::utilization_scaled(config.volume, config.relative_deadline);
 
     let mut node = MCSNode::new();
@@ -888,7 +863,10 @@ fn admit_light_partitioned(
     }
 
     let cores = resource::allocate_cluster(1)?;
-    let cpu = cores.iter().next().ok_or(VFedError::NoFeasibleAllocation)?;
+    let cpu = cores
+        .iter()
+        .next()
+        .ok_or(AdmissionError::NoFeasibleAllocation)?;
     partitions.push((
         cpu,
         Partition {
@@ -965,11 +943,11 @@ fn plan_batch(
     configs: &[DagMetrics],
     max_cores: u16,
     packing: PackingStrategy,
-) -> Result<BatchPlan, VFedError> {
+) -> Result<BatchPlan, AdmissionError> {
     let mut heavy: Vec<(usize, DagMetrics)> = Vec::new();
     let mut light: Vec<(usize, DagMetrics)> = Vec::new();
     for (i, &config) in configs.iter().enumerate() {
-        match classify(&config)? {
+        match classify(&config).map_err(|e| e.with_dag_id(i as u32))? {
             TaskClass::Heavy { .. } => heavy.push((i, config)),
             TaskClass::Light => light.push((i, config)),
         }
@@ -981,8 +959,8 @@ fn plan_batch(
     });
 
     let heavy_configs: Vec<DagMetrics> = heavy.iter().map(|(_, c)| *c).collect();
-    let (mh, heavy_plans, mut pool) =
-        search_min_heavy_cores(&heavy_configs, max_cores).ok_or(VFedError::NoFeasibleAllocation)?;
+    let (mh, heavy_plans, mut pool) = search_min_heavy_cores(&heavy_configs, max_cores)
+        .ok_or(AdmissionError::NoFeasibleAllocation)?;
 
     // Lines 10-19: passive-VPs first, for every light DAG in density order.
     let mut outcomes: Vec<Option<LightOutcome>> = Vec::with_capacity(light.len());
@@ -1014,7 +992,7 @@ fn plan_batch(
         })
         .collect();
     let (placement, bins) = partition::partition(&seq, ml, partition::Condition::Demand, packing)
-        .ok_or(VFedError::NoFeasibleAllocation)?;
+        .ok_or(AdmissionError::NoFeasibleAllocation)?;
     for (&pos, &bin) in leftover.iter().zip(placement.iter()) {
         outcomes[pos] = Some(LightOutcome::Partitioned(bin));
     }
@@ -1029,7 +1007,7 @@ fn plan_batch(
         outcomes: outcomes
             .into_iter()
             .collect::<Option<Vec<_>>>()
-            .ok_or(VFedError::NoFeasibleAllocation)?,
+            .ok_or(AdmissionError::NoFeasibleAllocation)?,
         bins,
     })
 }
@@ -1054,7 +1032,7 @@ pub fn is_batch_feasible(configs: &[DagMetrics], max_cores: u16, packing: Packin
 pub fn admit_batch(
     configs: &[DagMetrics],
     packing: PackingStrategy,
-) -> Result<Vec<VFedAssignment>, VFedError> {
+) -> Result<Vec<VFedAssignment>, AdmissionError> {
     let max_cores = resource::free_core_count();
     let BatchPlan {
         heavy,
@@ -1127,7 +1105,10 @@ pub fn admit_batch(
             LightOutcome::Partitioned(idx) => {
                 while real_partition_cpus.len() <= idx {
                     let cores = resource::allocate_cluster(1)?;
-                    let cpu = cores.iter().next().ok_or(VFedError::NoFeasibleAllocation)?;
+                    let cpu = cores
+                        .iter()
+                        .next()
+                        .ok_or(AdmissionError::NoFeasibleAllocation)?;
                     real_partition_cpus.push(cpu);
                 }
                 results.push((
@@ -1171,18 +1152,23 @@ pub fn admit_batch(
     Ok(results.into_iter().map(|(_, a)| a).collect())
 }
 
+/// Paper-conformance tests: worked examples of Jiang et al., RTSS 2021
+/// and TPDS 2023.
+#[cfg(test)]
+mod paper_examples;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dag::DagError;
 
     fn vp(cpu: usize, active_budget: u64, owner_period: u64, owner_deadline: u64) -> PassiveVp {
         PassiveVp {
             cpu,
-            kind: PassiveVpKind::Independent {
-                active_budget,
-                owner_period,
-                owner_deadline,
-            },
+            active_budget,
+            owner_period,
+            owner_deadline,
+            group: None,
         }
     }
 
@@ -1198,10 +1184,13 @@ mod tests {
         let config = DagMetrics::from_static(10, 5, 100, 150); // D=150 > T=100
         assert_eq!(
             classify(&config),
-            Err(VFedError::ArbitraryDeadlineNotSupported {
-                relative_deadline: 150,
-                period: 100,
-            })
+            Err(AdmissionError::Precondition(
+                DagError::ConstrainedDeadlineRequired {
+                    dag_id: 0,
+                    relative_deadline: 150,
+                    period: 100,
+                }
+            ))
         );
     }
 
@@ -1212,10 +1201,13 @@ mod tests {
         let config = DagMetrics::from_static(10, 50, 1000, 40);
         assert_eq!(
             classify(&config),
-            Err(VFedError::Infeasible {
-                critical_path: 50,
-                relative_deadline: 40,
-            })
+            Err(AdmissionError::Precondition(
+                DagError::CriticalPathExceedsDeadline {
+                    dag_id: 0,
+                    critical_path: 50,
+                    relative_deadline: 40,
+                }
+            ))
         );
     }
 
@@ -1236,10 +1228,13 @@ mod tests {
         let config = DagMetrics::from_static(100, 50, 1000, 50);
         assert_eq!(
             classify(&config),
-            Err(VFedError::Infeasible {
-                critical_path: 50,
-                relative_deadline: 50,
-            })
+            Err(AdmissionError::Precondition(
+                DagError::NoSlackForParallelWork {
+                    dag_id: 0,
+                    volume: 100,
+                    critical_path: 50,
+                }
+            ))
         );
     }
 
@@ -1255,253 +1250,127 @@ mod tests {
         );
     }
 
-    // Table I / Fig. 1 in RTSS21 (and reused verbatim in TPDS23 Sec 3):
-    // Ci=11, Li=7. sbf isn't exercised on that example directly, so this
-    // spot-checks the closed-form formula against Fig. 5/7's own numbers
-    // instead: Θ = {θ1=6, θ2=2} serving a task with T=10 (job in Fig. 5 has
-    // no explicit D; Fig. 7 plots sbf for D implied by the figure's own
-    // deadline marker at t=10, i.e. D=T=10 there).
+    // The paper's own sbf numbers (RTSS21 Fig. 7, TPDS23 Sec. 6.2) are
+    // checked in `paper_examples`.
     #[test]
     fn test_sbf_zero_below_budget() {
         assert_eq!(sbf(5, 6, 10, 10), 0); // delta < budget
     }
 
-    #[test]
-    fn test_sbf_matches_paper_worked_example_leading_vp() {
-        // From TPDS23 Sec 6.2: p1 hosts tau1's leading active-VP,
-        // theta1=8, T1=10, D1=8. sbf_p1(9) = 1 (used when planning tau3).
-        let p1 = vp(1, 8, 10, 8);
-        assert_eq!(p1.sbf(9), 1);
-        // sbf_p1(D2=8) = 0, i.e. tau1's own leading complementary VP is
-        // never useful back to a task whose deadline is no looser than 8.
-        assert_eq!(p1.sbf(8), 0);
-    }
+    // --- OURS2 (Π', TPDS23 Sec 4.2) ---
 
     #[test]
-    fn test_sbf_matches_paper_worked_example_non_leading_vp() {
-        // p2..p5 host tau1's non-leading active-VPs: theta=1, T1=10, D1=8.
-        let p = vp(2, 1, 10, 8);
-        assert_eq!(p.sbf(8), 6); // used when planning tau2 (D2=8)
-        assert_eq!(p.sbf(9), 7); // used when planning tau3 (D3=9)
-    }
-
-    // --- OURS2 (Pi', TPDS23 Sec 4.2): PassiveVpKind::AlwaysFree/Shared ---
-
-    #[test]
-    fn test_always_free_slot_sbf_is_full_delta() {
-        let always_free = PassiveVp {
-            cpu: 0,
-            kind: PassiveVpKind::AlwaysFree,
-        };
-        for delta in [0, 1, 9, 1000] {
-            assert_eq!(always_free.sbf(delta), delta);
-        }
-    }
-
-    #[test]
-    fn test_shared_slot_matches_hand_computed_example() {
-        // mi=3 active-VPs, budgets {8,1,1} (tau1's own group from the paper's
-        // worked example: theta1=8, theta2=theta3=1, T=10, D=8), li=2 shared
-        // slots (so mi - li = 1 slot would instead be AlwaysFree, generated
-        // separately -- this test only exercises the Shared formula itself).
-        let shared = PassiveVp {
-            cpu: 0,
-            kind: PassiveVpKind::Shared {
-                budgets: alloc::vec![8, 1, 1],
-                owner_period: 10,
-                owner_deadline: 8,
-                li: 2,
-            },
-        };
-        // At delta=9: sbf(9,8,10,8)=1, sbf(9,1,10,8)=7 each (from
-        // test_sbf_matches_paper_worked_example_{leading,non_leading}_vp) ->
-        // raw = 1+7+7 = 15. mi-li = 1, so subtract delta*1 = 9: 15-9 = 6,
-        // divided by li=2 -> 3.
-        assert_eq!(shared.sbf(9), 3);
-    }
-
-    #[test]
-    fn test_shared_slot_li_zero_is_defensive_zero_not_panic() {
-        let shared = PassiveVp {
-            cpu: 0,
-            kind: PassiveVpKind::Shared {
-                budgets: alloc::vec![8, 1, 1],
-                owner_period: 10,
-                owner_deadline: 8,
-                li: 0,
-            },
-        };
-        assert_eq!(shared.sbf(9), 0);
-    }
-
-    #[test]
-    fn test_generate_passive_vps_falls_back_to_independent_when_unknown() {
+    fn test_generate_passive_vps_without_group_when_unknown() {
         let budgets = alloc::vec![8, 1, 1, 1, 1];
         let vps = generate_passive_vps(&budgets, 0..5, 10, 8, u16::MAX);
         assert_eq!(vps.len(), 5);
-        for (v, &b) in vps.iter().zip(&budgets) {
-            assert_eq!(
-                v.kind,
-                PassiveVpKind::Independent {
-                    active_budget: b,
-                    owner_period: 10,
-                    owner_deadline: 8,
-                }
-            );
+        for (k, (v, &b)) in vps.iter().zip(&budgets).enumerate() {
+            assert_eq!(*v, vp(k, b, 10, 8));
         }
     }
 
     #[test]
-    fn test_generate_passive_vps_falls_back_to_independent_when_li_not_less_than_mi() {
+    fn test_generate_passive_vps_without_group_when_li_not_less_than_mi() {
         let budgets = alloc::vec![8, 1, 1];
         // max_parallelism == mi (3): precondition `Li < mi` violated.
         let vps = generate_passive_vps(&budgets, 0..3, 10, 8, 3);
-        assert!(vps
-            .iter()
-            .all(|v| matches!(v.kind, PassiveVpKind::Independent { .. })));
+        assert!(vps.iter().all(|v| v.group.is_none()));
+        // L_i = 0 cannot describe a DAG and would divide by zero.
+        let vps = generate_passive_vps(&budgets, 0..3, 10, 8, 0);
+        assert!(vps.iter().all(|v| v.group.is_none()));
     }
 
+    /// With `L_i < m_i` every passive-VP of the group records it, but keeps
+    /// its own per-core sbf -- no core is singled out as "always free".
     #[test]
-    fn test_generate_passive_vps_splits_always_free_then_shared() {
+    fn test_generate_passive_vps_records_group_keeping_own_sbf() {
         let budgets = alloc::vec![8, 1, 1];
-        let vps = generate_passive_vps(&budgets, 10..13, 10, 8, 2); // li=2, mi-li=1
-        assert_eq!(vps.len(), 3);
-        assert_eq!(vps[0].cpu, 10);
-        assert!(matches!(vps[0].kind, PassiveVpKind::AlwaysFree));
-        for v in &vps[1..] {
-            assert!(matches!(v.kind, PassiveVpKind::Shared { li: 2, .. }));
-        }
-        assert_eq!(vps[1].cpu, 11);
-        assert_eq!(vps[2].cpu, 12);
+        let vps = generate_passive_vps(&budgets, 10..13, 10, 8, 2);
+        let cpus: Vec<usize> = vps.iter().map(|v| v.cpu).collect();
+        assert_eq!(cpus, alloc::vec![10, 11, 12]);
+        let group = OwnerGroup {
+            id: 10,
+            mi: 3,
+            li: 2,
+        };
+        assert!(vps.iter().all(|v| v.group.as_ref() == Some(&group)));
+        let sbfs: Vec<u64> = vps.iter().map(|v| v.sbf(9)).collect();
+        assert_eq!(sbfs, alloc::vec![1, 7, 7]);
     }
 
-    /// OURS2's split is *not* a pointwise improvement over OURS1 for every
-    /// `(Δ, L)` — both are independently sound (each dominated by the real,
-    /// unknown platform per Lemma 2/3), but folding `li` VPs' individual sbf
-    /// values into one shared, averaged number trades away precision that
-    /// can occasionally beat what the unconditional-availability slots gain
-    /// back. Found empirically while writing this test suite: `budgets =
-    /// [8,1,1,1,1]`, `li=3`, `delta=5` gives split=10 < independent=12
-    /// (confirmed by hand: the two AlwaysFree slots (mi-li=2) only give
-    /// `delta` each = 10 total, while the 3 Shared slots' averaged value
-    /// floors to 0 at this delta, whereas the 4 independent budget=1 VPs
-    /// each individually clear the L=0 bar with sbf=3). This matches the
-    /// paper's own framing: OURS1 and OURS2 are reported as two *separate*
-    /// evaluation curves (Fig. 9), not a provably-dominant pair — the
-    /// paper's own empirical claim is aggregate ("OUR2 performs better...
-    /// in all experiments" on randomly generated task sets), not a
-    /// per-instance theorem. No regression test asserts the reverse either;
-    /// this is documented behavior, not a bug.
+    /// `f_j` of Π' on a whole group: budgets {8,1,1}, T=10, D=8, L=2 at
+    /// t=9: sbf = 1, 7, 7 (raw 15); `m - L = 1` value `t = 9` plus two of
+    /// `(15 - 9) / 2 = 3`, i.e. Π' = {9, 3, 3} against Π* = {1, 7, 7}.
     #[test]
-    fn test_ours2_split_is_not_always_better_than_ours1_pointwise() {
-        let budgets = alloc::vec![8u64, 1, 1, 1, 1];
-        let independent = generate_passive_vps(&budgets, 0..5, 10, 8, u16::MAX);
-        let split = generate_passive_vps(&budgets, 0..5, 10, 8, 3);
-        let sum = |vps: &[PassiveVp]| -> u64 { vps.iter().map(|v| v.sbf(5)).sum() };
-        assert_eq!(sum(&independent), 12);
-        assert_eq!(sum(&split), 10);
+    fn test_pi_prime_on_whole_group_matches_hand_computation() {
+        let vps = generate_passive_vps(&[8, 1, 1], 0..3, 10, 8, 2);
+        let refs: Vec<&PassiveVp> = vps.iter().collect();
+        assert_eq!(pi_prime_supply(0, 9, &refs), 9 + 3 + 3);
+        assert_eq!(pi_star_supply(0, 9, &refs), 1 + 7 + 7);
+        // With a critical path of 2: Π' = 7 + 1 + 1, Π* = 0 + 5 + 5.
+        assert_eq!(pi_prime_supply(2, 9, &refs), 9);
+        assert_eq!(pi_star_supply(2, 9, &refs), 10);
     }
 
-    /// Ports the TPDS23 Sec 6.2 / RTSS21 Sec VII worked example end to end:
-    /// 5 tasks on 7 processors, tau1..tau3 heavy admitted against a
-    /// (paper-given) budget of 6 cores for heavy tasks, tau4/tau5 light
-    /// admitted from the leftover passive-VP pool. Every intermediate
-    /// number below is quoted from the paper's own walkthrough.
+    /// Π' needs the owner's whole `Π_{τ_i}` (TPDS23 p. 38): Lemma 3 says
+    /// *some* `m - L` of its cores are free at any time, not which. Taking
+    /// only the passive-VP on the leading core (theta = 8, T = 10, D = 8)
+    /// gives the plain sbf(8) = 0, so a light task (C=6, L=2, D=8) is not
+    /// admitted on it -- the per-slot "always free" split used to report
+    /// sbf(8) = 8 there and admit it.
     #[test]
-    fn test_paper_worked_example() {
-        let tau1 = DagMetrics::from_static(12, 7, 10, 8);
-        let tau2 = DagMetrics::from_static(10, 4, 10, 8);
-        let tau3 = DagMetrics::from_static(10, 2, 9, 9);
-        let tau4 = DagMetrics::from_static(6, 2, 10, 10);
-        let tau5 = DagMetrics::from_static(5, 3, 10, 10);
+    fn test_pi_prime_ignores_partial_group() {
+        let vps = generate_passive_vps(&[8, 1, 1, 1, 1], 0..5, 10, 8, 3);
+        let leading_only = [&vps[0]];
+        assert_eq!(pi_prime_supply(2, 8, &leading_only), 0);
+        assert!(!PassiveTest::Theorem2.holds(6, 2, 8, &leading_only));
 
-        assert_eq!(
-            classify(&tau1).unwrap(),
-            TaskClass::Heavy { required_cores: 5 }
-        );
-        assert_eq!(
-            classify(&tau2).unwrap(),
-            TaskClass::Heavy { required_cores: 2 }
-        );
-        assert_eq!(
-            classify(&tau3).unwrap(),
-            TaskClass::Heavy { required_cores: 2 }
-        );
-        assert_eq!(classify(&tau4).unwrap(), TaskClass::Light);
-        assert_eq!(classify(&tau5).unwrap(), TaskClass::Light);
-
-        let mut pool: Vec<PassiveVp> = Vec::new();
-
-        // tau1: D1-L1=1 smallest, gets a full 5-core group; 5 of the 6
-        // heavy-dedicated cores are now spoken for.
-        let plan1 = plan_heavy(&tau1, 5, &pool).unwrap();
-        assert_eq!(plan1.cores_used, 5);
-        assert_eq!(plan1.active_budgets, alloc::vec![8, 1, 1, 1, 1]);
-        assert!(plan1.passive_indices.is_empty());
-        pool.extend(
-            plan1
-                .active_budgets
-                .iter()
-                .enumerate()
-                .map(|(i, &b)| vp(i + 1, b, tau1.period, tau1.relative_deadline)),
-        ); // p1..p5
-
-        // tau2: D2-L2=4, only 1 core (p6) remains of the 6-core heavy
-        // budget; leading-only budget of 8 falls short of C2=10, topped up
-        // from p2 (the paper's own choice).
-        let plan2 = plan_heavy(&tau2, 1, &pool).unwrap();
-        assert_eq!(plan2.cores_used, 1);
-        assert_eq!(plan2.active_budgets, alloc::vec![8]);
-        assert_eq!(plan2.passive_indices, alloc::vec![1]); // p2, index 1
-        for &idx in plan2.passive_indices.iter().rev() {
-            pool.remove(idx);
-        }
-        pool.push(vp(6, 8, tau2.period, tau2.relative_deadline)); // p6
-
-        // tau3: D3-L3=7 largest, no cores left at all (all 6 heavy-budget
-        // cores claimed); schedulable purely from p3 and p4.
-        let plan3 = plan_heavy(&tau3, 0, &pool).unwrap();
-        assert_eq!(plan3.cores_used, 0);
-        assert!(plan3.active_budgets.is_empty());
-        // Remaining pool at this point (insertion order): p1, p3, p4, p5,
-        // p6 (p2 was removed above). p3 and p4 are indices 1 and 2.
-        assert_eq!(plan3.passive_indices, alloc::vec![1, 2]);
-        for &idx in plan3.passive_indices.iter().rev() {
-            pool.remove(idx);
-        }
-
-        // Light tasks: pool is now p1, p5, p6 (indices 0,1,2). Paper picks
-        // p5 for tau4 (C4/D4 > C5/D5), leaving p1/p6 useless to either
-        // (both fail condition (17) for D=10, as the sbf tests above imply
-        // for p1; p6 has the same shape as p1 with theta=8).
-        let plan4 = plan_light(&tau4, &pool).unwrap();
-        assert_eq!(plan4, alloc::vec![1]); // p5
+        // Four of five members: still the members' own sbf values.
+        let four: Vec<&PassiveVp> = vps[..4].iter().collect();
+        assert_eq!(pi_prime_supply(2, 8, &four), pi_star_supply(2, 8, &four));
     }
 
-    /// The paper's own worked example states "we omit the enumerating of
-    /// Mh when Mh<=5, where AllocH(Mh) returns failure" and then walks
-    /// through Mh=6 directly. This confirms the search itself (not just
-    /// the per-Mh math already validated above) independently arrives at
-    /// the same Mh=6 for tau1..tau3 out of up to 7 available cores.
+    /// A group whose cores all have little sbf but a known small `L`: owner
+    /// C=20, L=4, T=D=10 gets budgets {10, 6, 4}; at t=10 their sbf are
+    /// 0, 0, 2. With `L_i = 2`, Π' = {10, 0, 0}, so a task with C=10, L=1,
+    /// D=10 passes (12) with the whole group (10 <= 1 + 9) but not with Π*
+    /// (10 > 1 + 1), nor with two of the three passive-VPs.
     #[test]
-    fn test_search_min_heavy_cores_matches_paper() {
-        let tau1 = DagMetrics::from_static(12, 7, 10, 8);
-        let tau2 = DagMetrics::from_static(10, 4, 10, 8);
-        let tau3 = DagMetrics::from_static(10, 2, 9, 9);
-        let heavy = [tau1, tau2, tau3]; // already ascending D-L: 1, 4, 7
+    fn test_pi_prime_admits_what_pi_star_cannot() {
+        let owner = DagMetrics::from_static(20, 4, 10, 10);
+        let budgets = full_active_vp_budgets(20, 4, 10, owner.min_dedicated_cores().unwrap());
+        assert_eq!(budgets, alloc::vec![10, 6, 4]);
+        let vps = generate_passive_vps(&budgets, 0..3, 10, 10, 2);
+        let all: Vec<&PassiveVp> = vps.iter().collect();
+        assert_eq!(pi_star_supply(1, 10, &all), 1);
+        assert_eq!(pi_prime_supply(1, 10, &all), 9);
+        assert!(PassiveTest::Theorem2.holds(10, 1, 10, &all));
+        assert!(!PassiveTest::Theorem2.holds(10, 1, 10, &all[..2]));
+    }
 
-        let (mh, plans, pool) = search_min_heavy_cores(&heavy, 7).unwrap();
-        assert_eq!(mh, 6);
-        assert_eq!(plans.len(), 3);
-        assert_eq!(plans[0].cores_used, 5); // tau1
-        assert_eq!(plans[1].cores_used, 1); // tau2
-        assert_eq!(plans[2].cores_used, 0); // tau3
-                                            // tau3 consumed 2 of the passive-VPs generated along the way (p3,
-                                            // p4 in the paper's own labeling); 5+1 active slots minus 2
-                                            // consumed by tau2/tau3 plus... simplest direct check: the leftover
-                                            // pool has 3 entries left over for light tasks, as the paper's
-                                            // walkthrough shows (p1, p5, p6).
-        assert_eq!(pool.len(), 3);
+    /// Neither PSF set dominates: budgets [8,1,1,1,1], L_i = 3, t = 5 gives
+    /// Π* = 0 + 3·4 = 12 but Π' = 5 + 5 + 3·max((12 - 10)/3, 0) = 10, which
+    /// is why Algorithm 1 lines 17/25 accept "with either Π' or Π*"
+    /// (the paper reports OURS1 and OURS2 as separate curves, not a
+    /// per-instance theorem).
+    #[test]
+    fn test_pi_prime_is_not_always_better_than_pi_star() {
+        let vps = generate_passive_vps(&[8, 1, 1, 1, 1], 0..5, 10, 8, 3);
+        let all: Vec<&PassiveVp> = vps.iter().collect();
+        assert_eq!(pi_star_supply(0, 5, &all), 12);
+        assert_eq!(pi_prime_supply(0, 5, &all), 10);
+        // `holds` uses the larger: C = 12, L = 0, D = 5 passes via Π*.
+        assert!(PassiveTest::Theorem2.holds(12, 0, 5, &all));
+    }
+
+    /// Two owners in one Π: only the complete group is replaced.
+    #[test]
+    fn test_pi_prime_replaces_only_complete_groups() {
+        let a = generate_passive_vps(&[10, 6, 4], 0..3, 10, 10, 2);
+        let b = generate_passive_vps(&[8, 1, 1], 3..6, 10, 8, 2);
+        let mixed: Vec<&PassiveVp> = a.iter().chain(b.iter().take(2)).collect();
+        // a (complete): 10 + 0 + 0; b's first two (partial): sbf 2 and 8.
+        assert_eq!(pi_prime_supply(0, 10, &mixed), 10 + 2 + 8);
     }
 
     #[test]
@@ -1651,34 +1520,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_is_batch_feasible_matches_paper_worked_example() {
-        // Same 5-task, 7-core scenario `test_search_min_heavy_cores_matches_paper`
-        // validates piecemeal; `is_batch_feasible` runs the whole `plan_batch`
-        // decision (heavy search + light dry run) end to end and touches no
-        // global state, unlike `admit_batch`/`admit_one`.
-        let tau1 = DagMetrics::from_static(12, 7, 10, 8);
-        let tau2 = DagMetrics::from_static(10, 4, 10, 8);
-        let tau3 = DagMetrics::from_static(10, 2, 9, 9);
-        let tau4 = DagMetrics::from_static(6, 2, 10, 10);
-        let tau5 = DagMetrics::from_static(5, 3, 10, 10);
-        assert!(is_batch_feasible(
-            &[tau1, tau2, tau3, tau4, tau5],
-            7,
-            PackingStrategy::FirstFit
-        ));
-    }
-
     /// Theorem 2's condition (12) keeps the `L_i` term that Theorem 4's
-    /// condition (13) replaces with `Σθ`: with one always-available
-    /// passive-VP (`sbf(D) = D`), (12) reads `C <= L + (D - L) = D`, while
-    /// (13) with an empty `Θ` reads `C <= D - L`.
+    /// condition (13) replaces with `Σθ`: with one passive-VP of
+    /// `sbf(10) = 9`, (12) reads `8 <= 4 + (9 - 4)`, while (13) with an
+    /// empty `Θ` reads `8 <= 9 - 4`.
     #[test]
     fn test_theorem2_keeps_critical_path_term() {
-        let free = PassiveVp {
-            cpu: 0,
-            kind: PassiveVpKind::AlwaysFree,
-        };
+        let free = vp(0, 1, 100, 90);
+        assert_eq!(free.sbf(10), 9);
         let (c, l, d) = (8, 4, 10);
         assert!(PassiveTest::Theorem2.holds(c, l, d, &[&free]));
         assert!(!PassiveTest::Theorem4 {
@@ -1687,37 +1536,9 @@ mod tests {
         .holds(c, l, d, &[&free]));
     }
 
-    /// The paper's Sec. 6.2 walkthrough for tau3 (C=10, L=2, D=9) after the
-    /// `goto line 19`: "Theorem 2 is not satisfied, i.e., 8 > 5" with p3
-    /// alone (sbf(9) - 2 = 5), then satisfied with p3 and p4 (8 < 5 + 5) --
-    /// i.e. the paper evaluates (12) as `C - L <= Σ(sbf - L)`.
-    #[test]
-    fn test_theorem2_matches_paper_walkthrough_for_tau3() {
-        let tau1 = DagMetrics::from_static(12, 7, 10, 8);
-        let p3 = vp(3, 1, tau1.period, tau1.relative_deadline);
-        let p4 = vp(4, 1, tau1.period, tau1.relative_deadline);
-        assert_eq!(p3.sbf(9), 7);
-        assert!(!PassiveTest::Theorem2.holds(10, 2, 9, &[&p3]));
-        assert!(PassiveTest::Theorem2.holds(10, 2, 9, &[&p3, &p4]));
-    }
-
     #[test]
     fn test_is_batch_feasible_false_when_infeasible() {
         let huge = DagMetrics::from_static(10_000, 10, 20, 15);
         assert!(!is_batch_feasible(&[huge], 4, PackingStrategy::FirstFit));
-    }
-
-    #[test]
-    fn test_is_batch_feasible_false_when_core_budget_too_small() {
-        // Same worked example, but only 5 cores instead of 7 — not enough
-        // even for the heavy DAGs' minimum-Mh search to succeed.
-        let tau1 = DagMetrics::from_static(12, 7, 10, 8);
-        let tau2 = DagMetrics::from_static(10, 4, 10, 8);
-        let tau3 = DagMetrics::from_static(10, 2, 9, 9);
-        assert!(!is_batch_feasible(
-            &[tau1, tau2, tau3],
-            5,
-            PackingStrategy::FirstFit
-        ));
     }
 }

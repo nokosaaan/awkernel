@@ -2,7 +2,6 @@
 extern crate alloc;
 
 mod build_dag;
-pub mod dag_fluid;
 mod dag_stats;
 mod parse_yaml;
 mod time_unit;
@@ -14,7 +13,11 @@ use awkernel_async_lib::dag_sched::policy::federated;
 use awkernel_async_lib::dag_sched::policy::vfed::{self, PackingStrategy};
 use awkernel_async_lib::{
     dag::finish_create_dags,
-    dag_sched::{metrics::DagMetrics, policy::federated::DagGraph},
+    dag_sched::{
+        graph::DagGraph,
+        metrics::DagMetrics,
+        policy::dag_fluid::{self, Segment},
+    },
 };
 use awkernel_lib::delay::wait_millisec;
 #[cfg(not(feature = "vfed"))]
@@ -41,14 +44,14 @@ pub fn dag_metrics_from_yaml(yaml_files: &[&str]) -> Result<Vec<DagMetrics>, Str
 }
 
 /// Parse a batch of RD-Gen DAG YAML documents into `(DagMetrics,
-/// Vec<dag_fluid::Segment>)` pairs -- the same pipeline as
+/// Vec<Segment>)` pairs (DAG-Fluid's segment decomposition) -- the same pipeline as
 /// [`dag_metrics_from_yaml`], plus a [`dag_fluid::decompose_segments`] call
 /// per DAG. Kept as a *separate* function (not a parameter on
 /// `dag_metrics_from_yaml`) so existing Federated/V-Fed-only callers don't
 /// pay for segment decomposition they don't use.
 pub fn dag_metrics_and_fluid_segments_from_yaml(
     yaml_files: &[&str],
-) -> Result<Vec<(DagMetrics, Vec<dag_fluid::Segment>)>, String> {
+) -> Result<Vec<(DagMetrics, Vec<Segment>)>, String> {
     let dags_data =
         parse_yaml::parse_dags(yaml_files).map_err(|e| alloc::format!("failed to parse: {e}"))?;
     dags_data
@@ -56,7 +59,7 @@ pub fn dag_metrics_and_fluid_segments_from_yaml(
         .map(|dag_data| {
             Ok((
                 dag_metrics(dag_data)?,
-                dag_fluid::decompose_segments(dag_data),
+                dag_fluid::decompose_segments(&dag_graph(dag_data)?),
             ))
         })
         .collect()
@@ -97,12 +100,19 @@ fn dag_metrics(dag_data: &parse_yaml::DagData) -> Result<DagMetrics, String> {
     ))
 }
 
-/// One DAG's [`DagGraph`]: nodes in ascending node-id order (which is also
-/// the list-scheduling priority list), WCET = `execution_time`, one edge per
-/// `out_links` entry.
-fn dag_graph(dag_data: &parse_yaml::DagData) -> Result<DagGraph, String> {
+/// `dag_data`'s node ids in ascending order: [`DagGraph`] index `v` of
+/// [`dag_graph`]'s output is node `sorted_node_ids(dag_data)[v]`.
+pub(crate) fn sorted_node_ids(dag_data: &parse_yaml::DagData) -> Vec<u32> {
     let mut ids: Vec<u32> = dag_data.get_nodes().iter().map(|n| n.get_id()).collect();
     ids.sort_unstable();
+    ids
+}
+
+/// One DAG's [`DagGraph`]: nodes in ascending node-id order (see
+/// [`sorted_node_ids`]; also the list-scheduling priority list), WCET =
+/// `execution_time`, one edge per `out_links` entry.
+pub(crate) fn dag_graph(dag_data: &parse_yaml::DagData) -> Result<DagGraph, String> {
+    let ids = sorted_node_ids(dag_data);
     let index_of = |id: u32| ids.binary_search(&id).ok();
 
     let mut wcet = vec![0u64; ids.len()];

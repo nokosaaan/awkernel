@@ -1,7 +1,7 @@
 //! Reports, for every `dag_<N>.yaml` in a pool, the DAG-Fluid segment
 //! decomposition's own maximum concurrency (`max(Segment::concurrency)`
 //! across that DAG's whole "infinite processors" timeline — see
-//! `dag_fluid::decompose_segments`'s own doc) alongside a pool-wide summary.
+//! `awkernel_async_lib::dag_sched::policy::dag_fluid::decompose_segments`'s own doc) alongside a pool-wide summary.
 //!
 //! # Why this exists
 //! DAG-Fluid's real-machine dispatch (`scheduler::dp_wrap`) can only ever
@@ -16,7 +16,7 @@
 //! independent branch groups can still overlap in time even with a small
 //! per-branch-point cap -- so the only reliable way to check whether a
 //! candidate parameter set fits a given target machine is to generate a
-//! sample and measure it here, the same way `dag_fluid::decompose_segments`
+//! sample and measure it here, the same way `awkernel_async_lib::dag_sched::policy::dag_fluid::decompose_segments`
 //! itself would be exercised for real. Used to tune a new sample_config
 //! (see `RD-Gen/sample_config/branching/`'s own docs) against this
 //! project's own real target (5 worker cores, ~4 DAG-pool cores after the
@@ -28,7 +28,7 @@
 
 use std::{env, fs, path::Path, process::ExitCode};
 
-use rd_gen_to_dags::dag_fluid::Segment;
+use awkernel_async_lib::dag_sched::policy::dag_fluid::Segment;
 
 fn load_pool_segments(pool_dir: &Path) -> Result<Vec<(String, Vec<Segment>)>, String> {
     let mut yaml_paths: Vec<_> = fs::read_dir(pool_dir)

@@ -161,7 +161,14 @@ impl_tuple_size!(T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14);
 impl_tuple_size!(T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15);
 impl_tuple_size!(T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11, T12, T13, T14, T15, T16);
 
-#[derive(Clone)]
+/// Why a DAG cannot be created or admitted. The first group is structural
+/// (checked when the DAG's nodes are registered); the second group is the
+/// scheduling model's preconditions on the DAG's timing, checked per
+/// admission policy through [`crate::dag_sched::precondition`] before any
+/// admission test runs. Each carries the DAG's id -- or, when checked
+/// before the DAGs are created (a batch admission), its position in the
+/// batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DagError {
     NotWeaklyConnected(u32),
     ContainsCycle(u32),
@@ -176,6 +183,101 @@ pub enum DagError {
     DuplicatePublish(u32, usize),
     TopicHasMultiplePublishers(u32, Cow<'static, str>),
     InterDagTopicConflict(Cow<'static, str>, Vec<u32>),
+
+    /// The source node has no period or the sink node no end-to-end
+    /// deadline, so the DAG has no timing to admit it by.
+    MissingTiming(u32),
+    /// `L > D`: traversing the critical path alone overruns the deadline,
+    /// on any number of processors.
+    CriticalPathExceedsDeadline {
+        dag_id: u32,
+        critical_path: u64,
+        relative_deadline: u64,
+    },
+    /// `D == L` with `C > L`: the policy's processor count
+    /// `ceil((C - L) / (D - L))` is undefined -- parallel-only work would
+    /// have to fit in zero slack.
+    NoSlackForParallelWork {
+        dag_id: u32,
+        volume: u64,
+        critical_path: u64,
+    },
+    /// `D <= L`: the policy needs positive slack (`D - L > 0`) on every
+    /// path.
+    NonPositiveSlack {
+        dag_id: u32,
+        critical_path: u64,
+        relative_deadline: u64,
+    },
+    /// `D != T`: the policy is defined for implicit deadlines only.
+    ImplicitDeadlineRequired {
+        dag_id: u32,
+        relative_deadline: u64,
+        period: u64,
+    },
+    /// `D > T`: the policy is defined for constrained deadlines only.
+    ConstrainedDeadlineRequired {
+        dag_id: u32,
+        relative_deadline: u64,
+        period: u64,
+    },
+}
+
+impl DagError {
+    /// The same error reported against `dag_id` -- for a precondition found
+    /// by a per-DAG entry point that has no DAG id of its own (it reports
+    /// 0). Structural errors, which always know their DAG, are unchanged.
+    pub fn with_dag_id(self, dag_id: u32) -> Self {
+        match self {
+            DagError::MissingTiming(_) => DagError::MissingTiming(dag_id),
+            DagError::CriticalPathExceedsDeadline {
+                critical_path,
+                relative_deadline,
+                ..
+            } => DagError::CriticalPathExceedsDeadline {
+                dag_id,
+                critical_path,
+                relative_deadline,
+            },
+            DagError::NoSlackForParallelWork {
+                volume,
+                critical_path,
+                ..
+            } => DagError::NoSlackForParallelWork {
+                dag_id,
+                volume,
+                critical_path,
+            },
+            DagError::NonPositiveSlack {
+                critical_path,
+                relative_deadline,
+                ..
+            } => DagError::NonPositiveSlack {
+                dag_id,
+                critical_path,
+                relative_deadline,
+            },
+            DagError::ImplicitDeadlineRequired {
+                relative_deadline,
+                period,
+                ..
+            } => DagError::ImplicitDeadlineRequired {
+                dag_id,
+                relative_deadline,
+                period,
+            },
+            DagError::ConstrainedDeadlineRequired {
+                relative_deadline,
+                period,
+                ..
+            } => DagError::ConstrainedDeadlineRequired {
+                dag_id,
+                relative_deadline,
+                period,
+            },
+            other => other,
+        }
+    }
 }
 
 #[rustfmt::skip]
@@ -210,6 +312,24 @@ impl core::fmt::Display for DagError {
             }
             DagError::InterDagTopicConflict(topic_name, dag_ids) => {
                 write!(f, "Topic '{topic_name}' is used in multiple DAGs. Conflicting DAG IDs: {dag_ids:?}")
+            }
+            DagError::MissingTiming(dag_id) => {
+                write!(f, "DAG#{dag_id} has no source period or no sink end-to-end deadline")
+            }
+            DagError::CriticalPathExceedsDeadline { dag_id, critical_path, relative_deadline } => {
+                write!(f, "DAG#{dag_id}: critical_path({critical_path}) > relative_deadline({relative_deadline}); no processor count can meet it")
+            }
+            DagError::NoSlackForParallelWork { dag_id, volume, critical_path } => {
+                write!(f, "DAG#{dag_id}: relative_deadline == critical_path({critical_path}) < volume({volume}); no slack for the parallel work")
+            }
+            DagError::NonPositiveSlack { dag_id, critical_path, relative_deadline } => {
+                write!(f, "DAG#{dag_id}: relative_deadline({relative_deadline}) <= critical_path({critical_path}); this policy needs positive slack")
+            }
+            DagError::ImplicitDeadlineRequired { dag_id, relative_deadline, period } => {
+                write!(f, "DAG#{dag_id}: relative_deadline({relative_deadline}) != period({period}); this policy needs implicit deadlines")
+            }
+            DagError::ConstrainedDeadlineRequired { dag_id, relative_deadline, period } => {
+                write!(f, "DAG#{dag_id}: relative_deadline({relative_deadline}) > period({period}); this policy needs constrained deadlines")
             }
         }
     }

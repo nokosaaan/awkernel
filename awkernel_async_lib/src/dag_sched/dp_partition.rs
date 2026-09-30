@@ -1,7 +1,7 @@
 //! System-wide Deadline-Partition boundary tracking and real dispatch
 //! entitlement (real-machine DAG-Fluid): every DAG-Fluid task's own
 //! per-segment absolute deadline (computed at admission time — see
-//! `rd_gen_to_dags::dag_fluid`'s own module doc for Algorithm 1 lines
+//! `crate::dag_sched::policy::dag_fluid`'s own module doc for Algorithm 1 lines
 //! 16–21, the 2022 paper's Section 8 thread-list conversion) is
 //! registered here once, before dispatch begins. Two independent
 //! consumers then watch [`PENDING`]:
@@ -23,7 +23,7 @@
 //! # Completion gate: advance is gated on real work, not just the clock
 //! The papers' segment deadlines are assigned with *zero* slack by
 //! construction (`Σd_i,j` sums exactly to the virtual deadline `D*_i` —
-//! see `rd_gen_to_dags::dag_fluid`'s own module doc): the idealized fluid
+//! see `crate::dag_sched::policy::dag_fluid`'s own module doc): the idealized fluid
 //! model proves a segment finishes exactly on time if run at its own
 //! `theta_i,j` rate continuously, with no margin anywhere. On real
 //! hardware, IPI latency, migration cost, and discrete task-switch
@@ -35,8 +35,8 @@
 //! current segment's own work had actually finished — silently abandoning
 //! any still-running node with no rescue mechanism. This was explicitly
 //! rejected as unacceptable. Instead, each [`BoundaryEntry`] carries a
-//! `gate_nodes` list ([`rd_gen_to_dags::dag_fluid::segment_completion_gates`]'s
-//! own output — the node ids the idealized timeline expects to finish
+//! `gate_nodes` list ([`crate::dag_sched::policy::dag_fluid::segment_completion_gates`]'s
+//! own output, mapped to the caller's node ids — the nodes the idealized timeline expects to finish
 //! exactly at this segment's end): [`advance_due_segments`] only actually
 //! advances past a boundary once every node in its gate has really
 //! processed at least one period (see [`gate_satisfied_from_cache`]'s own
@@ -121,7 +121,7 @@ use core::{
 /// 100us, not the original 1ms: this interval is a pure detection-latency
 /// tax paid once per segment transition (see [`advance_due_segments`]'s
 /// own doc), and with real DAGs commonly decomposing into dozens of
-/// segments (see `rd_gen_to_dags::dag_fluid::segment_completion_gates`'s
+/// segments (see [`crate::dag_sched::policy::dag_fluid::segment_completion_gates`]'s
 /// own real-machine trace: 41 segments observed for one DAG), that tax
 /// compounds across the whole DAG's lifetime -- up to 1ms * segment count
 /// of pure polling overhead on top of the real completion-latency numbers
@@ -137,10 +137,10 @@ struct BoundaryEntry {
     /// The absolute time this boundary is scheduled for.
     scheduled: Time,
     /// `m_i,j`: this segment's own thread count (see
-    /// `rd_gen_to_dags::dag_fluid::SegmentSchedule::concurrency`).
+    /// `crate::dag_sched::policy::dag_fluid::SegmentSchedule::concurrency`).
     concurrency: u32,
     /// `theta_i,j`: this segment's own execution rate (see
-    /// `rd_gen_to_dags::dag_fluid::SegmentSchedule::rate`).
+    /// `crate::dag_sched::policy::dag_fluid::SegmentSchedule::rate`).
     rate: f64,
     /// This segment's own completion gate (see this module's own doc) —
     /// node ids the idealized timeline expects to finish exactly at this
@@ -185,7 +185,7 @@ static CURRENT: Mutex<BTreeMap<u32, (u32, f64)>> = Mutex::new(BTreeMap::new());
 /// feature uses) into a `Duration`. Truncates towards zero rather than
 /// rounding: `f64::round`/`ceil` need `std`/`libm`, unavailable in this
 /// crate's `no_std` build — the same constraint
-/// `rd_gen_to_dags::dag_fluid` documents for its own float-to-integer
+/// `crate::dag_sched::policy::dag_fluid` documents for its own float-to-integer
 /// conversions (`ceil_capacity_to_cores`). Negative input (should not
 /// occur for a real offset/deadline) clamps to zero rather than
 /// wrapping.
@@ -195,12 +195,12 @@ fn millis_f64_to_duration(ms: f64) -> Duration {
 
 /// Register one segment's own absolute deadline (`release +
 /// offset_ms + duration_ms`, both in milliseconds — `offset_ms` from
-/// `rd_gen_to_dags::dag_fluid::segment_release_offsets`, `duration_ms`
+/// `crate::dag_sched::policy::dag_fluid::segment_release_offsets`, `duration_ms`
 /// from that same segment's own `SegmentSchedule::relative_deadline`)
 /// for `dag_id`, along with the `(concurrency, rate)` DP-Wrap density this
 /// segment contributes (see `scheduler::dp_wrap::recompute_and_apply`'s
 /// own doc) and its own completion gate (`gate_nodes` — see
-/// `rd_gen_to_dags::dag_fluid::segment_completion_gates`). Called once per
+/// [`crate::dag_sched::policy::dag_fluid::segment_completion_gates`]). Called once per
 /// segment, in increasing `segment_index` order, at DAG-Fluid admission
 /// time (boot, non-RT), before [`arm_next`]/dispatch begins. `segment_index
 /// == 0` also seeds [`CURRENT`] with this segment's own density, since a

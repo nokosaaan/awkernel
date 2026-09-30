@@ -2,6 +2,7 @@
 //! [`super::metrics::DagMetrics`] into a [`super::provision::Provision`] and,
 //! from it, a [`crate::scheduler::SchedulerType`] for a DAG's nodes.
 
+pub mod dag_fluid;
 pub mod federated;
 pub mod sfs;
 pub mod vfed;

@@ -6,8 +6,8 @@
 //!
 //! [`min_dedicated_cores`]: awkernel_async_lib::dag_sched::metrics::DagMetrics::min_dedicated_cores
 //!
-//! # How this differs from `acceptance_ratio.rs`
-//! That file derives `m = ceil(U_Sigma / u_norm)` *per resampled trial*, so
+//! # How this differs from `paper_setting_comparison.rs`
+//! That file (the V-Fed paper's Sec. 7 method) derives `m = ceil(U_Sigma / u_norm)` *per resampled trial*, so
 //! `m` is whatever the trial's own draw needs -- never tied to any real
 //! machine's actual core count (see its own module doc). This file inverts
 //! that: `real_cores` (a CLI argument, e.g. the target machine's actual
@@ -61,9 +61,8 @@
 //! deadline type; recorded per trial as `federated_variant`), V-Fed's own
 //! batch planner (`vfed::is_batch_feasible`, TPDS'23 Algorithms 1-2), and
 //! DAG-Fluid's own fluid-capacity check (`dag_fluid::is_batch_feasible`) --
-//! mirroring
-//! `acceptance_ratio.rs`'s own three-column CSV, just with `real_cores`
-//! fixed instead of a derived `m`. `manifest_jsonl` records all three
+//! the same policies as `paper_setting_comparison.rs`'s CSV, just with
+//! `real_cores` fixed instead of a derived `m`. `manifest_jsonl` records all three
 //! per-trial booleans (`accepted`/`vfed_accepted`/`dag_fluid_accepted`),
 //! (plus `sfs_accepted`, SFS-G of Lendve et al., JSA 2026, `policy::sfs`),
 //! so a real-machine comparison can read the ONE column matching whichever
@@ -96,15 +95,16 @@ use std::{
 };
 
 use awkernel_async_lib::dag_sched::{
+    graph::DagGraph,
     metrics::DagMetrics,
     policy::{
-        federated::{self, DagGraph, FedTask, FederatedVariant},
+        dag_fluid::{self, Segment},
+        federated::{self, FedTask, FederatedVariant},
         sfs::{self, SfsTask},
         vfed::{self, PackingStrategy},
     },
 };
 use rand::seq::IndexedRandom;
-use rd_gen_to_dags::dag_fluid::{self, Segment};
 
 const DEFAULT_U_NORM_MIN: f64 = 0.10;
 const DEFAULT_U_NORM_MAX: f64 = 1.00;
@@ -335,7 +335,7 @@ fn u_norm_values(u_norm_min: f64, u_norm_max: f64, u_norm_step: f64) -> Vec<f64>
 /// Load every `dag_<N>.yaml` directly inside `dags_dir` as-is -- RD-Gen's own
 /// 'Constrained' deadline mode already guarantees `D <= period` by
 /// construction (see this file's own module doc for why this file does NOT
-/// override deadline/period the way `acceptance_ratio.rs` does) -- then drop
+/// override deadline/period the way `paper_setting_comparison.rs` does) -- then drop
 /// any DAG `classify_dag` already calls infeasible (see this file's own
 /// "Per-DAG prefilter" doc for why only that case, not a plain
 /// `Heavy { required_cores }`, is dropped here). Returns the survivors

@@ -1,12 +1,18 @@
-//! DAG-Fluid's *static* admission math — segment decomposition and
-//! Algorithm 2's per-task capacity computation, used both as an offline
-//! schedulability test (see this crate's `examples/acceptance_ratio.rs`)
-//! and, via [`assign_segment_deadlines`]/[`segment_completion_gates`], to
-//! feed the real-machine dynamic runtime layer
-//! (`awkernel_async_lib::dag_sched::dp_partition` /
-//! `awkernel_async_lib::scheduler::dp_wrap`). See those modules' own docs
-//! for the DP-Fair/DP-Wrap dispatch mechanism and its documented
-//! simplifications relative to the papers' idealized fluid model.
+//! DAG-Fluid's *static* admission math — Table 1's virtual deadline and
+//! Algorithms 1 and 2's per-task capacity computation, used both as an
+//! offline schedulability test (`rd_gen_to_dags`'s
+//! `examples/paper_setting_comparison.rs` / `theory_vs_reality.rs`) and,
+//! via [`assign_segment_deadlines`], to feed the real-machine dynamic
+//! runtime layer ([`crate::dag_sched::dp_partition`] /
+//! [`crate::scheduler::dp_wrap`]). See those modules' own docs for the
+//! DP-Fair/DP-Wrap dispatch mechanism and its documented simplifications
+//! relative to the papers' idealized fluid model.
+//!
+//! The DAG's structure enters only through [`decompose_segments`] and
+//! [`segment_completion_gates`] (Sec. 4.1), which read a
+//! [`DagGraph`] -- node WCETs and edges, whatever application declared the
+//! DAG; everything after that is a pure function of `(C, T, L, D,
+//! segments)`.
 //!
 //! # Which paper, and why this module was rewritten
 //!
@@ -22,7 +28,7 @@
 //!
 //! This module previously implemented the 2020 paper's algorithm (a fixed,
 //! `m`-dependent threshold `alpha_i = C_i/(T_i - (m/(m+1))*L_i)` for
-//! light/heavy classification), but `examples/acceptance_ratio.rs` generates
+//! light/heavy classification), but the offline evaluation generates
 //! *constrained*-deadline task sets (via the V-Fed paper's own `D ~
 //! Uniform[L, L/alpha]` then `T = D/beta`, `beta <= 1`, so `T >= D`
 //! unconditionally) — exactly the case the 2020 paper's model excludes.
@@ -54,11 +60,11 @@
 //! | 6   | `T_i/D_i in (sqrt(2)/2, 1)` and `L_i <= T_i`             | `T_i`   |
 //!
 //! Row 1 (`T_i >= D_i`, i.e. constrained deadline) is the *only* row this
-//! crate's own experimental setup can ever hit: `acceptance_ratio.rs`
+//! project's own experimental setup can ever hit: the evaluation
 //! guarantees `T_i >= D_i` by construction (`T = D/beta`, `beta <= 1`), so
 //! `T_i/D_i >= 1` unconditionally, and `D*_i = D_i` always in practice. Rows
 //! 2–6 (arbitrary deadlines, `D_i > T_i`) are implemented anyway for
-//! faithfulness and reusability, but are dead code against this crate's own
+//! faithfulness and reusability, but are dead code against this project's own
 //! generated pools today.
 //!
 //! ## Step 2 — classify by `C_i` vs `D*_i` (not `T_i`)
@@ -89,7 +95,7 @@
 //! of Federated's `required_cores`), not a per-thread rate. The task's full
 //! contribution to the system-wide capacity sum is `ceil(D*_i/T_i) *
 //! rate_i` (`ceil(D*_i/T_i)` accounts for multiple concurrent job instances
-//! when `D*_i > T_i`; always `1` under this crate's constrained-deadline
+//! when `D*_i > T_i`; always `1` under this project's constrained-deadline
 //! pools since `D*_i = D_i <= T_i` there).
 //!
 //! `m` **never appears** in Steps 2–4 above — every quantity is computed
@@ -110,10 +116,10 @@
 //! tasks, reject if `delta > m` at any point). This is now a direct
 //! transcription of Algorithm 2 rather than an inferred composition.
 
-use crate::parse_yaml::DagData;
-
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
+
+use crate::dag_sched::graph::DagGraph;
 
 /// One interval of [`decompose_segments`]'s output: `duration` = `l_i,j`
 /// (the WCET of each thread in this segment, under the papers' "infinite
@@ -126,161 +132,107 @@ pub struct Segment {
     pub concurrency: u32,
 }
 
-/// Decompose `dag_data` into segments via the papers' shared construction
-/// (2022 paper Section 4.1, identical to the 2020 paper's Section 4.2):
-/// build the "infinite processors" timing diagram (every node starts the
-/// instant its last predecessor finishes — `start[v] = max(finish[pred] for
-/// pred in in_links)`, `finish[v] = start[v] + execution_time[v]`), collect
-/// every distinct start/finish instant into a sorted timeline, and treat
-/// each consecutive pair of instants as one segment, with `concurrency` =
-/// how many nodes are active (`start <= t0 < finish`) during it. This step
-/// is shared by both papers' algorithms and is unaffected by which deadline
-/// model is in use.
-///
-/// Two structural invariants hold for any DAG (checked in this module's own
-/// tests against [`crate::dag_stats::compute_dag_stats`]'s independently
-/// computed values, since both are derived from the same node/edge data by
-/// a different route):
-/// - `Σ duration * concurrency == volume` (every unit of work is in exactly
-///   one segment, running on exactly `concurrency` nodes for that
-///   segment's `duration`).
-/// - `Σ duration == critical_path` (segments partition the *entire*
-///   infinite-processor timeline end to end, and that timeline's total span
-///   is, by definition, the longest path's own length).
-///
-/// Shared "infinite processors" timing computation (see [`decompose_segments`]'s
-/// own doc): per-node `start`/`finish` in that idealized model, plus the
-/// sorted, deduplicated timeline of every distinct start/finish instant.
-/// Factored out so [`decompose_segments`] and [`segment_completion_gates`]
-/// derive their respective outputs from the exact same node timing rather
-/// than two independently-computed (and potentially drifting) copies.
-fn segment_timeline(dag_data: &DagData) -> (BTreeMap<u32, u64>, BTreeMap<u32, u64>, Vec<u64>) {
-    let nodes = dag_data.get_nodes();
+/// Per-node `start`/`finish` in the papers' "infinite processors" model
+/// (every node starts the instant its last predecessor finishes), `None`
+/// for a node on or behind a cycle, plus the sorted, deduplicated timeline
+/// of every distinct start/finish instant. Shared by [`decompose_segments`]
+/// and [`segment_completion_gates`] so both derive their outputs from the
+/// exact same node timing.
+fn segment_timeline(graph: &DagGraph) -> (Vec<Option<(u64, u64)>>, Vec<u64>) {
+    let n = graph.len();
+    let mut remaining: Vec<usize> = (0..n).map(|v| graph.in_degree(v)).collect();
+    let mut start = alloc::vec![0u64; n];
+    let mut timing: Vec<Option<(u64, u64)>> = alloc::vec![None; n];
+    let mut queue: VecDeque<usize> = (0..n).filter(|&v| remaining[v] == 0).collect();
 
-    let node_by_id: BTreeMap<u32, &crate::parse_yaml::NodeData> =
-        nodes.iter().map(|node| (node.get_id(), node)).collect();
-
-    let mut in_degree: BTreeMap<u32, usize> = nodes
-        .iter()
-        .map(|node| (node.get_id(), node.get_in_links().len()))
-        .collect();
-
-    let mut queue: VecDeque<u32> = in_degree
-        .iter()
-        .filter(|&(_, &degree)| degree == 0)
-        .map(|(&id, _)| id)
-        .collect();
-
-    let mut start: BTreeMap<u32, u64> = BTreeMap::new();
-    let mut finish: BTreeMap<u32, u64> = BTreeMap::new();
-
-    while let Some(id) = queue.pop_front() {
-        let Some(node) = node_by_id.get(&id) else {
-            continue;
-        };
-
-        let pred_max = node
-            .get_in_links()
-            .iter()
-            .filter_map(|pred_id| finish.get(pred_id).copied())
-            .max()
-            .unwrap_or(0);
-        let node_start = pred_max;
-        let node_finish = node_start + node.get_execution_time();
-        start.insert(id, node_start);
-        finish.insert(id, node_finish);
-
-        for out_id in node.get_out_links() {
-            if let Some(degree) = in_degree.get_mut(out_id) {
-                *degree = degree.saturating_sub(1);
-                if *degree == 0 {
-                    queue.push_back(*out_id);
-                }
+    while let Some(v) = queue.pop_front() {
+        let finish = start[v] + graph.wcet(v);
+        timing[v] = Some((start[v], finish));
+        for &w in graph.successors(v) {
+            start[w] = start[w].max(finish);
+            remaining[w] -= 1;
+            if remaining[w] == 0 {
+                queue.push_back(w);
             }
         }
     }
 
-    let mut events: Vec<u64> = start.values().chain(finish.values()).copied().collect();
+    let mut events: Vec<u64> = timing.iter().flatten().flat_map(|&(s, f)| [s, f]).collect();
     events.sort_unstable();
     events.dedup();
-
-    (start, finish, events)
+    (timing, events)
 }
 
-pub(crate) fn decompose_segments(dag_data: &DagData) -> Vec<Segment> {
-    let (start, finish, events) = segment_timeline(dag_data);
+/// How many nodes run during the window starting at `t0`.
+fn active_at(timing: &[Option<(u64, u64)>], t0: u64) -> usize {
+    timing
+        .iter()
+        .flatten()
+        .filter(|&&(s, f)| s <= t0 && t0 < f)
+        .count()
+}
 
-    let mut segments = Vec::new();
-    for window in events.windows(2) {
-        let (t0, t1) = (window[0], window[1]);
-        let concurrency = start
-            .iter()
-            .filter(|&(id, &node_start)| {
-                let node_finish = finish.get(id).copied().unwrap_or(node_start);
-                node_start <= t0 && t0 < node_finish
+/// Decompose a DAG into segments via the papers' shared construction (2022
+/// paper Section 4.1, identical to the 2020 paper's Section 4.2): build the
+/// "infinite processors" timing diagram (`start[v] = max(finish[pred])`,
+/// `finish[v] = start[v] + c(v)`), collect every distinct start/finish
+/// instant into a sorted timeline, and treat each consecutive pair of
+/// instants as one segment, with `concurrency` = how many nodes are active
+/// (`start <= t0 < finish`) during it. Unaffected by the deadline model.
+///
+/// Two structural invariants hold for any DAG (checked in this module's
+/// tests):
+/// - `Σ duration * concurrency == volume` (every unit of work is in exactly
+///   one segment).
+/// - `Σ duration == critical_path` (segments partition the whole
+///   infinite-processor timeline, whose span is the longest path's length).
+pub fn decompose_segments(graph: &DagGraph) -> Vec<Segment> {
+    let (timing, events) = segment_timeline(graph);
+    events
+        .windows(2)
+        .filter_map(|w| {
+            let concurrency = active_at(&timing, w[0]);
+            // No node active: cannot happen for a connected DAG, skipped
+            // harmlessly if it does.
+            (concurrency > 0).then(|| Segment {
+                duration: w[1] - w[0],
+                concurrency: concurrency as u32,
             })
-            .count();
-        if concurrency == 0 {
-            continue; // no node active in this interval (shouldn't happen for a connected DAG, but harmless if it does)
-        }
-        segments.push(Segment {
-            duration: t1 - t0,
-            concurrency: concurrency as u32,
-        });
-    }
-    segments
+        })
+        .collect()
 }
 
-/// For each segment [`decompose_segments`] would produce (same order, same
-/// zero-concurrency-window skip, so indices line up 1:1 with its output and
-/// with [`assign_segment_deadlines`]'s), the node ids whose "infinite
-/// processors" finish time coincides with that segment's own *end* instant
-/// -- i.e. the nodes the idealized timeline expects to have completed by
-/// the time this segment's theoretical deadline is reached.
+/// For each segment [`decompose_segments`] produces (same order, same
+/// skipped windows, so indices line up 1:1 with its output and with
+/// [`assign_segment_deadlines`]'s), the [`DagGraph`] indices of the nodes
+/// whose "infinite processors" finish time is that segment's *end* instant
+/// -- the nodes the idealized timeline expects to have completed by the
+/// segment's theoretical deadline. Ascending index order.
 ///
-/// Used by `dag_sched::dp_partition` (real-machine dispatch) as a
-/// completion gate: a segment's boundary is only actually acted on once
-/// every node in its own gate has really reached `State::Terminated`, not
-/// merely once the theoretical deadline has elapsed -- seeing the real
-/// gap between the two *is* the point (see that module's own doc), but
-/// letting the dispatcher silently abandon still-running work the instant
-/// the clock says "done" was explicitly rejected as unacceptable (it would
-/// starve that work of any further entitlement with no rescue mechanism).
+/// Used by [`crate::dag_sched::dp_partition`] (real-machine dispatch) as a
+/// completion gate: a segment's boundary is only acted on once every node
+/// in its gate has really terminated, not merely once the theoretical
+/// deadline has elapsed -- seeing the real gap between the two *is* the
+/// point (see that module's doc), but abandoning still-running work the
+/// instant the clock says "done" would starve it with no rescue mechanism.
 ///
-/// A node can legitimately appear in no gate at all if its own finish
-/// falls strictly *inside* a window rather than at a boundary -- untested
-/// for any DAG this crate's own generators can currently produce (every
-/// node's finish is, by construction, one of the timeline's own event
-/// points), but harmless if it ever did: that node's completion would then
-/// never gate anything, same as if this function were never consulted for
-/// it.
-#[cfg_attr(not(feature = "dagfluid"), allow(dead_code))]
-pub(crate) fn segment_completion_gates(dag_data: &DagData) -> Vec<Vec<u32>> {
-    let (start, finish, events) = segment_timeline(dag_data);
-
-    let mut gates = Vec::new();
-    for window in events.windows(2) {
-        let (t0, t1) = (window[0], window[1]);
-        // Identical predicate to `decompose_segments`'s own concurrency
-        // check, so a window is skipped here iff it is skipped there --
-        // keeps this function's output aligned index-for-index with
-        // `decompose_segments`'s (and hence `assign_segment_deadlines`'s).
-        let is_active = |id: &u32| -> bool {
-            let node_start = start.get(id).copied().unwrap_or(0);
-            let node_finish = finish.get(id).copied().unwrap_or(node_start);
-            node_start <= t0 && t0 < node_finish
-        };
-        if !start.keys().any(is_active) {
-            continue;
-        }
-        let gate: Vec<u32> = finish
-            .iter()
-            .filter(|&(_, &node_finish)| node_finish == t1)
-            .map(|(&id, _)| id)
-            .collect();
-        gates.push(gate);
-    }
-    gates
+/// A node appears in no gate if its finish falls strictly inside a window;
+/// that cannot happen here (every finish is one of the timeline's own
+/// event points), and would only mean its completion gates nothing.
+pub fn segment_completion_gates(graph: &DagGraph) -> Vec<Vec<usize>> {
+    let (timing, events) = segment_timeline(graph);
+    events
+        .windows(2)
+        .filter(|w| active_at(&timing, w[0]) > 0)
+        .map(|w| {
+            timing
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.is_some_and(|(_, f)| f == w[1]))
+                .map(|(v, _)| v)
+                .collect()
+        })
+        .collect()
 }
 
 /// Table 1 (2022 paper): pick the virtual deadline `D*_i`. See this
@@ -290,7 +242,7 @@ pub(crate) fn segment_completion_gates(dag_data: &DagData) -> Vec<Vec<u32>> {
 /// crate's own generated pools ever exercise.
 // One branch per row of the paper's table, even where rows share a value.
 #[allow(clippy::if_same_then_else)]
-pub(crate) fn virtual_deadline(period: u64, deadline: u64, critical_path: u64) -> u64 {
+pub fn virtual_deadline(period: u64, deadline: u64, critical_path: u64) -> u64 {
     let t = period as f64;
     let d = deadline as f64;
     let l = critical_path as f64;
@@ -316,8 +268,7 @@ pub(crate) fn virtual_deadline(period: u64, deadline: u64, critical_path: u64) -
 }
 
 // `f64::sqrt` isn't available in `core` without `libm`/`std`; this crate
-// builds with `std` for the `acceptance_ratio` example (see its own
-// `--features std`), but stays `#![no_std]` at the crate root, so spell the
+// stays `#![no_std]` for the kernel build, so spell the
 // two needed square roots out via Newton's method rather than add a new
 // dependency for two constants.
 fn libm_sqrt(x: f64) -> f64 {
@@ -379,7 +330,7 @@ fn heavy_capacity_and_deadline(
 /// 1 uses internally only for light/heavy classification (lines 1–15).
 /// Section 8's `r_i,j` (segment release offset) needs the timeline order to
 /// accumulate predecessor segments' deadlines; see
-/// [`crate::dag_fluid`]'s own module doc and
+/// this module's own doc and
 /// [`segment_release_offsets`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SegmentSchedule {
@@ -438,7 +389,8 @@ pub struct SegmentSchedule {
 /// here (instead of changing that function's return type) keeps
 /// [`required_capacity`]'s already-tested static-admission path — Phase 0
 /// of the real-machine DAG-Fluid work, already wired into
-/// `crate::build_dag` and shipped — untouched by this Phase 1 addition.
+/// `rd_gen_to_dags`'s `build_dag` and shipped — untouched by this Phase 1
+/// addition.
 ///
 /// Returns `None` under the same conditions as
 /// [`heavy_capacity_and_deadline`] (no heavy segment, or a non-positive
@@ -566,211 +518,89 @@ pub fn is_batch_feasible(entries: &[(u64, u64, u64, u64, &[Segment])], m: u16) -
     delta <= m as f64
 }
 
+/// Paper-conformance tests: worked example of Guan, Peng, Qiao, TC 2022.
+#[cfg(test)]
+mod paper_examples;
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dag_stats::compute_dag_stats;
-    use crate::parse_yaml::parse_dags;
 
-    /// Algorithm 1's own worked example (2022 paper, Fig. 1 and its
-    /// caption): `C_i=120, L_i=60, T_i=90, D_i=80`, five segments
-    /// `(l_i,j, m_i,j)` = `(10,1), (10,2), (20,3), (10,2), (10,1)` in
-    /// timeline order. `T_i/D_i = 90/80 = 1.125 >= 1` selects Table 1's
-    /// row 1, so `D*_i = D_i = 80` (confirmed by
-    /// `virtual_deadline(90, 80, 60) == 80` below). The paper's own text
-    /// states the resulting `D^H_i=60, C^H_i=100` directly (Fig. 1's
-    /// caption), and Fig. 1d gives `d_i,j` = 10, 12, 36, 12, 10 and
-    /// `θ_i,j` = 1, 5/6, 5/9, 5/6, 1 for the five segments in order —
-    /// every value checked here is transcribed from the primary source,
-    /// not derived.
-    #[test]
-    fn test_assign_segment_deadlines_matches_paper_worked_example() {
-        let segments = [
-            Segment {
-                duration: 10,
-                concurrency: 1,
-            },
-            Segment {
-                duration: 10,
-                concurrency: 2,
-            },
-            Segment {
-                duration: 20,
-                concurrency: 3,
-            },
-            Segment {
-                duration: 10,
-                concurrency: 2,
-            },
-            Segment {
-                duration: 10,
-                concurrency: 1,
-            },
-        ];
-        let volume = 120;
-        let d_star = virtual_deadline(90, 80, 60);
-        assert_eq!(d_star, 80);
-
-        let schedule = assign_segment_deadlines(&segments, volume, d_star).unwrap();
-        let deadlines: Vec<f64> = schedule.iter().map(|s| s.relative_deadline).collect();
-        assert_eq!(deadlines, alloc::vec![10.0, 12.0, 36.0, 12.0, 10.0]);
-
-        let rates: Vec<f64> = schedule.iter().map(|s| s.rate).collect();
-        assert_eq!(
-            rates,
-            alloc::vec![1.0, 10.0 / 12.0, 20.0 / 36.0, 10.0 / 12.0, 1.0]
-        );
-        // Paper's own Definition 4.1 states the light-segment rate as
-        // exactly 5/6 and 5/9 -- confirm the fractions reduce to those.
-        assert!((rates[1] - 5.0 / 6.0).abs() < 1e-9);
-        assert!((rates[2] - 5.0 / 9.0).abs() < 1e-9);
-
-        let offsets = segment_release_offsets(&schedule);
-        assert_eq!(offsets, alloc::vec![0.0, 10.0, 22.0, 58.0, 70.0]);
-        // Sum of every segment's own relative deadline equals D*_i (Eq. 3).
-        let total: f64 = deadlines.iter().sum();
-        assert!((total - d_star as f64).abs() < 1e-9);
-    }
-
+    /// 0 --10--> 1 --20--> 2 (single path, never concurrent).
     #[test]
     fn test_decompose_segments_linear_chain() {
-        // Same fixture as dag_stats::tests::test_compute_dag_stats_chain:
-        // 0 --10--> 1 --20--> 2 (single path, never concurrent).
-        let dag_file = "links:
-  - source: 0
-    target: 1
-  - source: 1
-    target: 2
-nodes:
-  - execution_time: 10
-    id: 0
-    period: 50
-  - execution_time: 20
-    id: 1
-  - end_to_end_deadline: 40
-    execution_time: 5
-    id: 2
-";
-        let dags = parse_dags(&[dag_file]).unwrap();
-        let segments = decompose_segments(&dags[0]);
+        let g = DagGraph::new(alloc::vec![10, 20, 5], &[(0, 1), (1, 2)]).unwrap();
+        let segments = decompose_segments(&g);
         assert!(segments.iter().all(|s| s.concurrency == 1));
-        let total_duration: u64 = segments.iter().map(|s| s.duration).sum();
-        let total_work: u64 = segments
-            .iter()
-            .map(|s| s.duration * s.concurrency as u64)
-            .sum();
-        let stats = compute_dag_stats(&dags[0]);
-        assert_eq!(total_duration, stats.critical_path);
-        assert_eq!(total_work, stats.volume);
+        assert_eq!(segments.iter().map(|s| s.duration).sum::<u64>(), 35); // L
+        assert_eq!(
+            segments
+                .iter()
+                .map(|s| s.duration * s.concurrency as u64)
+                .sum::<u64>(),
+            35 // C
+        );
+    }
+
+    /// Diamond 0 -> {1, 2} -> 3 with WCETs 10, 30, 5, 5. Infinite
+    /// processors: node0 [0,10), node1 [10,40), node2 [10,15), node3
+    /// [40,45) -> segments [0,10) x1, [10,15) x2, [15,40) x1, [40,45) x1.
+    fn diamond() -> DagGraph {
+        DagGraph::new(alloc::vec![10, 30, 5, 5], &[(0, 1), (0, 2), (1, 3), (2, 3)]).unwrap()
     }
 
     #[test]
-    fn test_decompose_segments_diamond_matches_dag_stats() {
-        // Same fixture as dag_stats::tests::test_compute_dag_stats_diamond.
-        // Hand-derived under infinite processors: start/finish = 0(node0,
-        // s=0,f=10), node1(s=10,f=40), node2(s=10,f=15), node3(s=40,f=45).
-        // Segments: [0,10) concurrency=1 (node0); [10,15) concurrency=2
-        // (node1,node2); [15,40) concurrency=1 (node1 only, node2 already
-        // finished at 15); [40,45) concurrency=1 (node3).
-        let dag_file = "links:
-  - source: 0
-    target: 1
-  - source: 0
-    target: 2
-  - source: 1
-    target: 3
-  - source: 2
-    target: 3
-nodes:
-  - execution_time: 10
-    id: 0
-    period: 50
-  - execution_time: 30
-    id: 1
-  - execution_time: 5
-    id: 2
-  - end_to_end_deadline: 100
-    execution_time: 5
-    id: 3
-";
-        let dags = parse_dags(&[dag_file]).unwrap();
-        let segments = decompose_segments(&dags[0]);
+    fn test_decompose_segments_diamond() {
+        let segments = decompose_segments(&diamond());
+        let seg = |duration, concurrency| Segment {
+            duration,
+            concurrency,
+        };
         assert_eq!(
             segments,
-            alloc::vec![
-                Segment {
-                    duration: 10,
-                    concurrency: 1
-                },
-                Segment {
-                    duration: 5,
-                    concurrency: 2
-                },
-                Segment {
-                    duration: 25,
-                    concurrency: 1
-                },
-                Segment {
-                    duration: 5,
-                    concurrency: 1
-                },
-            ]
+            alloc::vec![seg(10, 1), seg(5, 2), seg(25, 1), seg(5, 1)]
         );
-
-        let total_duration: u64 = segments.iter().map(|s| s.duration).sum();
-        let total_work: u64 = segments
-            .iter()
-            .map(|s| s.duration * s.concurrency as u64)
-            .sum();
-        let stats = compute_dag_stats(&dags[0]);
-        assert_eq!(total_duration, stats.critical_path); // 45
-        assert_eq!(total_work, stats.volume); // 50
+        assert_eq!(segments.iter().map(|s| s.duration).sum::<u64>(), 45); // L
+        assert_eq!(
+            segments
+                .iter()
+                .map(|s| s.duration * s.concurrency as u64)
+                .sum::<u64>(),
+            50 // C
+        );
     }
 
-    /// Same fixture as `test_decompose_segments_diamond_matches_dag_stats`,
-    /// deliberately chosen because node1 (s=10,f=40) spans *two* segments
-    /// ([10,15) and [15,40)) -- exactly the "a node can span multiple
-    /// segments" case that ruled out per-node segment membership as a
-    /// dispatch-time concept (see `dag_sched::dp_partition`'s own doc).
-    /// [`segment_completion_gates`] only needs "which nodes finish at this
-    /// segment's own end", which stays well-defined even here: node1 gates
-    /// segment[2] (its own finish, 40, matches that segment's end), not
-    /// segment[1] where it merely *started*.
+    /// node1 ([10,40)) spans *two* segments -- the case that rules out
+    /// per-node segment membership as a dispatch-time concept (see
+    /// `dag_sched::dp_partition`'s doc). The gate only needs "which nodes
+    /// finish at this segment's end": node1 gates segment[2], where it
+    /// finishes, not segment[1], where it starts.
     #[test]
     fn test_segment_completion_gates_diamond() {
-        let dag_file = "links:
-  - source: 0
-    target: 1
-  - source: 0
-    target: 2
-  - source: 1
-    target: 3
-  - source: 2
-    target: 3
-nodes:
-  - execution_time: 10
-    id: 0
-    period: 50
-  - execution_time: 30
-    id: 1
-  - execution_time: 5
-    id: 2
-  - end_to_end_deadline: 100
-    execution_time: 5
-    id: 3
-";
-        let dags = parse_dags(&[dag_file]).unwrap();
-        let segments = decompose_segments(&dags[0]);
-        let gates = segment_completion_gates(&dags[0]);
-        assert_eq!(segments.len(), gates.len());
+        let g = diamond();
+        let gates = segment_completion_gates(&g);
+        assert_eq!(gates.len(), decompose_segments(&g).len());
         assert_eq!(
             gates,
             alloc::vec![
-                alloc::vec![0u32], // segment[0] ends at t=10: node0 finishes there
-                alloc::vec![2u32], // segment[1] ends at t=15: node2 finishes there
-                alloc::vec![1u32], // segment[2] ends at t=40: node1 finishes there (though it started in segment[1])
-                alloc::vec![3u32], // segment[3] ends at t=45: node3 finishes there
+                alloc::vec![0], // ends at 10
+                alloc::vec![2], // ends at 15
+                alloc::vec![1], // ends at 40
+                alloc::vec![3], // ends at 45
             ]
+        );
+    }
+
+    #[test]
+    fn test_decompose_segments_ignores_nodes_on_a_cycle() {
+        // 0 -> 1 -> 2 -> 1: nodes 1 and 2 never become ready.
+        let g = DagGraph::new(alloc::vec![4, 3, 2], &[(0, 1), (1, 2), (2, 1)]).unwrap();
+        assert_eq!(
+            decompose_segments(&g),
+            alloc::vec![Segment {
+                duration: 4,
+                concurrency: 1
+            }]
         );
     }
 

@@ -5,17 +5,20 @@ use crate::parse_yaml::{DagData, NodeData};
 use crate::time_unit::{convert_duration, simulated_execution_time};
 
 use alloc::{borrow::Cow, collections::BTreeMap, format, sync::Arc, vec::Vec};
-#[cfg(feature = "laxity")]
-use awkernel_async_lib::dag_sched::metrics::DagMetrics;
 #[cfg(not(feature = "vfed"))]
 use awkernel_async_lib::dag_sched::policy::federated::FederatedAssignment;
 #[cfg(feature = "vfed")]
-use awkernel_async_lib::dag_sched::policy::vfed::{self, VFedError};
+use awkernel_async_lib::dag_sched::policy::vfed;
 #[cfg(feature = "dagfluid")]
 use awkernel_async_lib::dag_sched::resource::{self, ResourceError};
+#[cfg(any(feature = "laxity", feature = "dagfluid"))]
+use awkernel_async_lib::dag_sched::{
+    metrics::DagMetrics,
+    precondition::{self, Policy},
+};
 use awkernel_async_lib::{
-    dag::{Dag, create_dag, record_build_failure},
-    dag_sched::policy::federated::FederatedError,
+    dag::{Dag, DagError, create_dag, record_build_failure},
+    dag_sched::admission::AdmissionError,
     scheduler::SchedulerType,
 };
 
@@ -52,15 +55,16 @@ impl core::fmt::Display for LinkNumError {
     }
 }
 
-/// Errors that can prevent a DAG from being built, from either link-arity
-/// validation or admission (Federated Scheduling or, with the `vfed`
-/// feature, V-Fed).
+/// Errors that can prevent a DAG from being built: link-arity validation,
+/// the DAG's own problems ([`DagError`]: missing timing, or a precondition
+/// of the active admission policy, see
+/// `awkernel_async_lib::dag_sched::precondition`), or the admission
+/// policy's rejection ([`AdmissionError`]).
 pub(crate) enum BuildDagError {
     LinkNum(LinkNumError),
-    Federated(FederatedError),
-    #[cfg(feature = "vfed")]
-    VFed(VFedError),
-    /// `vfed::admit_one` succeeded but `into_scheduler_type` returned
+    Dag(DagError),
+    Admission(AdmissionError),
+    /// `vfed::admit_batch` succeeded but `into_scheduler_type` returned
     /// `None` — should not happen for any `VFedAssignment` this crate's own
     /// admission call can produce (see that method's own doc), kept only so
     /// the conversion stays total rather than panicking on a should-never
@@ -71,33 +75,14 @@ pub(crate) enum BuildDagError {
     /// batch admission (`federated::admit_batch`) should have decided.
     #[cfg(not(any(feature = "vfed", feature = "laxity", feature = "dagfluid")))]
     FederatedNotAdmitted(u32),
-    /// The DAG's source node has no `period`, or its sink node has no
-    /// `end_to_end_deadline` — both are required for admission.
-    MissingDagTiming(u32),
-    /// (`laxity` feature only) `compute_node_laxity` found
-    /// `relative_deadline <= critical_path` — the DAG is unconditionally
-    /// infeasible under any policy, not specific to this one.
-    #[cfg(feature = "laxity")]
-    LaxityInfeasible(u32),
-    /// (`dagfluid` feature only) `dag_fluid::required_capacity` returned
-    /// `None`: either `critical_path > relative_deadline` (unconditionally
-    /// infeasible under any policy), or a degenerate segment decomposition
-    /// (see that function's own doc).
-    #[cfg(feature = "dagfluid")]
-    DagFluidInfeasible(u32),
-    /// (`dagfluid` feature only) the shared core ledger could not satisfy
-    /// this DAG's `ceil(required_capacity)`-cores placeholder request.
-    #[cfg(feature = "dagfluid")]
-    DagFluidResource(ResourceError),
 }
 
 impl core::fmt::Display for BuildDagError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             BuildDagError::LinkNum(e) => write!(f, "{e}"),
-            BuildDagError::Federated(e) => write!(f, "{e}"),
-            #[cfg(feature = "vfed")]
-            BuildDagError::VFed(e) => write!(f, "{e:?}"),
+            BuildDagError::Dag(e) => write!(f, "{e}"),
+            BuildDagError::Admission(e) => write!(f, "{e}"),
             #[cfg(feature = "vfed")]
             BuildDagError::VFedSchedulerTypeMissing(dag_id) => write!(
                 f,
@@ -108,30 +93,7 @@ impl core::fmt::Display for BuildDagError {
                 f,
                 "DAG#{dag_id}: no federated batch-admission decision for this DAG"
             ),
-            BuildDagError::MissingDagTiming(dag_id) => write!(
-                f,
-                "DAG#{dag_id} has no source period or no sink end-to-end deadline"
-            ),
-            #[cfg(feature = "laxity")]
-            BuildDagError::LaxityInfeasible(dag_id) => write!(
-                f,
-                "DAG#{dag_id}: relative_deadline <= critical_path, unconditionally infeasible"
-            ),
-            #[cfg(feature = "dagfluid")]
-            BuildDagError::DagFluidInfeasible(dag_id) => write!(
-                f,
-                "DAG#{dag_id}: relative_deadline <= critical_path, unconditionally infeasible"
-            ),
-            #[cfg(feature = "dagfluid")]
-            BuildDagError::DagFluidResource(e) => write!(f, "{e}"),
         }
-    }
-}
-
-#[cfg(feature = "dagfluid")]
-impl From<ResourceError> for BuildDagError {
-    fn from(e: ResourceError) -> Self {
-        BuildDagError::DagFluidResource(e)
     }
 }
 
@@ -141,16 +103,22 @@ impl From<LinkNumError> for BuildDagError {
     }
 }
 
-impl From<FederatedError> for BuildDagError {
-    fn from(e: FederatedError) -> Self {
-        BuildDagError::Federated(e)
+impl From<DagError> for BuildDagError {
+    fn from(e: DagError) -> Self {
+        BuildDagError::Dag(e)
     }
 }
 
-#[cfg(feature = "vfed")]
-impl From<VFedError> for BuildDagError {
-    fn from(e: VFedError) -> Self {
-        BuildDagError::VFed(e)
+impl From<AdmissionError> for BuildDagError {
+    fn from(e: AdmissionError) -> Self {
+        BuildDagError::Admission(e)
+    }
+}
+
+#[cfg(feature = "dagfluid")]
+impl From<ResourceError> for BuildDagError {
+    fn from(e: ResourceError) -> Self {
+        BuildDagError::Admission(AdmissionError::Resource(e))
     }
 }
 
@@ -1285,19 +1253,27 @@ async fn build_dag_impl(
         .iter()
         .find(|node| node.is_source())
         .and_then(NodeData::get_period)
-        .ok_or(BuildDagError::MissingDagTiming(dag_id))?;
+        .ok_or(DagError::MissingTiming(dag_id))?;
     let relative_deadline = dag_data
         .get_nodes()
         .iter()
         .find(|node| node.is_sink())
         .and_then(NodeData::get_end_to_end_deadline)
-        .ok_or(BuildDagError::MissingDagTiming(dag_id))?;
+        .ok_or(DagError::MissingTiming(dag_id))?;
 
-    #[cfg(feature = "laxity")]
+    // Laxity/DAG-Fluid admit one DAG at a time here, so their preconditions
+    // are checked here, against this DAG's own id, before any admission
+    // work (Federated/V-Fed check theirs in their batch admission in
+    // `run()`).
+    #[cfg(any(feature = "laxity", feature = "dagfluid"))]
     let config = DagMetrics::from_static(stats.volume, stats.critical_path, period, relative_deadline);
+    #[cfg(feature = "laxity")]
+    precondition::check(Policy::Laxity, dag_id, &config)?;
+    #[cfg(feature = "dagfluid")]
+    precondition::check(Policy::DagFluid, dag_id, &config)?;
     // Federated already read both from the same nodes in `run()`'s batch
     // admission; they are still fetched above so a DAG missing either is
-    // rejected with the same `MissingDagTiming` error on every build.
+    // rejected with the same `DagError::MissingTiming` error on every build.
     #[cfg(not(any(feature = "laxity", feature = "dagfluid")))]
     let _ = (period, relative_deadline);
 
@@ -1339,7 +1315,12 @@ async fn build_dag_impl(
     #[cfg(feature = "laxity")]
     let (sched_type, node_laxity) = {
         let laxity =
-            compute_node_laxity(&dag_data, relative_deadline).ok_or(BuildDagError::LaxityInfeasible(dag_id))?;
+            // `None` only for `D <= L`, which the precondition above rejects.
+            compute_node_laxity(&dag_data, relative_deadline).ok_or(DagError::NonPositiveSlack {
+                dag_id,
+                critical_path: stats.critical_path,
+                relative_deadline,
+            })?;
         let sched_type = SchedulerType::GEDF(relative_deadline);
         log::info!(
             "DAG#{dag_id}: admitted (laxity) {config:?} -> {sched_type:?}, node_laxity={laxity:?}"
@@ -1347,7 +1328,7 @@ async fn build_dag_impl(
         (sched_type, laxity)
     };
 
-    // DAG-Fluid (see `crate::dag_fluid`'s own doc): `required_capacity`
+    // DAG-Fluid (see `awkernel_async_lib::dag_sched::policy::dag_fluid`'s own doc): `required_capacity`
     // gives this DAG's own real-valued contribution to the shared capacity
     // pool -- order-independent (unlike V-Fed's Algorithm 1,
     // `Σrequired_capacity_i <= m` is a plain running sum), so admitting one
@@ -1377,15 +1358,21 @@ async fn build_dag_impl(
     // `dag_fluid.rs` module doc.
     #[cfg(feature = "dagfluid")]
     let sched_type = {
-        let segments = crate::dag_fluid::decompose_segments(&dag_data);
-        let required = crate::dag_fluid::required_capacity(
+        let graph = crate::dag_graph(&dag_data).map_err(|e| {
+            log::warn!("DAG#{dag_id}: cannot build its graph for DAG-Fluid: {e}");
+            AdmissionError::NoFeasibleAllocation
+        })?;
+        let segments = awkernel_async_lib::dag_sched::policy::dag_fluid::decompose_segments(&graph);
+        let required = awkernel_async_lib::dag_sched::policy::dag_fluid::required_capacity(
             stats.volume,
             period,
             stats.critical_path,
             relative_deadline,
             &segments,
         )
-        .ok_or(BuildDagError::DagFluidInfeasible(dag_id))?;
+        // `L > D` was rejected by the precondition above, so `None` here is
+        // a degenerate segment decomposition (see `required_capacity`).
+        .ok_or(AdmissionError::NoFeasibleAllocation)?;
         resource::reserve_dagfluid_capacity(required)?;
 
         // Real dispatch (`scheduler::dp_wrap` / `dag_sched::dp_partition`):
@@ -1402,9 +1389,9 @@ async fn build_dag_impl(
         // (see `SchedulerType::GEDF`'s own doc: fine for a task DP-Wrap
         // would reduce to trivially anyway with no segment boundaries to
         // track).
-        let d_star = crate::dag_fluid::virtual_deadline(period, relative_deadline, stats.critical_path);
+        let d_star = awkernel_async_lib::dag_sched::policy::dag_fluid::virtual_deadline(period, relative_deadline, stats.critical_path);
         let schedule = if stats.volume > d_star {
-            crate::dag_fluid::assign_segment_deadlines(&segments, stats.volume, d_star)
+            awkernel_async_lib::dag_sched::policy::dag_fluid::assign_segment_deadlines(&segments, stats.volume, d_star)
         } else {
             None
         };
@@ -1419,8 +1406,14 @@ async fn build_dag_impl(
         );
 
         if let Some(schedule) = schedule {
-            let offsets = crate::dag_fluid::segment_release_offsets(&schedule);
-            let gates = crate::dag_fluid::segment_completion_gates(&dag_data);
+            let offsets = awkernel_async_lib::dag_sched::policy::dag_fluid::segment_release_offsets(&schedule);
+            // Gates come back as graph indices; `dp_partition` watches node ids.
+            let node_ids = crate::sorted_node_ids(&dag_data);
+            let gates: Vec<Vec<u32>> =
+                awkernel_async_lib::dag_sched::policy::dag_fluid::segment_completion_gates(&graph)
+                    .into_iter()
+                    .map(|gate| gate.iter().filter_map(|&v| node_ids.get(v).copied()).collect())
+                    .collect();
             // All of this DAG's own segments share one release-time
             // baseline (see `dp_partition`'s own doc on why
             // `Time::now()` at admission stands in for the papers'
@@ -1491,7 +1484,7 @@ async fn build_dag_impl_vfed(
             .iter()
             .find(|node| node.is_sink())
             .and_then(NodeData::get_end_to_end_deadline)
-            .ok_or(BuildDagError::MissingDagTiming(dag_id))?;
+            .ok_or(DagError::MissingTiming(dag_id))?;
 
         let sched_type = assignment
             .into_scheduler_type(relative_deadline)

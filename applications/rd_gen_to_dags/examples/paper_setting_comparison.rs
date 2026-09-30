@@ -39,25 +39,48 @@
 //! mean parallelism `C/L` is printed to stderr, so pools generated with
 //! different generator parameters can be compared on that axis.
 //!
+//! The pool can be any flat directory of `dag_*.yaml` in RD-Gen's format:
+//! a Melani pool (`scripts/paper_setting_figures.py`) or an RD-Gen pool
+//! (`awkernel_script/.../run_schedulability_evaluation.py`, which runs this
+//! in `constrained` mode for the ECRTS acceptance-ratio figure). Only each
+//! DAG's structure and WCETs are used; its own period/deadline are replaced
+//! per trial as above.
+//!
+//! # Recording individual trials (`--trials-jsonl PATH`)
+//! Appends one JSON object per trial (JSON Lines), e.g.
+//! `{"u_norm":0.5000,"trial":37,"mode":"constrained","m":12,
+//! "dags_dir":"/.../DAGs","dags":["dag_18.yaml",...],
+//! "timing":[[C,L,T,D],...],"max_parallelism":[3,...],
+//! "li":null,"date":true,"ours1":true,"ours2":true,"fluid":false,"sfs":true}`
+//! -- enough to recompute that trial's verdicts offline (`timing` and
+//! OURS2's `max_parallelism` are this trial's own draws). The YAML files
+//! themselves keep RD-Gen's own period/deadline, so a record is *not* a
+//! task set to stage for a real boot; `theory_vs_reality.rs` produces
+//! those (it keeps each DAG's own timing).
+//!
 //! Usage: `paper_setting_comparison <pool_dir> <implicit|constrained>
-//! <u_norm_min> <u_norm_max> <u_norm_step> <trials> [alpha] [--cores M]`
+//! <u_norm_min> <u_norm_max> <u_norm_step> <trials> [alpha] [--cores M]
+//! [--trials-jsonl PATH]`
 
-use std::{env, fs, path::Path, process::ExitCode};
+use std::{env, fs, io::Write, path::Path, process::ExitCode};
 
 use awkernel_async_lib::dag_sched::{
+    graph::DagGraph,
     metrics::DagMetrics,
     policy::{
-        federated::{self, DagGraph, FedTask, FederatedVariant},
+        dag_fluid::{self, Segment},
+        federated::{self, FedTask, FederatedVariant},
         sfs::{self, SfsTask},
         vfed::{self, PackingStrategy},
     },
 };
 use rand::{Rng, seq::IndexedRandom};
-use rd_gen_to_dags::dag_fluid::{self, Segment};
 
 const DAGS_PER_SET: usize = 8;
 
 struct Structure {
+    /// File name within the pool directory (`dag_<N>.yaml`).
+    name: String,
     volume: u64,
     critical_path: u64,
     graph: DagGraph,
@@ -81,13 +104,25 @@ fn main() -> ExitCode {
             Some(m)
         }
     };
+    let trials_jsonl_path: Option<String> = match args.iter().position(|a| a == "--trials-jsonl") {
+        None => None,
+        Some(i) => {
+            let Some(path) = args.get(i + 1).cloned() else {
+                eprintln!("--trials-jsonl needs a path");
+                return ExitCode::from(2);
+            };
+            args.drain(i..=i + 1);
+            Some(path)
+        }
+    };
     let (pool_dir, mode, lo, hi, step, trials, alpha) = match args.as_slice() {
         [_, p, m, lo, hi, st, t] => (p, m, lo, hi, st, t, None),
         [_, p, m, lo, hi, st, t, a] => (p, m, lo, hi, st, t, Some(a)),
         _ => {
             eprintln!(
                 "usage: paper_setting_comparison <pool_dir> <implicit|constrained> \
-                 <u_norm_min> <u_norm_max> <u_norm_step> <trials> [alpha] [--cores M]"
+                 <u_norm_min> <u_norm_max> <u_norm_step> <trials> [alpha] [--cores M] \
+                 [--trials-jsonl PATH]"
             );
             return ExitCode::from(2);
         }
@@ -143,6 +178,24 @@ fn main() -> ExitCode {
         pool.len()
     );
 
+    let mut trials_jsonl = match trials_jsonl_path.as_deref().map(|path| {
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| format!("cannot open '{path}' for appending: {e}"))
+    }) {
+        None => None,
+        Some(Ok(f)) => Some(f),
+        Some(Err(e)) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let dags_dir = fs::canonicalize(pool_dir)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| pool_dir.clone());
+
     let mut rng = rand::rng();
     println!("u_norm,li,date,ours1,ours2,fluid,sfs");
     let n_steps = ((hi - lo) / step + 1e-9).floor() as usize;
@@ -152,7 +205,7 @@ fn main() -> ExitCode {
             (0usize, 0usize, 0usize, 0usize, 0usize);
         let mut sfs_ok = 0usize;
         let mut redraws = 0usize;
-        for _ in 0..trials {
+        for trial in 0..trials {
             let (drawn, metrics, m) = match fixed_cores {
                 None => {
                     let drawn: Vec<&Structure> =
@@ -195,13 +248,14 @@ fn main() -> ExitCode {
                     graph: &s.graph,
                 })
                 .collect();
-            if implicit {
-                li +=
-                    federated::plan_batch(&tasks, m, FederatedVariant::LiImplicit).is_ok() as usize;
-            }
-            date += federated::plan_batch(&tasks, m, FederatedVariant::BaruahConstrained).is_ok()
-                as usize;
-            ours1 += vfed::is_batch_feasible(&metrics, m, PackingStrategy::BestFit) as usize;
+            let li_ok = implicit
+                .then(|| federated::plan_batch(&tasks, m, FederatedVariant::LiImplicit).is_ok());
+            li += li_ok.unwrap_or(false) as usize;
+            let date_ok =
+                federated::plan_batch(&tasks, m, FederatedVariant::BaruahConstrained).is_ok();
+            date += date_ok as usize;
+            let ours1_ok = vfed::is_batch_feasible(&metrics, m, PackingStrategy::BestFit);
+            ours1 += ours1_ok as usize;
 
             let with_parallelism: Vec<DagMetrics> = metrics
                 .iter()
@@ -221,8 +275,8 @@ fn main() -> ExitCode {
                     None => *c,
                 })
                 .collect();
-            ours2 +=
-                vfed::is_batch_feasible(&with_parallelism, m, PackingStrategy::BestFit) as usize;
+            let ours2_ok = vfed::is_batch_feasible(&with_parallelism, m, PackingStrategy::BestFit);
+            ours2 += ours2_ok as usize;
 
             let fluid_entries: Vec<(u64, u64, u64, u64, &[Segment])> = drawn
                 .iter()
@@ -237,7 +291,8 @@ fn main() -> ExitCode {
                     )
                 })
                 .collect();
-            fluid += dag_fluid::is_batch_feasible(&fluid_entries, m) as usize;
+            let fluid_ok = dag_fluid::is_batch_feasible(&fluid_entries, m);
+            fluid += fluid_ok as usize;
 
             let sfs_tasks: Vec<SfsTask<'_>> = drawn
                 .iter()
@@ -248,7 +303,31 @@ fn main() -> ExitCode {
                     deadline: c.relative_deadline,
                 })
                 .collect();
-            sfs_ok += sfs::is_schedulable(&sfs_tasks, m) as usize;
+            let sfs_this = sfs::is_schedulable(&sfs_tasks, m);
+            sfs_ok += sfs_this as usize;
+
+            if let Some(f) = trials_jsonl.as_mut() {
+                let record = TrialRecord {
+                    u_norm,
+                    trial,
+                    mode,
+                    m,
+                    dags_dir: &dags_dir,
+                    drawn: &drawn,
+                    metrics: &with_parallelism,
+                    verdicts: [
+                        li_ok,
+                        Some(date_ok),
+                        Some(ours1_ok),
+                        Some(ours2_ok),
+                        Some(fluid_ok),
+                        Some(sfs_this),
+                    ],
+                };
+                // A lost record does not affect the aggregate ratios
+                // (this example's main output), so keep the sweep going.
+                let _ = f.write_all(record.to_json_line().as_bytes());
+            }
         }
         if redraws > 0 {
             eprintln!("u_norm={u_norm}: {redraws} structure redraws (caps below target)");
@@ -349,6 +428,58 @@ fn fixed_m_timing(
     )
 }
 
+/// One `--trials-jsonl` line (see the module doc).
+struct TrialRecord<'a> {
+    u_norm: f64,
+    trial: usize,
+    mode: &'a str,
+    m: u16,
+    dags_dir: &'a str,
+    drawn: &'a [&'a Structure],
+    /// This trial's timing, with OURS2's `max_parallelism` draw.
+    metrics: &'a [DagMetrics],
+    /// `li`, `date`, `ours1`, `ours2`, `fluid`, `sfs` (`li` is `None` in
+    /// constrained mode).
+    verdicts: [Option<bool>; 6],
+}
+
+impl TrialRecord<'_> {
+    fn to_json_line(&self) -> String {
+        let dags = self
+            .drawn
+            .iter()
+            .map(|s| format!("\"{}\"", s.name))
+            .collect::<Vec<_>>()
+            .join(",");
+        let timing = self
+            .metrics
+            .iter()
+            .map(|c| {
+                format!(
+                    "[{},{},{},{}]",
+                    c.volume, c.critical_path, c.period, c.relative_deadline
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let parallelism = self
+            .metrics
+            .iter()
+            .map(|c| c.max_parallelism.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let verdict = |v: Option<bool>| v.map_or_else(|| String::from("null"), |b| b.to_string());
+        let [li, date, ours1, ours2, fluid, sfs] = self.verdicts.map(verdict);
+        format!(
+            "{{\"u_norm\":{:.4},\"trial\":{},\"mode\":\"{}\",\"m\":{},\"dags_dir\":\"{}\",\
+             \"dags\":[{dags}],\"timing\":[{timing}],\"max_parallelism\":[{parallelism}],\
+             \"li\":{li},\"date\":{date},\"ours1\":{ours1},\"ours2\":{ours2},\
+             \"fluid\":{fluid},\"sfs\":{sfs}}}\n",
+            self.u_norm, self.trial, self.mode, self.m, self.dags_dir
+        )
+    }
+}
+
 fn alloc_fmt(x: f64) -> String {
     format!("{x:.2}")
 }
@@ -365,6 +496,14 @@ fn load_pool(dir: &Path) -> Result<Vec<Structure>, String> {
         })
         .collect();
     paths.sort();
+    let names: Vec<String> = paths
+        .iter()
+        .map(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        })
+        .collect();
     let texts: Vec<String> = paths
         .iter()
         .map(|p| fs::read_to_string(p).map_err(|e| format!("cannot read {}: {e}", p.display())))
@@ -372,10 +511,12 @@ fn load_pool(dir: &Path) -> Result<Vec<Structure>, String> {
     let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
     let with_segments = rd_gen_to_dags::dag_metrics_and_fluid_segments_from_yaml(&refs)?;
     let graphs = rd_gen_to_dags::dag_graphs_from_yaml(&refs)?;
-    Ok(with_segments
+    Ok(names
         .into_iter()
+        .zip(with_segments)
         .zip(graphs)
-        .map(|((m, segments), graph)| Structure {
+        .map(|((name, (m, segments)), graph)| Structure {
+            name,
             volume: m.volume,
             critical_path: m.critical_path,
             graph,

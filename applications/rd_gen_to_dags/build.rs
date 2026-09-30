@@ -14,10 +14,10 @@ use std::{
 /// (e.g. `RD_GEN_DAGS_DIR=/path/to/generated/DAGs cargo build ...`) so an
 /// automation pipeline can point the kernel at a freshly-generated RD-Gen
 /// output directory without editing this file; falls back to this fixed
-/// path — the small, hand-curated set this crate has always shipped with —
-/// when unset, so a plain `make x86_64` keeps working unchanged.
-const DEFAULT_DAGS_DIR: &str =
-    "/home/nokosan/azumi-lab/RD-Gen/test/awkernel_theory_pool_branching/DAGs";
+/// path — the staging directory `scripts/real_machine_trial.py` fills with
+/// the DAGs of one offline-tested trial (a `trials.jsonl` record) — when
+/// unset, so a plain `make x86_64` boots the last staged task set.
+const DEFAULT_DAGS_DIR: &str = "/home/nokosan/azumi-lab/RD-Gen/test/awkernel_staged";
 
 /// True for `dag_<N>.yaml`/`.yml` files. RD-Gen writes sibling files in the
 /// same directory that are not DAG definitions (e.g. `combination_log.yaml`,

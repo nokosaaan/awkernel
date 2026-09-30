@@ -50,7 +50,15 @@
 //!   selection (size, then gross normalised density) by target creation
 //!   order.
 
-use super::federated::DagGraph;
+use crate::{
+    dag::DagError,
+    dag_sched::{
+        admission::AdmissionError,
+        graph::DagGraph,
+        metrics::DagMetrics,
+        precondition::{self, Policy},
+    },
+};
 use alloc::{vec, vec::Vec};
 
 /// One sporadic DAG task with a constrained deadline (`D <= T`).
@@ -113,7 +121,7 @@ pub struct SfsPlan {
 
 /// Whether `tasks` is schedulable under SFS-G on `m` processors.
 pub fn is_schedulable(tasks: &[SfsTask<'_>], m: u16) -> bool {
-    plan(tasks, m).is_some()
+    plan(tasks, m).is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -442,23 +450,40 @@ struct Prepared<'a> {
     segs: Vec<Vec<usize>>,
 }
 
-/// Runs SFS-G on `m` processors. `None` = FAILURE (or a cyclic graph, or a
-/// task with `D > T`).
-pub fn plan(tasks: &[SfsTask<'_>], m: u16) -> Option<SfsPlan> {
+/// Runs SFS-G on `m` processors. A task violating SFS's preconditions
+/// ([`Policy::Sfs`]: `D <= T`, `L <= D`) or with a cyclic graph is a
+/// [`AdmissionError::Precondition`] naming its position in `tasks`;
+/// Algorithm 3's FAILURE is [`AdmissionError::NoFeasibleAllocation`].
+pub fn plan(tasks: &[SfsTask<'_>], m: u16) -> Result<SfsPlan, AdmissionError> {
     let preps: Vec<Prepared<'_>> = tasks
         .iter()
-        .map(|t| {
-            (t.deadline <= t.period && t.deadline > 0).then_some(())?;
-            Some(Prepared {
+        .enumerate()
+        .map(|(i, t)| {
+            let dag_id = i as u32;
+            let work: u64 = (0..t.graph.len()).map(|v| t.graph.wcet(v)).sum();
+            let length = critical_path(t.graph);
+            let metrics = DagMetrics::from_static(work, length, t.period, t.deadline);
+            precondition::check(Policy::Sfs, dag_id, &metrics)?;
+            if t.deadline == 0 {
+                return Err(AdmissionError::NoFeasibleAllocation);
+            }
+            Ok(Prepared {
                 graph: t.graph,
                 period: t.period,
                 deadline: t.deadline,
-                work: (0..t.graph.len()).map(|v| t.graph.wcet(v)).sum(),
-                length: critical_path(t.graph),
-                segs: segments(t.graph)?,
+                work,
+                length,
+                segs: segments(t.graph).ok_or(DagError::ContainsCycle(dag_id))?,
             })
         })
-        .collect::<Option<_>>()?;
+        .collect::<Result<_, _>>()?;
+    plan_prepared(&preps, m).ok_or(AdmissionError::NoFeasibleAllocation)
+}
+
+/// Algorithm 3 (first and second pass) on tasks that passed [`plan`]'s
+/// checks. `None` = FAILURE.
+fn plan_prepared(preps: &[Prepared<'_>], m: u16) -> Option<SfsPlan> {
+    let tasks = preps;
 
     // Algorithm 3, lines 2 and 17: non-increasing D (ties by index).
     let mut order: Vec<usize> = (0..tasks.len()).collect();
@@ -601,110 +626,17 @@ pub fn plan(tasks: &[SfsTask<'_>], m: u16) -> Option<SfsPlan> {
     })
 }
 
+/// Paper-conformance tests: worked examples of Lendve et al., JSA 2026.
+#[cfg(test)]
+mod paper_examples;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rand::{Rng, SeedableRng};
 
-    /// Fig. 1 of the paper (tau_1..tau_10 as nodes 0..9, D = 130).
-    fn fig1() -> DagGraph {
-        DagGraph::new(
-            vec![10, 20, 30, 20, 20, 10, 20, 20, 20, 10],
-            &[
-                (0, 1),
-                (0, 2),
-                (0, 3),
-                (1, 4),
-                (1, 6),
-                (2, 4),
-                (2, 5),
-                (3, 5),
-                (4, 6),
-                (4, 7),
-                (5, 7),
-                (5, 8),
-                (6, 9),
-                (7, 9),
-                (8, 9),
-            ],
-        )
-        .unwrap()
-    }
-
     fn wcets(g: &DagGraph) -> Vec<u64> {
         (0..g.len()).map(|v| g.wcet(v)).collect()
-    }
-
-    #[test]
-    fn test_segments_match_fig1() {
-        let segs = segments(&fig1()).unwrap();
-        assert_eq!(
-            segs,
-            vec![vec![0], vec![1, 2, 3], vec![4, 5], vec![6, 7, 8], vec![9]]
-        );
-    }
-
-    #[test]
-    fn test_flatten_fig2_makespan_105() {
-        let g = fig1();
-        let (len, ivs) = flatten(&segments(&g).unwrap(), &wcets(&g), 2);
-        assert_eq!(len, 105);
-        // Every node receives exactly its WCET.
-        let mut got = vec![0u64; g.len()];
-        for iv in &ivs {
-            got[iv.node] += iv.end - iv.start;
-        }
-        assert_eq!(got, wcets(&g));
-        // At most 2 nodes run at any time and no node runs twice at once.
-        for t in 0..len {
-            let running: Vec<usize> = ivs
-                .iter()
-                .filter(|iv| iv.start <= t && t < iv.end)
-                .map(|iv| iv.node)
-                .collect();
-            assert!(running.len() <= 2, "t={t}: {running:?}");
-            let mut dedup = running.clone();
-            dedup.dedup();
-            assert_eq!(dedup.len(), running.len());
-        }
-    }
-
-    #[test]
-    fn test_fig5_rump_after_60_flattens_to_35_on_3() {
-        let g = fig1();
-        let segs = segments(&g).unwrap();
-        let mut rem = wcets(&g);
-        let (_, ivs) = flatten(&segs, &rem, 2);
-        for iv in &ivs {
-            let done = iv.end.min(60).saturating_sub(iv.start);
-            rem[iv.node] -= done.min(rem[iv.node]);
-        }
-        assert_eq!(rem, vec![0, 0, 0, 0, 5, 0, 20, 20, 20, 10]); // Fig. 5(c)
-        assert_eq!(flatten(&segs, &rem, 3).0, 35); // Fig. 5(d)
-    }
-
-    #[test]
-    fn test_fig3_prefers_graham_fallback() {
-        // Two chains 1 -> 49 and 49 -> 1: flattening needs 49 + 49 = 98.
-        let g = DagGraph::new(vec![1, 49, 49, 1], &[(0, 2), (1, 3)]).unwrap();
-        let task = SfsTask {
-            graph: &g,
-            period: 80,
-            deadline: 80,
-        };
-        let prep = Prepared {
-            graph: &g,
-            period: 80,
-            deadline: 80,
-            work: 100,
-            length: critical_path(&g),
-            segs: segments(&g).unwrap(),
-        };
-        assert_eq!(prep.length, 50);
-        assert!(feasibly_max_flatten(&prep.segs, &wcets(&g), 80).is_none());
-        assert_eq!(cluster_size_requirements(&prep), Some((2, 75))); // Eq. (2)
-        assert!(is_schedulable(&[task], 2));
-        assert!(!is_schedulable(&[task], 1));
     }
 
     #[test]
@@ -866,7 +798,7 @@ mod tests {
                     }
                 })
                 .collect();
-            let Some(plan) = plan(&tasks, rng.random_range(2..=8)) else {
+            let Ok(plan) = plan(&tasks, rng.random_range(2..=8)) else {
                 continue;
             };
             splits += plan.split_dags;

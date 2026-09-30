@@ -368,7 +368,7 @@ impl DpWrapScheduler {
 /// every currently-active DAG-Fluid segment's own `(dag_id, concurrency,
 /// rate)` (`rate` = that segment's `theta_i,j`, `concurrency` = `m_i,j`
 /// interchangeable virtual threads -- see
-/// `rd_gen_to_dags::dag_fluid::SegmentSchedule`'s own doc), and apply it
+/// `crate::dag_sched::policy::dag_fluid::SegmentSchedule`'s own doc), and apply it
 /// for the Deadline Partition running from `dp_start` until `dp_end`
 /// (`None` if no further boundary is currently known -- see below).
 /// Called by `dag_sched::dp_partition` once a Deadline Partition boundary

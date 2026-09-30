@@ -48,8 +48,10 @@ pub struct DagMetrics {
     /// A task's own maximum degree of parallelism (how many nodes can ever
     /// be eligible at once) — *not* the same quantity as `critical_path`,
     /// despite both being called `L` in the literature. Only consulted by
-    /// [`super::policy::vfed`]'s OURS2 (PSF/`Π'`) refinement, to prove some
-    /// of a heavy DAG's own active-VPs are structurally always idle; every
+    /// [`super::policy::vfed`]'s OURS2 (PSF/`Π'`) refinement: at any time at
+    /// least `m_i - L_i` of a heavy DAG's `m_i` active-VPs are idle, which
+    /// raises the supply of its passive-VPs when a consumer takes all of
+    /// them together (never for a single one of them); every
     /// other policy, and `vfed`'s own OURS1 path, ignores this field
     /// entirely. `u16::MAX` (the value [`DagMetrics::from_static`]/
     /// [`DagMetrics::from_measured`] set) means "unknown" — `vfed` then

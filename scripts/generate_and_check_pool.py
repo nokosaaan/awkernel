@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """Regenerates an RD-Gen DAG pool from a config file and immediately reports
-DAG-Fluid's own per-DAG segment-concurrency stats against it -- the same
-numbers shown when RD-Gen/sample_config/branching/
-my_branching_theory_pool_dagfluid.yaml was tuned against this project's real
-target's DAG-pool core count (see that file's own doc comments for the
-methodology). Run this after every RD-Gen generation-parameter change
-instead of eyeballing pool output by hand, so a regression (or an
-improvement) in max segment concurrency is never missed.
+DAG-Fluid's own per-DAG segment-concurrency stats against it, compared
+with this project's real target's DAG-pool core count. Run this after
+every RD-Gen generation-parameter change instead of eyeballing pool output
+by hand, so a regression (or an improvement) in max segment concurrency is
+never missed.
 
 Wraps two steps that would otherwise need to be run and remembered
 separately:
@@ -16,8 +14,8 @@ separately:
 
 Usage:
   scripts/generate_and_check_pool.py \\
-      --config /home/nokosan/ws/RD-Gen/sample_config/branching/my_branching_theory_pool_dagfluid.yaml \\
-      --dest-dir /home/nokosan/ws/RD-Gen/test/awkernel_theory_pool_branching_dagfluid \\
+      --config /home/nokosan/ws/RD-Gen/sample_config/chain_based/theory_vs_reality_pool_fanout16.yaml \\
+      --dest-dir /home/nokosan/ws/RD-Gen/test/pool_check \\
       --target 4
 """
 
@@ -52,7 +50,7 @@ def generate_pool(rd_gen_dir: Path, config: Path, dest_dir: Path):
 
 def ensure_stats_tool_built(awkernel_dir: Path, dags_dir_for_embed: Path) -> Path:
     """Build rd_gen_to_dags's `segment_concurrency_stats` example (host-side,
-    `--features std`, same as `acceptance_ratio`/`predict_admission`) if the
+    `--features std`, same as `theory_vs_reality`/`predict_admission`) if the
     release binary isn't already there. Cargo itself is a no-op when nothing
     changed, so this is cheap to call every time rather than caching a
     "did I already build this" flag.

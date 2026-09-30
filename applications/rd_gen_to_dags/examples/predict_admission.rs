@@ -1,5 +1,5 @@
 //! Deterministic, single-batch admission prediction for one concrete
-//! RD-Gen-generated DAG directory (as opposed to `acceptance_ratio`'s
+//! RD-Gen-generated DAG directory (as opposed to `paper_setting_comparison`'s
 //! Monte-Carlo resampling over a *pool* of many independent directories):
 //! this is for validating one specific, curated task set that will actually
 //! be booted for real — e.g. by `run_realboot_evaluation.py`, which
@@ -19,9 +19,10 @@
 use std::{env, fs, process::ExitCode};
 
 use awkernel_async_lib::dag_sched::{
+    graph::DagGraph,
     metrics::DagMetrics,
     policy::{
-        federated::{self, DagGraph, FedTask, FederatedVariant},
+        federated::{self, FedTask, FederatedVariant},
         vfed::{self, PackingStrategy},
     },
 };
@@ -53,8 +54,8 @@ fn main() -> ExitCode {
         configs.len()
     );
     for (i, config) in configs.iter().enumerate() {
-        let fed = federated::classify_dag(config);
-        let v = vfed::classify(config);
+        let fed = federated::classify_dag(config).map_err(|e| e.with_dag_id(i as u32));
+        let v = vfed::classify(config).map_err(|e| e.with_dag_id(i as u32));
         println!(
             "DAG#{i}: C={} L={} T={} D={} | federated={fed:?} vfed={v:?}",
             config.volume, config.critical_path, config.period, config.relative_deadline,

@@ -15,10 +15,10 @@ Run repeatedly with --trials N to fire off N trials unattended.
 Two selection modes (mutually exclusive):
   - Default (single-DAG): picks the next not-yet-used dag_<N>.yaml from
     --pool-dir (ascending N), one DAG per trial.
-  - --trials-jsonl PATH (group-of-8): reads the JSON-Lines file
-    rd_gen_to_dags's acceptance_ratio.rs (via --trials-jsonl on
-    run_schedulability_evaluation.py) writes one record per resampled
-    trial to, and consumes it round-robin across u_norm levels (one trial
+  - --trials-jsonl PATH (group-of-8): reads the JSON-Lines manifest
+    rd_gen_to_dags's theory_vs_reality.rs writes one record per trial to
+    (files from the removed acceptance_ratio.rs are still read), and
+    consumes it round-robin across u_norm levels (one trial
     from each level, then the next trial from each level, ...) rather than
     the file's own order (every trial of one level before the next) -- see
     load_trials_jsonl's own doc comment -- so a batch that's cut short
@@ -41,7 +41,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 DEFAULT_AWKERNEL_DIR = Path("/home/nokosan/ws/awkernel")
-DEFAULT_POOL_DIR = Path("/home/nokosan/ws/RD-Gen/test/awkernel_theory_pool_branching/DAGs")
+DEFAULT_POOL_DIR = Path("/home/nokosan/ws/RD-Gen/test/awkernel_theory_vs_reality_pool_fanout16/DAGs")
 DEFAULT_STAGING_DIR = Path("/home/nokosan/ws/RD-Gen/test/awkernel_staged")
 
 # rd_gen_to_dags's admission policy (see build_dag.rs) is picked at kernel
@@ -271,7 +271,7 @@ def load_trials_jsonl(path, include_rejected=False):
     "dags","accepted"}` -- one shared Federated-only `accepted` flag, and a
     *per-record* `dags_dir` naming the pool it drew from (a single core-
     count-independent pool, windowed per u_norm by that file itself), unlike
-    `acceptance_ratio.rs`'s own
+    the removed `acceptance_ratio.rs`'s own
     `{"u_norm","trial","dags","federated_accepted","vfed_accepted",
     "dag_fluid_accepted"}`, which has no `dags_dir` at all -- for that
     schema, `--pool-dir` supplies the (single, shared) directory instead;
@@ -295,6 +295,14 @@ def load_trials_jsonl(path, include_rejected=False):
                 record = json.loads(line)
             except json.JSONDecodeError as e:
                 raise RuntimeError(f"{path}:{line_no}: not valid JSON: {e}") from e
+            if "timing" in record:
+                # paper_setting_comparison.rs's --trials-jsonl: its verdicts
+                # are for per-trial C/L/T/D draws the YAML files don't carry,
+                # so booting the files would test a different task set.
+                raise RuntimeError(
+                    f"{path}:{line_no}: a paper_setting_comparison record (per-trial "
+                    "timing not in the YAML); use theory_vs_reality.rs's manifest"
+                )
             if not include_rejected:
                 accepted = record.get("accepted", record.get("federated_accepted", True))
                 if not accepted:
@@ -307,7 +315,7 @@ def load_trials_jsonl(path, include_rejected=False):
         )
 
     # Dict insertion order == ascending u_norm here, since
-    # acceptance_ratio.rs sweeps u_norm_min -> u_norm_max and appends each
+    # theory_vs_reality.rs sweeps u_norm_min -> u_norm_max and appends each
     # level's trials in that order as it goes.
     levels = list(by_u_norm.values())
     ordered = []
@@ -558,7 +566,7 @@ def run_trial(args, state, boot_cache_path, trials_jsonl):
         dag_names = trial_record["dags"]
         # theory_vs_reality.rs's records carry their own bin directory
         # (--pool-dir is one shared directory, doesn't apply); fall back to
-        # --pool-dir for acceptance_ratio.rs's older single-shared-pool
+        # --pool-dir for the removed acceptance_ratio.rs's single-shared-pool
         # schema, which has no "dags_dir" field at all.
         dags_dir = Path(trial_record["dags_dir"]) if "dags_dir" in trial_record else args.pool_dir
         stage_group(dags_dir, dag_names, args.staging_dir)
@@ -594,7 +602,7 @@ def parse_args():
     p.add_argument("--staging-dir", type=Path, default=DEFAULT_STAGING_DIR,
                    help="scratch dir the selected DAG(s) are copied into; pointed at via RD_GEN_DAGS_DIR")
     p.add_argument("--trials-jsonl", type=Path, default=None,
-                   help="group-of-8 mode: consume acceptance_ratio.rs's per-trial JSONL top to "
+                   help="group-of-8 mode: consume theory_vs_reality.rs's per-trial JSONL top to "
                         "bottom instead of picking single DAGs from --pool-dir (see module docstring)")
     p.add_argument("--algorithms", default="federated",
                    help="comma-separated admission policies (rd_gen_to_dags's build-time cargo "
