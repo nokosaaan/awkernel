@@ -4,7 +4,7 @@ use core::cmp::max;
 
 use super::{Scheduler, SchedulerType, Task};
 use crate::{
-    dag::calculate_and_update_dag_deadline,
+    dag::{get_dag, to_node_index, Dag},
     scheduler::GLOBAL_WAKE_GET_MUTEX,
     scheduler::{
         get_priority, peek_preemption_pending, push_preemption_pending, PREEMPTION_ENABLED,
@@ -219,4 +219,33 @@ impl GEDFScheduler {
 
         false
     }
+}
+
+fn calculate_and_set_dag_deadline(dag: &Dag, wake_time: u64) -> u64 {
+    // Microseconds, the unit of `awkernel_lib::delay::uptime()`.
+    let relative_deadline_us = dag
+        .get_sink_relative_deadline()
+        .map(|deadline| deadline.as_micros() as u64)
+        .unwrap_or_else(|| {
+            panic!(
+                "GEDF scheduler: DAG {} has no sink relative deadline set",
+                dag.get_id()
+            )
+        });
+    let dag_absolute_deadline = wake_time + relative_deadline_us;
+    dag.set_absolute_deadline(dag_absolute_deadline);
+    dag_absolute_deadline
+}
+
+pub fn calculate_and_update_dag_deadline(dag_info: &DagInfo, wake_time: u64) -> u64 {
+    let dag_id = dag_info.dag_id;
+    let dag = get_dag(dag_id).unwrap_or_else(|| panic!("GEDF scheduler: DAG {dag_id} not found"));
+
+    if let Some(absolute_deadline) = dag.get_absolute_deadline() {
+        if !dag.is_source_node(to_node_index(dag_info.node_id)) {
+            return absolute_deadline;
+        }
+    }
+
+    calculate_and_set_dag_deadline(&dag, wake_time)
 }
