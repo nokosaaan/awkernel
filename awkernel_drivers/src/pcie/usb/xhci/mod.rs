@@ -8,13 +8,11 @@ use super::super::{
 };
 
 mod cdc_acm;
-mod fat32;
-mod msc;
 mod pl2303;
 mod regs;
 mod ring;
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 use ring::{CommandRing, Dcbaa, EventRing, TransferRing, Trb};
 
@@ -36,137 +34,6 @@ static CDC_SLOT:    AtomicU8    = AtomicU8::new(0);
 /// Spinlock + reentrancy guard: if already held (recursive log call inside a
 /// CDC write), skip rather than deadlock.
 static CDC_LOCK:    AtomicBool  = AtomicBool::new(false);
-
-/// Incremented each time start_controller() succeeds.
-static XHCI_STARTED: AtomicUsize = AtomicUsize::new(0);
-/// Incremented for every port with CCS=1 seen across all boot_enumerate() calls.
-static XHCI_CCS_SEEN: AtomicUsize = AtomicUsize::new(0);
-/// Incremented when enumerate_port() returns Ok (device was addressed + described).
-static XHCI_ENUM_OK: AtomicUsize = AtomicUsize::new(0);
-/// VID of the last device whose Device Descriptor was successfully read.
-static XHCI_LAST_VID: AtomicU32 = AtomicU32::new(0);
-/// PID of the last device whose Device Descriptor was successfully read.
-static XHCI_LAST_PID: AtomicU32 = AtomicU32::new(0);
-/// Set when try_setup_pl2303() sees VID:PID 067b:23xx (PL2303 chip identified).
-static XHCI_PL2303_VID_SEEN:  AtomicBool = AtomicBool::new(false);
-/// Set after get_config_descriptor() succeeds inside try_setup_pl2303().
-static XHCI_PL2303_GOT_CFG:   AtomicBool = AtomicBool::new(false);
-/// Set after find_bulk_endpoints() finds IN+OUT pair inside try_setup_pl2303().
-static XHCI_PL2303_GOT_EPS:   AtomicBool = AtomicBool::new(false);
-/// Set after set_configuration() succeeds inside try_setup_pl2303().
-static XHCI_PL2303_SET_CFG:   AtomicBool = AtomicBool::new(false);
-/// Set after configure_bulk_endpoints() (CONFIGURE_EP) succeeds.
-static XHCI_PL2303_CFG_EPS:   AtomicBool = AtomicBool::new(false);
-/// Set after pl2303_init_seq() completes successfully.
-static XHCI_PL2303_INIT_SEQ:  AtomicBool = AtomicBool::new(false);
-/// Set after the first 9-byte control_transfer_in in get_config_descriptor succeeds
-/// (only meaningful when called from try_setup_pl2303; MSC/CDC calls are skipped for PL2303).
-static XHCI_PL2303_CFG_P1_OK:    AtomicBool = AtomicBool::new(false);
-/// Set if wTotalLength parsed from the first-pass config descriptor is non-zero
-/// (indicates DMA buffer was actually written; not a cache-coherency ghost).
-static XHCI_PL2303_CFG_TOTAL_OK: AtomicBool = AtomicBool::new(false);
-/// Last control_transfer_in failure code: 0=no failure yet, 0xFFFF=timeout,
-/// 0xFFFE=exhausted SP retries, else the raw xHCI completion code (e.g. 6=STALL).
-static XHCI_CTRL_FAIL_CODE: AtomicU32 = AtomicU32::new(0);
-/// wTotalLength (capped to 255) read from the first-pass config descriptor.
-/// 0 = not yet set (get_config_descriptor not yet called or first pass failed).
-static XHCI_CFG_FETCH: AtomicU8 = AtomicU8::new(0);
-/// Incremented when port reset (PRC polling) succeeds.
-static XHCI_PORT_RESET_OK: AtomicUsize = AtomicUsize::new(0);
-/// Incremented when Enable Slot command completes with code=1.
-static XHCI_SLOT_ENABLED: AtomicUsize = AtomicUsize::new(0);
-/// Incremented when Address Device command completes with code=1 inside enumerate_port.
-static XHCI_ADDR_DEV_OK: AtomicUsize = AtomicUsize::new(0);
-/// Failure code from the last failed Address Device: 0=none, 0xFFFF=timeout, else xHCI code.
-static XHCI_ADDR_DEV_FAIL: AtomicU32 = AtomicU32::new(0);
-/// Number of successful get_device_descriptor() calls (incremented after VID/PID stored).
-static XHCI_GDESC_OK: AtomicUsize = AtomicUsize::new(0);
-/// Failure code from last failed get_device_descriptor: 0=none, 0xFFFF=timeout, else xHCI code.
-static XHCI_GDESC_FAIL_CODE: AtomicU32 = AtomicU32::new(0);
-/// 0=not attempted, 1=OK, 2=failed/timeout
-static XHCI_NOOP_RESULT: AtomicU32 = AtomicU32::new(0);
-/// USBSTS value captured at the first command timeout; u32::MAX = no timeout yet.
-static XHCI_USBSTS_ON_SLOT_FAIL: AtomicU32 = AtomicU32::new(u32::MAX);
-/// Set to true if BUS_MASTER bit confirmed set after enable_bus_master().
-static XHCI_BUS_MASTER_OK: AtomicBool = AtomicBool::new(false);
-
-/// Returns true if a CDC-ACM or PL2303 device was found and registered.
-pub fn is_cdc_registered() -> bool {
-    CDC_DEV_PTR.load(Ordering::Acquire) != 0
-}
-
-/// Returns true if at least one xHCI controller successfully started.
-pub fn xhci_any_started() -> bool {
-    XHCI_STARTED.load(Ordering::Relaxed) > 0
-}
-
-/// Returns true if at least one USB device (CCS=1) was seen during enumeration.
-pub fn xhci_any_device_seen() -> bool {
-    XHCI_CCS_SEEN.load(Ordering::Relaxed) > 0
-}
-/// Total number of ports with CCS=1 seen at boot.
-pub fn xhci_ccs_count() -> usize { XHCI_CCS_SEEN.load(Ordering::Relaxed) }
-/// Total number of successful port resets.
-pub fn xhci_port_reset_count() -> usize { XHCI_PORT_RESET_OK.load(Ordering::Relaxed) }
-/// Total number of Enable Slot successes.
-pub fn xhci_slot_count() -> usize { XHCI_SLOT_ENABLED.load(Ordering::Relaxed) }
-/// Total number of successful Address Device commands inside enumerate_port.
-pub fn xhci_addr_dev_ok() -> usize { XHCI_ADDR_DEV_OK.load(Ordering::Relaxed) }
-/// Failure code from last failed Address Device (0=none, 0xFFFF=timeout, else xHCI code).
-pub fn xhci_addr_dev_fail() -> u32 { XHCI_ADDR_DEV_FAIL.load(Ordering::Relaxed) }
-/// Total number of successful get_device_descriptor() calls.
-pub fn xhci_gdesc_ok() -> usize { XHCI_GDESC_OK.load(Ordering::Relaxed) }
-/// Failure code from last failed get_device_descriptor (0=none, 0xFFFF=timeout, else xHCI).
-pub fn xhci_gdesc_fail_code() -> u32 { XHCI_GDESC_FAIL_CODE.load(Ordering::Relaxed) }
-/// Total number of successful enumerate_port() calls.
-pub fn xhci_enum_count() -> usize { XHCI_ENUM_OK.load(Ordering::Relaxed) }
-/// VID of the last device whose Device Descriptor was successfully read (0 = none yet).
-pub fn xhci_last_vid() -> u16 { XHCI_LAST_VID.load(Ordering::Relaxed) as u16 }
-/// PID of the last device whose Device Descriptor was successfully read (0 = none yet).
-pub fn xhci_last_pid() -> u16 { XHCI_LAST_PID.load(Ordering::Relaxed) as u16 }
-
-/// Returns true if at least one port reset completed (PRC=1 seen).
-pub fn xhci_any_port_reset_ok() -> bool {
-    XHCI_PORT_RESET_OK.load(Ordering::Relaxed) > 0
-}
-
-/// Returns true if at least one Enable Slot command completed successfully.
-pub fn xhci_any_slot_enabled() -> bool {
-    XHCI_SLOT_ENABLED.load(Ordering::Relaxed) > 0
-}
-
-/// Returns true if at least one device was fully addressed (enumerate_port returned Ok).
-pub fn xhci_any_enum_ok() -> bool {
-    XHCI_ENUM_OK.load(Ordering::Relaxed) > 0
-}
-
-/// Returns true if PL2303 VID:PID (067b:23xx) was matched during setup.
-pub fn xhci_pl2303_vid_seen()     -> bool { XHCI_PL2303_VID_SEEN.load(Ordering::Relaxed) }
-pub fn xhci_pl2303_cfg_p1_ok()    -> bool { XHCI_PL2303_CFG_P1_OK.load(Ordering::Relaxed) }
-pub fn xhci_pl2303_cfg_total_ok() -> bool { XHCI_PL2303_CFG_TOTAL_OK.load(Ordering::Relaxed) }
-/// 0 = no failure, 0xFFFF = timeout, 0xFFFE = SP-retry exhausted, else xHCI completion code.
-pub fn xhci_ctrl_fail_code() -> u32 { XHCI_CTRL_FAIL_CODE.load(Ordering::Relaxed) }
-/// wTotalLength (capped to 255) from first-pass config descriptor; 0 = not set yet.
-pub fn xhci_cfg_fetch() -> u8 { XHCI_CFG_FETCH.load(Ordering::Relaxed) }
-pub fn xhci_pl2303_got_cfg()      -> bool { XHCI_PL2303_GOT_CFG.load(Ordering::Relaxed) }
-pub fn xhci_pl2303_got_eps()      -> bool { XHCI_PL2303_GOT_EPS.load(Ordering::Relaxed) }
-pub fn xhci_pl2303_set_cfg()      -> bool { XHCI_PL2303_SET_CFG.load(Ordering::Relaxed) }
-pub fn xhci_pl2303_cfg_eps()      -> bool { XHCI_PL2303_CFG_EPS.load(Ordering::Relaxed) }
-pub fn xhci_pl2303_init_seq()     -> bool { XHCI_PL2303_INIT_SEQ.load(Ordering::Relaxed) }
-
-/// 0 = not attempted, 1 = success, 2 = fail/timeout
-pub fn xhci_noop_result() -> u32 {
-    XHCI_NOOP_RESULT.load(Ordering::Relaxed)
-}
-pub fn xhci_bus_master_ok() -> bool {
-    XHCI_BUS_MASTER_OK.load(Ordering::Relaxed)
-}
-
-/// Returns the USBSTS value captured at the first Enable Slot timeout, if any.
-pub fn xhci_usbsts_on_fail() -> Option<u32> {
-    let v = XHCI_USBSTS_ON_SLOT_FAIL.load(Ordering::Relaxed);
-    if v == u32::MAX { None } else { Some(v) }
-}
 
 /// Write `data` to the CDC-ACM USB serial adapter if one has been configured.
 /// No-ops when CDC-ACM is unavailable; never blocks more than a USB bulk timeout.
@@ -240,10 +107,6 @@ pub struct XhciDevice {
     bulk_out_ep_id: u8,   // xHCI DCI for bulk OUT doorbell
     dev_speed: u8,        // PORTSC speed field cached from enumerate_port
     dev_port: u8,         // 1-based port number cached from enumerate_port
-    msc_tag: u32,         // monotonic BOT transaction tag
-
-    // Phase 5: mounted FAT32 volume state (set after fat32_mount).
-    fat32: Option<fat32::Fat32>,
 
     // Phase 6: CDC-ACM serial adapter state (set after try_setup_cdcacm succeeds).
     is_cdcacm: bool,
@@ -324,7 +187,6 @@ pub(super) fn attach(
     if info.read_status_command().contains(
         super::super::registers::StatusCommand::BUS_MASTER,
     ) {
-        XHCI_BUS_MASTER_OK.store(true, Ordering::Relaxed);
         log::info!("xHCI: {}: BUS_MASTER confirmed set", dev.name);
     } else {
         log::error!("xHCI: {}: BUS_MASTER NOT set — DMA will fail!", dev.name);
@@ -383,7 +245,6 @@ pub(super) fn attach(
     }
 
     dev.start_controller(interrupt_ready)?;
-    XHCI_STARTED.fetch_add(1, Ordering::Relaxed);
 
     // Synchronous boot-time enumeration: find and address any device already connected.
     dev.boot_enumerate();
@@ -471,8 +332,6 @@ impl XhciDevice {
             bulk_out_ep_id: 0,
             dev_speed: 0,
             dev_port: 0,
-            msc_tag: 0,
-            fat32: None,
             is_cdcacm: false,
             cdcacm_ctrl_if: 0,
             cdcacm_max_pkt: 64,
@@ -938,18 +797,15 @@ impl XhciDevice {
         self.send_address_device(slot, input_ctx_phys, false);
         match self.poll_cmd_completion(2_000_000) {
             None => {
-                XHCI_ADDR_DEV_FAIL.store(0xFFFF, Ordering::Relaxed);
                 log::error!("xHCI: {}: Address Device timeout (slot={})", self.name, slot);
                 return Err(PCIeDeviceErr::InitFailure);
             }
             Some((code, _)) if code != 1 => {
-                XHCI_ADDR_DEV_FAIL.store(code as u32, Ordering::Relaxed);
                 log::error!("xHCI: {}: Address Device failed (code={} slot={})", self.name, code, slot);
                 return Err(PCIeDeviceErr::InitFailure);
             }
             Some(_) => {}
         }
-        XHCI_ADDR_DEV_OK.fetch_add(1, Ordering::Relaxed);
         // input_ctx no longer needed after Address Device completes.
         drop(input_ctx);
 
@@ -974,26 +830,18 @@ impl XhciDevice {
 
         if is_pl2303 {
             // PL2303: always run PL2303 setup regardless of bulk_in_ring state.
-            // If a previous port (e.g. Kioxia MSC) already claimed bulk_in_ring,
-            // overwrite it — serial console takes priority over mass storage.
             if let Err(e) = self.try_setup_pl2303(slot) {
                 log::warn!("xHCI: {}: PL2303 setup failed: {:?}", self.name, e);
             }
         } else {
             // Non-PL2303: skip all protocol probes.
-            // MSC probes issue EP0 control transfers that may time out, leaving
+            // Class probes issue EP0 control transfers that may time out, leaving
             // stale TRANSFER_EVENTs in the Event Ring that corrupt the next
             // device's enumeration.  We only care about PL2303 here.
             log::info!(
-                "xHCI: {}: non-PL2303 {:04x}:{:04x}, skipping MSC/CDC probe",
+                "xHCI: {}: non-PL2303 {:04x}:{:04x}, skipping class probe",
                 self.name, self.dev_vid, self.dev_pid,
             );
-        }
-
-        // Diagnostic: immediately write a test string via bulk OUT to confirm the
-        // write path works before CDC_DEV_PTR is registered via the normal log mirror.
-        if self.is_pl2303 || self.is_cdcacm {
-            let _ = self.cdcacm_write(slot, b"\r\n[awkernel USB diag OK]\r\n");
         }
         Ok(())
     }
@@ -1046,14 +894,12 @@ impl XhciDevice {
             let code = match self.poll_xfer_completion(2_000_000) {
                 Some(c) => c,
                 None => {
-                    XHCI_GDESC_FAIL_CODE.store(0xFFFF, Ordering::Relaxed);
                     log::error!("xHCI: {}: GET_DESCRIPTOR timeout (slot={})", self.name, slot);
                     return Err(PCIeDeviceErr::InitFailure);
                 }
             };
             if code == 1 { break; }
             if code == 13 { continue; }
-            XHCI_GDESC_FAIL_CODE.store(code as u32, Ordering::Relaxed);
             log::error!("xHCI: {}: GET_DESCRIPTOR error code={} slot={}", self.name, code, slot);
             return Err(PCIeDeviceErr::InitFailure);
         }
@@ -1072,9 +918,6 @@ impl XhciDevice {
         // Cache fields needed by try_setup_pl2303() later.
         self.dev_vid      = id_vendor;
         self.dev_pid      = id_product;
-        XHCI_LAST_VID.store(id_vendor as u32, Ordering::Relaxed);
-        XHCI_LAST_PID.store(id_product as u32, Ordering::Relaxed);
-        XHCI_GDESC_OK.fetch_add(1, Ordering::Relaxed);
         self.dev_bcd      = bcd_dev;
         self.dev_class    = dev_class;
         self.dev_max_pkt0 = max_pkt0;
@@ -1124,20 +967,15 @@ impl XhciDevice {
         self.send_noop_cmd();
         match self.poll_cmd_completion(2_000_000) {
             Some((code, _)) if code == 1 => {
-                XHCI_NOOP_RESULT.store(1, Ordering::Relaxed);
                 log::info!("xHCI: {}: NOOP command OK — command ring is alive", self.name);
             }
             Some((code, _)) => {
-                XHCI_NOOP_RESULT.store(2, Ordering::Relaxed);
                 let usbsts = self.read_op(regs::op::USBSTS);
-                XHCI_USBSTS_ON_SLOT_FAIL.store(usbsts, Ordering::Relaxed);
                 log::debug!("xHCI: {}: NOOP failed (code={}) USBSTS={:#010x}", self.name, code, usbsts);
                 return;
             }
             None => {
-                XHCI_NOOP_RESULT.store(2, Ordering::Relaxed);
                 let usbsts = self.read_op(regs::op::USBSTS);
-                XHCI_USBSTS_ON_SLOT_FAIL.store(usbsts, Ordering::Relaxed);
                 log::error!(
                     "xHCI: {}: NOOP timeout — command ring dead. USBSTS={:#010x}",
                     self.name, usbsts,
@@ -1158,7 +996,6 @@ impl XhciDevice {
             }
         }
 
-        XHCI_CCS_SEEN.fetch_add(ccs_ports.len(), Ordering::Relaxed);
 
         if ccs_ports.is_empty() {
             log::info!("xHCI: {}: no device found at boot", self.name);
@@ -1182,7 +1019,6 @@ impl XhciDevice {
                 log::error!("xHCI: {}: port {} reset timeout", self.name, port);
                 continue;
             }
-            XHCI_PORT_RESET_OK.fetch_add(1, Ordering::Relaxed);
             // Clear PRC (and any other change bits) by writing 1 to them (RW1CS).
             let portsc = self.read_portsc(port);
             self.write_portsc(
@@ -1198,7 +1034,6 @@ impl XhciDevice {
                 Some(r) => r,
                 None => {
                     let usbsts = self.read_op(regs::op::USBSTS);
-                    XHCI_USBSTS_ON_SLOT_FAIL.store(usbsts, Ordering::Relaxed);
                     log::error!(
                         "xHCI: {}: Enable Slot timeout port={} USBSTS={:#010x}",
                         self.name, port, usbsts,
@@ -1210,7 +1045,6 @@ impl XhciDevice {
                 log::error!("xHCI: {}: Enable Slot failed (code={}) on port {}", self.name, code, port);
                 continue;
             }
-            XHCI_SLOT_ENABLED.fetch_add(1, Ordering::Relaxed);
             log::info!("xHCI: {}: slot {} assigned for port {}", self.name, slot, port);
 
             if let Err(e) = self.enumerate_port(port, slot) {
@@ -1221,7 +1055,6 @@ impl XhciDevice {
                 self.abandon_dev_state();
                 continue;
             }
-            XHCI_ENUM_OK.fetch_add(1, Ordering::Relaxed);
 
             if self.is_pl2303 || self.is_cdcacm {
                 return; // Found our serial adapter — done.
@@ -1295,16 +1128,13 @@ impl XhciDevice {
         // past it so we consume the Status Stage event before returning.
         for _ in 0..3 {
             let Some(code) = self.poll_xfer_completion(2_000_000) else {
-                XHCI_CTRL_FAIL_CODE.store(0xFFFF, Ordering::Relaxed);
                 return Err(PCIeDeviceErr::InitFailure);
             };
             if code == 1 { return Ok(()); }
             if code == 13 { continue; }
             log::error!("xHCI: control_transfer_in: code={}", code);
-            XHCI_CTRL_FAIL_CODE.store(code as u32, Ordering::Relaxed);
             return Err(PCIeDeviceErr::InitFailure);
         }
-        XHCI_CTRL_FAIL_CODE.store(0xFFFE, Ordering::Relaxed); // exhausted SP retries
         Err(PCIeDeviceErr::InitFailure)
     }
 
@@ -1708,7 +1538,6 @@ impl XhciDevice {
         if !pl2303::is_pl2303(self.dev_vid, self.dev_pid) {
             return Ok(());
         }
-        XHCI_PL2303_VID_SEEN.store(true, Ordering::Relaxed);
 
         log::info!(
             "xHCI: {}: slot {} — PL2303 detected VID={:#06x} PID={:#06x} bcdDevice={:#06x}",
@@ -1717,7 +1546,6 @@ impl XhciDevice {
 
         // Walk the configuration descriptor for bulk endpoints.
         let (cfg, cfg_len) = self.get_config_descriptor(slot)?;
-        XHCI_PL2303_GOT_CFG.store(true, Ordering::Relaxed);
 
         let mut info = match pl2303::find_bulk_endpoints(&cfg, cfg_len) {
             Some(i) => i,
@@ -1726,7 +1554,6 @@ impl XhciDevice {
                 return Err(PCIeDeviceErr::InitFailure);
             }
         };
-        XHCI_PL2303_GOT_EPS.store(true, Ordering::Relaxed);
 
         // Determine chip type from cached device descriptor fields.
         let mut chip_type = pl2303::detect_chip_type(
@@ -1752,16 +1579,13 @@ impl XhciDevice {
         );
 
         self.set_configuration(slot, info.config_val)?;
-        XHCI_PL2303_SET_CFG.store(true, Ordering::Relaxed);
 
         self.configure_bulk_endpoints(
             slot, info.bulk_in_addr, info.bulk_out_addr, info.max_pkt,
         )?;
-        XHCI_PL2303_CFG_EPS.store(true, Ordering::Relaxed);
 
         // Phase B: chip initialization sequence.
         self.pl2303_init_seq(slot, chip_type, info.data_iface_no)?;
-        XHCI_PL2303_INIT_SEQ.store(true, Ordering::Relaxed);
 
         // SET_LINE_CODING (115200 8N1) — same CDC class request as CDC-ACM,
         // but wIndex = data_iface_no (PL2303 uses the data interface for class requests).
@@ -1800,25 +1624,16 @@ impl XhciDevice {
         // First pass: 9 bytes to learn wTotalLength.
         let setup9: u64 = 0x80u64 | (6u64 << 8) | (0x0200u64 << 16) | (9u64 << 48);
         self.control_transfer_in(slot, setup9, phys, 9)?;
-        // Diagnostic: first pass succeeded — DMA and EP0 are functional up to here.
-        XHCI_PL2303_CFG_P1_OK.store(true, Ordering::Relaxed);
 
         let total = u16::from_le_bytes([buf.as_mut()[2], buf.as_mut()[3]]) as usize;
         let fetch = total.min(255);
         log::info!("xHCI: {}: get_config_descriptor: wTotalLength={} fetch={}", self.name, total, fetch);
-        if total > 0 {
-            // Diagnostic: DMA buffer was actually written (not a cache/coherency ghost of zeros).
-            XHCI_PL2303_CFG_TOTAL_OK.store(true, Ordering::Relaxed);
-        }
-
         // Guard: if fetch==0 the device sent a malformed/empty config descriptor; bail now
         // rather than issuing a GET_DESCRIPTOR with wLength=0 which most devices STALL.
         if fetch == 0 {
             log::error!("xHCI: {}: get_config_descriptor: wTotalLength=0 (DMA not updated?)", self.name);
             return Err(PCIeDeviceErr::InitFailure);
         }
-        // Record fetch before the second transfer so it's visible even if the transfer fails.
-        XHCI_CFG_FETCH.store(fetch as u8, Ordering::Relaxed);
 
         // Second pass: full descriptor.
         for b in buf.as_mut().iter_mut() { *b = 0; }
@@ -2003,392 +1818,6 @@ impl XhciDevice {
     }
 
     // -------------------------------------------------------------------------
-    // Phase 4c: MSC Bulk-Only Transport (BOT)
-    // -------------------------------------------------------------------------
-
-    /// Execute one BOT IN transaction: CBW → data IN → CSW.
-    /// Returns CSW status byte (0 = pass).
-    fn msc_bot_in(
-        &mut self, slot: u8,
-        cdb: &[u8; 16], cdb_len: u8,
-        data_phys: u64, data_len: u32,
-    ) -> Result<u8, PCIeDeviceErr> {
-        let mut cbw_buf = DMAPool::<[u8; 64]>::new(0, 1).ok_or(PCIeDeviceErr::InitFailure)?;
-        let mut csw_buf = DMAPool::<[u8; 64]>::new(0, 1).ok_or(PCIeDeviceErr::InitFailure)?;
-        for b in cbw_buf.as_mut().iter_mut() { *b = 0; }
-        for b in csw_buf.as_mut().iter_mut() { *b = 0; }
-
-        self.msc_tag = self.msc_tag.wrapping_add(1);
-        let tag = self.msc_tag;
-
-        let cbw = msc::Cbw {
-            signature: msc::CBW_SIGNATURE,
-            tag,
-            data_transfer_length: data_len,
-            flags: msc::CBW_FLAGS_IN,
-            lun: 0,
-            cb_length: cdb_len,
-            cb: *cdb,
-        };
-        msc::write_cbw(cbw_buf.as_mut(), &cbw);
-
-        let cbw_phys = cbw_buf.get_phy_addr().as_usize() as u64;
-        let csw_phys = csw_buf.get_phy_addr().as_usize() as u64;
-
-        self.bulk_out_transfer(slot, cbw_phys, msc::CBW_WIRE_LEN as u32)?;
-        if data_len > 0 {
-            self.bulk_in_transfer(slot, data_phys, data_len)?;
-        }
-        self.bulk_in_transfer(slot, csw_phys, msc::CSW_WIRE_LEN as u32)?;
-
-        let csw = msc::read_csw(csw_buf.as_mut());
-        // Copy packed fields to locals before comparison to avoid misaligned-reference UB.
-        let csw_sig = csw.signature;
-        let csw_tag = csw.tag;
-        let csw_status = csw.status;
-        if csw_sig != msc::CSW_SIGNATURE {
-            log::error!("xHCI: BOT: bad CSW signature {:#010x}", csw_sig);
-            return Err(PCIeDeviceErr::InitFailure);
-        }
-        if csw_tag != tag {
-            log::error!("xHCI: BOT: CSW tag mismatch ({} vs {})", csw_tag, tag);
-            return Err(PCIeDeviceErr::InitFailure);
-        }
-        Ok(csw_status)
-    }
-
-    /// SCSI INQUIRY — confirm device type and log vendor/product strings.
-    fn msc_inquiry(&mut self, slot: u8) -> Result<(), PCIeDeviceErr> {
-        let mut buf = DMAPool::<[u8; 64]>::new(0, 1).ok_or(PCIeDeviceErr::InitFailure)?;
-        for b in buf.as_mut().iter_mut() { *b = 0; }
-        let phys = buf.get_phy_addr().as_usize() as u64;
-
-        let cdb = msc::scsi_inquiry_cdb();
-        let st = self.msc_bot_in(slot, &cdb, 6, phys, 36)?;
-        if st != msc::CSW_STATUS_PASS {
-            log::error!("xHCI: INQUIRY failed (status={})", st);
-            return Err(PCIeDeviceErr::InitFailure);
-        }
-
-        let d = buf.as_mut();
-        let ptype = d[0] & 0x1f;
-        // Trim trailing spaces from vendor (bytes 8-15) and product (bytes 16-31).
-        let vendor = core::str::from_utf8(&d[8..16]).unwrap_or("?");
-        let product = core::str::from_utf8(&d[16..32]).unwrap_or("?");
-        log::info!(
-            "xHCI: {}: slot {} INQUIRY type={} vendor='{}' product='{}'",
-            self.name, slot, ptype,
-            vendor.trim(), product.trim(),
-        );
-        Ok(())
-    }
-
-    /// SCSI READ CAPACITY(10) — returns (last_lba, block_len_bytes).
-    fn msc_read_capacity(&mut self, slot: u8) -> Result<(u32, u32), PCIeDeviceErr> {
-        let mut buf = DMAPool::<[u8; 64]>::new(0, 1).ok_or(PCIeDeviceErr::InitFailure)?;
-        for b in buf.as_mut().iter_mut() { *b = 0; }
-        let phys = buf.get_phy_addr().as_usize() as u64;
-
-        let cdb = msc::scsi_read_capacity_cdb();
-        let st = self.msc_bot_in(slot, &cdb, 10, phys, 8)?;
-        if st != msc::CSW_STATUS_PASS {
-            log::error!("xHCI: READ CAPACITY failed (status={})", st);
-            return Err(PCIeDeviceErr::InitFailure);
-        }
-
-        let d = buf.as_mut();
-        let last_lba = u32::from_be_bytes([d[0], d[1], d[2], d[3]]);
-        let block_len = u32::from_be_bytes([d[4], d[5], d[6], d[7]]);
-        log::info!(
-            "xHCI: {}: slot {} capacity: last_lba={} block={}B (~{}MiB)",
-            self.name, slot, last_lba, block_len,
-            (last_lba as u64 + 1) * block_len as u64 / (1024 * 1024),
-        );
-        Ok((last_lba, block_len))
-    }
-
-    /// SCSI READ(10) — read `count` 512-byte sectors from `lba` into `buf_phys`.
-    pub fn msc_read10(
-        &mut self, slot: u8, lba: u32, count: u16, buf_phys: u64,
-    ) -> Result<(), PCIeDeviceErr> {
-        let cdb = msc::scsi_read10_cdb(lba, count);
-        let data_len = (count as u32) * 512;
-        let st = self.msc_bot_in(slot, &cdb, 10, buf_phys, data_len)?;
-        if st != msc::CSW_STATUS_PASS {
-            log::error!("xHCI: READ(10) lba={} count={} failed (status={})", lba, count, st);
-            return Err(PCIeDeviceErr::InitFailure);
-        }
-        Ok(())
-    }
-
-    // -------------------------------------------------------------------------
-    // Phase 4d: Top-level MSC setup orchestration
-    // -------------------------------------------------------------------------
-
-    fn try_setup_msc(&mut self, slot: u8) -> Result<(), PCIeDeviceErr> {
-        let (cfg, cfg_len) = self.get_config_descriptor(slot)?;
-
-        let info = match find_msc_bulk_endpoints(&cfg, cfg_len) {
-            Some(i) => i,
-            None => {
-                log::info!(
-                    "xHCI: {}: slot {} — no MSC bulk endpoints in config descriptor",
-                    self.name, slot,
-                );
-                return Ok(());
-            }
-        };
-        log::info!(
-            "xHCI: {}: slot {} — MSC cfg={} IN={:#04x} OUT={:#04x} max_pkt={}",
-            self.name, slot, info.config_val, info.in_addr, info.out_addr, info.max_pkt,
-        );
-
-        self.set_configuration(slot, info.config_val)?;
-        self.configure_bulk_endpoints(slot, info.in_addr, info.out_addr, info.max_pkt)?;
-        self.msc_inquiry(slot)?;
-
-        let (last_lba, block_len) = self.msc_read_capacity(slot)?;
-        if block_len != 512 {
-            log::warn!(
-                "xHCI: {}: slot {} — block size {} ≠ 512, skipping sector read",
-                self.name, slot, block_len,
-            );
-            return Ok(());
-        }
-
-        // Read LBA 0 (MBR / protective GPT header).
-        let mut sec = DMAPool::<[u8; 512]>::new(0, 1).ok_or(PCIeDeviceErr::InitFailure)?;
-        for b in sec.as_mut().iter_mut() { *b = 0; }
-        let sec_phys = sec.get_phy_addr().as_usize() as u64;
-        self.msc_read10(slot, 0, 1, sec_phys)?;
-
-        // Extract partition table without keeping a long-lived borrow on sec.
-        let boot_sig = {
-            let s = sec.as_mut();
-            u16::from_le_bytes([s[510], s[511]])
-        };
-        let mut fat32_part: Option<u32> = None;
-        if boot_sig == 0xAA55 {
-            log::info!("xHCI: {}: slot {} — valid MBR (0xAA55)", self.name, slot);
-            for i in 0..4usize {
-                let off = 446 + i * 16;
-                let (ptype, status, lba_start, lba_size) = {
-                    let s = sec.as_mut();
-                    let pt = s[off + 4];
-                    let st = s[off];
-                    let ls = u32::from_le_bytes([s[off+8],  s[off+9],  s[off+10], s[off+11]]);
-                    let lz = u32::from_le_bytes([s[off+12], s[off+13], s[off+14], s[off+15]]);
-                    (pt, st, ls, lz)
-                };
-                if ptype == 0 { continue; }
-                log::info!(
-                    "  partition {}: type={:#04x} status={:#04x} lba_start={} lba_size={}",
-                    i + 1, ptype, status, lba_start, lba_size,
-                );
-                if fat32_part.is_none() && (ptype == 0x0B || ptype == 0x0C) {
-                    fat32_part = Some(lba_start);
-                }
-            }
-        } else {
-            log::warn!(
-                "xHCI: {}: slot {} — no MBR signature ({:#06x}); total sectors: {}",
-                self.name, slot, boot_sig, last_lba as u64 + 1,
-            );
-        }
-        drop(sec);
-
-        // Phase 5: mount FAT32 and locate kernel file.
-        if let Some(plba) = fat32_part {
-            self.try_mount_fat32(slot, plba);
-        }
-        Ok(())
-    }
-    // -------------------------------------------------------------------------
-    // Phase 5: FAT32 filesystem layer
-    // -------------------------------------------------------------------------
-
-    /// Parse the BPB from `partition_lba` and store FAT32 volume metadata.
-    fn fat32_mount(&mut self, slot: u8, partition_lba: u32) -> Result<(), PCIeDeviceErr> {
-        let mut bpb = DMAPool::<[u8; 512]>::new(0, 1).ok_or(PCIeDeviceErr::InitFailure)?;
-        for b in bpb.as_mut().iter_mut() { *b = 0; }
-        let phys = bpb.get_phy_addr().as_usize() as u64;
-        self.msc_read10(slot, partition_lba, 1, phys)?;
-
-        let fs = {
-            let buf = bpb.as_mut();
-            fat32::Fat32::from_bpb(buf, partition_lba).ok_or(PCIeDeviceErr::InitFailure)?
-        };
-        log::info!(
-            "xHCI: {}: FAT32 bps={} spc={} fat_sz={} root_clus={} data_sec={}",
-            self.name, fs.bytes_per_sec, fs.sec_per_clus,
-            fs.fat_sz, fs.root_clus, fs.first_data_sec,
-        );
-        self.fat32 = Some(fs);
-        Ok(())
-    }
-
-    /// Read the FAT32 cluster chain entry for `cluster`. Returns the next cluster
-    /// number (≥ `fat32::EOC` means end-of-chain).
-    fn fat32_next_cluster(&mut self, slot: u8, cluster: u32) -> Result<u32, PCIeDeviceErr> {
-        let (fat_lba, byte_off) = {
-            let fs = self.fat32.as_ref().ok_or(PCIeDeviceErr::InitFailure)?;
-            fs.fat_entry_pos(cluster)
-        };
-        let mut sec = DMAPool::<[u8; 512]>::new(0, 1).ok_or(PCIeDeviceErr::InitFailure)?;
-        for b in sec.as_mut().iter_mut() { *b = 0; }
-        let phys = sec.get_phy_addr().as_usize() as u64;
-        self.msc_read10(slot, fat_lba, 1, phys)?;
-        let raw = {
-            let s = sec.as_mut();
-            u32::from_le_bytes([s[byte_off], s[byte_off+1], s[byte_off+2], s[byte_off+3]])
-        };
-        Ok(raw & 0x0FFF_FFFF)
-    }
-
-    /// Scan the root directory cluster chain for a file named `filename`.
-    /// Returns `Some((first_cluster, file_size))` on match, `None` if not found.
-    fn fat32_find_root_file(
-        &mut self, slot: u8, filename: &str,
-    ) -> Result<Option<(u32, u32)>, PCIeDeviceErr> {
-        let (mut cluster, sec_per_clus) = {
-            let fs = self.fat32.as_ref().ok_or(PCIeDeviceErr::InitFailure)?;
-            (fs.root_clus, fs.sec_per_clus)
-        };
-        let mut sec = DMAPool::<[u8; 512]>::new(0, 1).ok_or(PCIeDeviceErr::InitFailure)?;
-        // LFN accumulation buffer indexed by (seq-1)*13 + char_index.
-        let mut lfn_buf = [0u16; 260];
-        let mut lfn_valid = false;
-
-        'chain: loop {
-            let base_lba = {
-                let fs = self.fat32.as_ref().ok_or(PCIeDeviceErr::InitFailure)?;
-                fs.cluster_to_lba(cluster)
-            };
-            for s in 0..sec_per_clus as u32 {
-                for b in sec.as_mut().iter_mut() { *b = 0; }
-                let phys = sec.get_phy_addr().as_usize() as u64;
-                self.msc_read10(slot, base_lba + s, 1, phys)?;
-
-                for e in 0..16usize {
-                    // Copy 32-byte entry to a local array to avoid borrow conflicts.
-                    let entry: [u8; 32] = {
-                        let d = sec.as_mut();
-                        let off = e * 32;
-                        let mut a = [0u8; 32];
-                        a.copy_from_slice(&d[off..off + 32]);
-                        a
-                    };
-
-                    if entry[0] == 0x00 { return Ok(None); } // end of directory
-                    if entry[0] == 0xE5 { lfn_valid = false; continue; } // deleted
-
-                    let attr = entry[11];
-                    if attr == fat32::ATTR_LFN {
-                        let order = entry[0];
-                        if order & 0x40 != 0 {
-                            // First-encountered LFN entry (highest seq, end of name).
-                            for x in lfn_buf.iter_mut() { *x = 0; }
-                            lfn_valid = true;
-                        }
-                        if lfn_valid {
-                            let seq = (order & 0x1F) as usize;
-                            if seq >= 1 && seq <= 20 {
-                                let chars = fat32::lfn_chars(&entry);
-                                let base = (seq - 1) * 13;
-                                for (i, &c) in chars.iter().enumerate() {
-                                    if base + i < 260 { lfn_buf[base + i] = c; }
-                                }
-                            }
-                        }
-                        continue;
-                    }
-
-                    // Skip volume labels and subdirectory entries.
-                    if attr & (fat32::ATTR_VOLUME | fat32::ATTR_DIR) != 0 {
-                        lfn_valid = false;
-                        continue;
-                    }
-
-                    // Regular file entry: check LFN then 8.3 name.
-                    let matched = (lfn_valid && fat32::lfn_matches(&lfn_buf, filename))
-                        || fat32::match_83(&entry[..11], filename);
-                    lfn_valid = false;
-
-                    if matched {
-                        let (fc, sz) = fat32::dir_entry_info(&entry);
-                        return Ok(Some((fc, sz)));
-                    }
-                }
-            }
-
-            let next = self.fat32_next_cluster(slot, cluster)?;
-            if next >= fat32::EOC { break 'chain; }
-            cluster = next;
-        }
-        Ok(None)
-    }
-
-    /// Read `file_size` bytes of file data starting at `first_cluster` into
-    /// the caller-provided DMA buffer at physical address `dest_phys`.
-    pub fn fat32_read_file(
-        &mut self, slot: u8, first_cluster: u32, file_size: u32, dest_phys: u64,
-    ) -> Result<(), PCIeDeviceErr> {
-        let sec_per_clus = {
-            let fs = self.fat32.as_ref().ok_or(PCIeDeviceErr::InitFailure)?;
-            fs.sec_per_clus
-        };
-        let clus_bytes = sec_per_clus as u32 * 512;
-        let mut cluster = first_cluster;
-        let mut remaining = file_size;
-        let mut dest_off: u64 = 0;
-
-        while remaining > 0 {
-            let clus_lba = {
-                let fs = self.fat32.as_ref().ok_or(PCIeDeviceErr::InitFailure)?;
-                fs.cluster_to_lba(cluster)
-            };
-            let read_bytes = clus_bytes.min(remaining);
-            let read_secs = ((read_bytes + 511) / 512) as u16;
-            self.msc_read10(slot, clus_lba, read_secs, dest_phys + dest_off)?;
-
-            remaining = remaining.saturating_sub(clus_bytes);
-            dest_off += clus_bytes as u64;
-
-            if remaining > 0 {
-                let next = self.fat32_next_cluster(slot, cluster)?;
-                if next >= fat32::EOC { break; }
-                cluster = next;
-            }
-        }
-        Ok(())
-    }
-
-    /// Mount the FAT32 partition at `partition_lba` and search the root directory
-    /// for common kernel file names, logging what is found.
-    fn try_mount_fat32(&mut self, slot: u8, partition_lba: u32) {
-        if let Err(e) = self.fat32_mount(slot, partition_lba) {
-            log::error!("xHCI: {}: FAT32 mount failed: {:?}", self.name, e);
-            return;
-        }
-        let candidates = ["kernel.elf", "KERNEL.ELF", "vmlinux", "VMLINUX",
-                          "boot.elf",   "BOOT.ELF"];
-        for &name in &candidates {
-            match self.fat32_find_root_file(slot, name) {
-                Ok(Some((cluster, size))) => {
-                    log::info!(
-                        "xHCI: {}: '{}' found: first_cluster={} size={}B ({}KiB)",
-                        self.name, name, cluster, size, size / 1024,
-                    );
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    log::warn!("xHCI: {}: scan '{}' error: {:?}", self.name, name, e);
-                }
-            }
-        }
-    }
-
-    // -------------------------------------------------------------------------
     // Phase 6: CDC-ACM detection and setup orchestration
     // -------------------------------------------------------------------------
 
@@ -2449,61 +1878,6 @@ impl XhciDevice {
 #[inline]
 fn ctx_write32(ctx: &mut [u8], off: usize, val: u32) {
     ctx[off..off + 4].copy_from_slice(&val.to_le_bytes());
-}
-
-// ---------------------------------------------------------------------------
-// MSC bulk endpoint discovery: walk config descriptor for class 0x08 + Bulk EPs.
-// ---------------------------------------------------------------------------
-
-struct BulkInfo {
-    in_addr: u8,     // USB endpoint address (bit7=1)
-    out_addr: u8,    // USB endpoint address (bit7=0)
-    max_pkt: u16,
-    config_val: u8,
-}
-
-fn find_msc_bulk_endpoints(desc: &[u8], len: usize) -> Option<BulkInfo> {
-    let config_val = if len >= 6 { desc[5] } else { 1 };
-    let mut i = 0;
-    let mut in_msc = false;
-    let mut in_ep: Option<u8> = None;
-    let mut out_ep: Option<u8> = None;
-    let mut max_pkt: u16 = 512;
-
-    while i < len {
-        let blen = desc[i] as usize;
-        if blen < 2 || i + blen > len { break; }
-        let btype = desc[i + 1];
-
-        match btype {
-            4 if blen >= 9 => {
-                // Interface Descriptor: bInterfaceClass at [i+5].
-                in_msc = desc[i + 5] == 0x08;
-                if !in_msc {
-                    in_ep = None;
-                    out_ep = None;
-                }
-            }
-            5 if blen >= 7 && in_msc => {
-                // Endpoint Descriptor: only pick Bulk (bmAttributes bits[1:0] == 2).
-                let addr = desc[i + 2];
-                let attrs = desc[i + 3];
-                let pkt = u16::from_le_bytes([desc[i + 4], desc[i + 5]]);
-                if attrs & 0x3 == 2 {
-                    max_pkt = pkt;
-                    if addr & 0x80 != 0 { in_ep = Some(addr); }
-                    else { out_ep = Some(addr); }
-                }
-            }
-            _ => {}
-        }
-        i += blen;
-    }
-
-    match (in_ep, out_ep) {
-        (Some(ia), Some(oa)) => Some(BulkInfo { in_addr: ia, out_addr: oa, max_pkt, config_val }),
-        _ => None,
-    }
 }
 
 // ---------------------------------------------------------------------------

@@ -1,5 +1,5 @@
-use alloc::{boxed::Box, format};
-use awkernel_lib::{console, delay::wait_forever, heap::TALLOC};
+use alloc::boxed::Box;
+use awkernel_lib::{delay::wait_forever, heap::TALLOC};
 
 use core::ffi::c_void;
 use unwinding::abi::{_Unwind_Backtrace, _Unwind_GetIP, UnwindContext, UnwindReasonCode};
@@ -159,12 +159,8 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     {
         let _guard = TALLOC.save();
         unsafe { TALLOC.use_primary_then_backup() };
-        console::print(&format!("\r\n*** PANIC: {info}\r\n"));
         log::error!("panic: {info}");
     }
-
-    #[cfg(target_arch = "x86_64")]
-    awkernel_lib::logger::reboot_if_pending();
 
     awkernel_async_lib::task::panicking();
     stack_trace();

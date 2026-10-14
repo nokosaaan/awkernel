@@ -104,17 +104,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     super::console::init_device(); // 2. Initialize the serial port.
 
-    // BAR 0 (gray): kernel_main reached. Bars 0–15 are all gray = early init OK.
-    // draw_boot_bar(boot_info, 0, 100, 100, 100);
-
     unsafe { unsafe_puts("\r\nThe primary CPU is waking up.\r\n") };
 
     // 3. Initialize virtual memory
 
     unsafe { page_allocator::init(boot_info) };
     let mut page_table = if let Some(page_table) = unsafe { get_page_table() } {
-        // BAR 1 (green): page table mapped OK.
-        // draw_boot_bar(boot_info, 1, 100, 100, 100);
         page_table
     } else {
         unsafe { unsafe_puts("Physical memory is not mapped.\r\n") };
@@ -154,9 +149,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // 6. Initialize the backup heap memory allocator.
     let (backup_pages, backup_region, backup_next_frame) =
         init_backup_heap(boot_info, &mut page_table, early_num_cpu);
-
-    // BAR 2 (blue): backup heap OK — about to enter kernel_main2.
-    // draw_boot_bar(boot_info, 2, 100, 100, 100);
 
     let _ = catch_unwind(|| {
         kernel_main2(
@@ -209,14 +201,8 @@ fn kernel_main2(
     acpi: AcpiTables<AcpiMapper>,
     offset: u64,
 ) {
-    // BAR 3 (yellow): kernel_main2 entered — inside catch_unwind.
-    // draw_boot_bar(boot_info, 3, 100, 100, 100);
-
-    // 5. Enable logger.
+    // 7. Enable logger.
     super::console::register_console();
-
-    // BAR 4 (cyan): register_console returned — logger ready.
-    // draw_boot_bar(boot_info, 4, 100, 100, 100);
 
     log::info!(
         "Backup heap: start = 0x{:x}, size = {}MiB",
@@ -226,21 +212,6 @@ fn kernel_main2(
 
     // The physical memory offset is read once in `kernel_main` (step 4) and passed in.
     log::info!("Physical memory offset: 0x{offset:x}");
-
-    // BAR 5 (orange): physical memory offset obtained.
-    // draw_boot_bar(boot_info, 5, 100, 100, 100);
-
-    // 7. Initialize ACPI.
-    let acpi = if let Some(acpi) = awkernel_lib::arch::x86_64::acpi::create_acpi(boot_info, offset)
-    {
-        // BAR 6a (light blue): create_acpi returned Some — ACPI OK.
-        // draw_boot_bar(boot_info, 6, 100, 100, 100);
-        acpi
-    } else {
-        // BAR 6b (dark red): create_acpi returned None — ACPI failed.
-        // draw_boot_bar(boot_info, 6, 100, 100, 100);
-        wait_forever();
-    };
 
     // 8. Get NUMA information.
     let (mut numa_to_mem, cpu_to_numa) =
@@ -254,9 +225,6 @@ fn kernel_main2(
         page_allocators.insert(*numa_id, page_allocator);
     }
 
-    // BAR 9 (lime): NUMA + DMA init done.
-    // draw_boot_bar(boot_info, 9, 100, 100, 100);
-
     for (cpu, numa) in cpu_to_numa.iter() {
         log::info!("CPU/NUMA: {cpu}/{numa}");
     }
@@ -266,9 +234,6 @@ fn kernel_main2(
         log::error!("Failed to map stack memory.");
         wait_forever();
     }
-
-    // BAR 10 (sky): map_stack done.
-    // draw_boot_bar(boot_info, 10, 100, 100, 100);
 
     unsafe { set_raw_cpu_id_to_numa(cpu_to_numa) };
 
@@ -282,30 +247,20 @@ fn kernel_main2(
             wait_forever();
         }
 
-        // BAR 11 (pink): awkernel_lib init done.
-        // draw_boot_bar(boot_info, 11, 100, 100, 100);
-
         // 11. Initialize APIC.
         let type_apic = awkernel_drivers::interrupt_controller::apic::new(
             &mut awkernel_page_table,
             page_allocator0,
         );
 
-        // BAR 12 (gold): APIC init done.
-        // draw_boot_bar(boot_info, 12, 100, 100, 100);
-
         // 12. Map a page for `mpboot.img`.
         let mpboot_start = map_mpboot_page(boot_info, &mut awkernel_page_table, page_allocator0);
 
         (type_apic, mpboot_start)
     } else {
-        // BAR 9b (dark): no page allocator for NUMA #0.
-        // draw_boot_bar(boot_info, 9, 100, 100, 100);
+        log::error!("No page allocator for NUMA #0.");
         awkernel_lib::delay::wait_forever();
     };
-
-    // BAR 7 (magenta): ACPI + APIC + stack init done — about to wake non-primary CPUs.
-    // draw_boot_bar(boot_info, 7, 100, 100, 100);
 
     // 13. Write boot images to wake non-primary CPUs up.
     write_boot_images(offset, mpboot_start);
@@ -410,296 +365,28 @@ fn kernel_main2(
         non_primary_cpus.len() + 1,
     );
 
-    // Row 0: primary heap ready, about to init PCIe/xHCI.
-    draw_boot_bar(boot_info, 0, 100, 100, 100);
-
     // 16. Initialize PCIe devices.
-    awkernel_lib::logger::arm_reboot_on_warn();
     if awkernel_drivers::pcie::init_with_acpi(&acpi, 255, 32).is_err() {
         // fallback
         awkernel_drivers::pcie::init_with_io(255, 32);
     }
 
-    // ── Boot progress bars ──────────────────────────────────────────────────
-    // Each row is 16px high; bar colour encodes status, 8x8 white text
-    // overlays the label so the meaning is readable without a legend.
-
-    // Row 0: PCIe init reached.
-    draw_boot_text(boot_info, 0, "PCI INIT", 255, 255, 255);
-
-    // Row 1: PCI BUS_MASTER confirmed set.
-    if awkernel_drivers::pcie::usb::xhci::xhci_bus_master_ok() {
-        draw_boot_bar(boot_info, 1, 100, 100, 100);
-        draw_boot_text(boot_info, 1, "BUS MASTER", 255, 255, 255);
-    }
-
-    // Row 2: xHCI controller started.
-    if awkernel_drivers::pcie::usb::xhci::xhci_any_started() {
-        draw_boot_bar(boot_info, 2, 100, 100, 100);
-        draw_boot_text(boot_info, 2, "XHCI START", 255, 255, 255);
-    }
-
-    // Rows 3–5: USB enumeration pipeline counts.
-    // Text shows "CCS=N RST=M SLT=K" so we can tell how many devices
-    // made it through each stage (e.g. CCS=2 but RST=1 means one port
-    // reset timed out).
-    {
-        use awkernel_drivers::pcie::usb::xhci::{
-            xhci_ccs_count, xhci_port_reset_count, xhci_slot_count,
-        };
-        let ccs = xhci_ccs_count();
-        let rst = xhci_port_reset_count();
-        let slt = xhci_slot_count();
-
-        // Row 3: CCS seen
-        if ccs > 0 {
-            draw_boot_bar(boot_info, 3, 100, 100, 100);
-            let mut label = [b' '; 7]; // "CCS=N  "
-            label[..4].copy_from_slice(b"CCS=");
-            let mut tmp = [0u8; 3];
-            let w = u32_to_decimal(ccs as u32, &mut tmp).len();
-            label[4..4+w].copy_from_slice(&tmp[..w]);
-            draw_boot_text(boot_info, 3,
-                unsafe { core::str::from_utf8_unchecked(&label[..4+w]) },
-                255, 255, 255);
-        }
-
-        // Row 4: port resets OK
-        if rst > 0 {
-            draw_boot_bar(boot_info, 4, 100, 100, 100);
-            let mut label = [b' '; 7]; // "RST=N  "
-            label[..4].copy_from_slice(b"RST=");
-            let mut tmp = [0u8; 3];
-            let w = u32_to_decimal(rst as u32, &mut tmp).len();
-            label[4..4+w].copy_from_slice(&tmp[..w]);
-            draw_boot_text(boot_info, 4,
-                unsafe { core::str::from_utf8_unchecked(&label[..4+w]) },
-                255, 255, 255);
-        }
-
-        // Row 5: slots enabled
-        if slt > 0 {
-            draw_boot_bar(boot_info, 5, 100, 100, 100);
-            let mut label = [b' '; 7]; // "SLT=N  "
-            label[..4].copy_from_slice(b"SLT=");
-            let mut tmp = [0u8; 3];
-            let w = u32_to_decimal(slt as u32, &mut tmp).len();
-            label[4..4+w].copy_from_slice(&tmp[..w]);
-            draw_boot_text(boot_info, 5,
-                unsafe { core::str::from_utf8_unchecked(&label[..4+w]) },
-                255, 255, 255);
-        }
-    }
-
-    // Row 6: Address Device pipeline — "ADDR=N" count + last failure code.
-    // ADDR=0 means enumerate_port fails before any device descriptor is read.
-    {
-        use awkernel_drivers::pcie::usb::xhci::{xhci_addr_dev_ok, xhci_addr_dev_fail};
-        let addr = xhci_addr_dev_ok();
-        let fail = xhci_addr_dev_fail();
-        if addr > 0 || fail != 0 {
-            let (r, g, b) = if addr > 0 { (100u8, 200u8, 100u8) } else { (200u8, 80u8, 0u8) };
-            draw_boot_bar(boot_info, 6, r, g, b);
-            // "ADDR=N FAIL=XXXX"
-            let mut label = [b' '; 16];
-            label[..5].copy_from_slice(b"ADDR=");
-            let mut tmp = [0u8; 3];
-            let aw = u32_to_decimal(addr as u32, &mut tmp).len();
-            label[5..5+aw].copy_from_slice(&tmp[..aw]);
-            let off = 5 + aw + 1;
-            label[off..off+5].copy_from_slice(b"FAIL=");
-            let mut h4 = [0u8; 4];
-            u32_to_hex4(fail, &mut h4);
-            label[off+5..off+9].copy_from_slice(&h4);
-            let end = off + 9;
-            draw_boot_text(boot_info, 6,
-                unsafe { core::str::from_utf8_unchecked(&label[..end]) },
-                0, 0, 0);
-        }
-    }
-
-    // Row 7: NOOP command ring test (green = OK, red = fail/timeout).
-    {
-        use awkernel_drivers::pcie::usb::xhci::xhci_noop_result;
-        match xhci_noop_result() {
-            1 => {
-                draw_boot_bar(boot_info, 7,   0, 200, 100);
-                draw_boot_text(boot_info, 7, "NOOP OK", 0, 0, 0);
-            }
-            2 => {
-                draw_boot_bar(boot_info, 7, 200,   0,   0);
-                draw_boot_text(boot_info, 7, "NOOP FAIL", 255, 255, 255);
-            }
-            _ => {}
-        }
-    }
-
-    // Row 8: GET_DESCRIPTOR pipeline — GDESC=N (success count) + last failure code,
-    // then VID:PID of the last successfully described device.
-    {
-        use awkernel_drivers::pcie::usb::xhci::{
-            xhci_gdesc_ok, xhci_gdesc_fail_code, xhci_last_vid, xhci_last_pid,
-        };
-        let gok  = xhci_gdesc_ok();
-        let gfail = xhci_gdesc_fail_code();
-        let vid  = xhci_last_vid();
-        let pid  = xhci_last_pid();
-        if gok > 0 || gfail != 0 {
-            let (r, g, b) = if gok > 0 { (255u8, 100u8, 180u8) } else { (200u8, 60u8, 0u8) };
-            draw_boot_bar(boot_info, 8, r, g, b);
-            // "GD=N FAIL=XXXX VID=XXXX PID=XXXX"
-            let mut label = [b' '; 32];
-            label[..3].copy_from_slice(b"GD=");
-            let mut tmp = [0u8; 3];
-            let gw = u32_to_decimal(gok as u32, &mut tmp).len();
-            label[3..3+gw].copy_from_slice(&tmp[..gw]);
-            let mut off = 3 + gw + 1;
-            label[off..off+5].copy_from_slice(b"FAIL=");
-            let mut h4 = [0u8; 4];
-            u32_to_hex4(gfail, &mut h4);
-            label[off+5..off+9].copy_from_slice(&h4);
-            off += 10;
-            if gok > 0 {
-                label[off..off+4].copy_from_slice(b"VID=");
-                u32_to_hex4(vid as u32, &mut h4);
-                label[off+4..off+8].copy_from_slice(&h4);
-                label[off+8] = b' ';
-                label[off+9..off+13].copy_from_slice(b"PID=");
-                u32_to_hex4(pid as u32, &mut h4);
-                label[off+13..off+17].copy_from_slice(&h4);
-                off += 17;
-            }
-            draw_boot_text(boot_info, 8,
-                unsafe { core::str::from_utf8_unchecked(&label[..off]) },
-                0, 0, 0);
-        }
-    }
-
-    // Row 9:  first GET_DESCRIPTOR(Config, 9 bytes) completed.
-    // Row 10: wTotalLength > 0.
-    {
-        use awkernel_drivers::pcie::usb::xhci::{xhci_pl2303_cfg_p1_ok, xhci_pl2303_cfg_total_ok};
-        if xhci_pl2303_cfg_p1_ok() {
-            draw_boot_bar(boot_info,  9, 255, 200,   0);
-            draw_boot_text(boot_info, 9, "CFG P1 OK", 0, 0, 0);
-        }
-        if xhci_pl2303_cfg_total_ok() {
-            draw_boot_bar(boot_info, 10, 255, 255, 100);
-            draw_boot_text(boot_info, 10, "TOTAL OK", 0, 0, 0);
-        }
-    }
-
-    // Rows 11–15: PL2303 setup sub-steps.
-    {
-        use awkernel_drivers::pcie::usb::xhci::{
-            xhci_pl2303_got_cfg, xhci_pl2303_got_eps, xhci_pl2303_set_cfg,
-            xhci_pl2303_cfg_eps, xhci_pl2303_init_seq,
-        };
-        if xhci_pl2303_got_cfg()  {
-            draw_boot_bar(boot_info, 11, 100, 150, 255);
-            draw_boot_text(boot_info, 11, "GOT CFG", 0, 0, 0);
-        }
-        if xhci_pl2303_got_eps()  {
-            draw_boot_bar(boot_info, 12,   0, 220,  80);
-            draw_boot_text(boot_info, 12, "GOT EPS", 0, 0, 0);
-        }
-        if xhci_pl2303_set_cfg()  {
-            draw_boot_bar(boot_info, 13, 160,   0, 200);
-            draw_boot_text(boot_info, 13, "SET CFG", 255, 255, 255);
-        }
-        if xhci_pl2303_cfg_eps()  {
-            draw_boot_bar(boot_info, 14, 255, 100,  60);
-            draw_boot_text(boot_info, 14, "CFG EPS", 0, 0, 0);
-        }
-        if xhci_pl2303_init_seq() {
-            draw_boot_bar(boot_info, 15, 180, 255,   0);
-            draw_boot_text(boot_info, 15, "INIT SEQ", 0, 0, 0);
-        }
-    }
-
-    // Row 16: USB serial console registered.
-    if awkernel_drivers::pcie::usb::xhci::is_cdc_registered() {
-        draw_boot_bar(boot_info, 16,   0, 255,   0);
-        draw_boot_text(boot_info, 16, "CDC READY", 0, 0, 0);
-    } else {
-        draw_boot_bar(boot_info, 16, 160,   0,   0);
-        draw_boot_text(boot_info, 16, "CDC NOT READY", 255, 255, 255);
-    }
-
-    // Row 17: control_transfer_in failure code — colour encodes category,
-    // text shows "FAIL=XXXX" with the raw 16-bit code in hex.
-    //   0xFFFF=timeout, 0xFFFE=SP-retry exhausted, 4=TxErr, 6=STALL, other=purple.
-    {
-        use awkernel_drivers::pcie::usb::xhci::xhci_ctrl_fail_code;
-        let code = xhci_ctrl_fail_code();
-        if code != 0 {
-            match code {
-                0xFFFF => draw_boot_bar(boot_info, 17, 200,   0,   0),
-                0xFFFE => draw_boot_bar(boot_info, 17,   0, 200, 200),
-                4      => draw_boot_bar(boot_info, 17, 255, 200,   0),
-                6      => draw_boot_bar(boot_info, 17, 255, 140,   0),
-                _      => draw_boot_bar(boot_info, 17, 200,   0, 200),
-            }
-            let mut label = [0u8; 9];
-            label[..5].copy_from_slice(b"FAIL=");
-            let mut hex = [0u8; 4];
-            u32_to_hex4(code, &mut hex);
-            label[5..9].copy_from_slice(&hex);
-            // SAFETY: label contains only ASCII bytes from the "FAIL=" prefix and 0-9A-F.
-            let s = unsafe { core::str::from_utf8_unchecked(&label) };
-            draw_boot_text(boot_info, 17, s, 255, 255, 255);
-        }
-    }
-
-    // Row 18: wTotalLength read from first-pass config descriptor, decimal.
-    // "FETCH=NNN" — 0 means the first pass did not reach this point yet.
-    {
-        use awkernel_drivers::pcie::usb::xhci::xhci_cfg_fetch;
-        let fetch = xhci_cfg_fetch();
-        if fetch != 0 {
-            draw_boot_bar(boot_info, 18, 80, 80, 120);
-            let mut label = [b' '; 9];
-            label[..6].copy_from_slice(b"FETCH=");
-            let mut dec = [0u8; 3];
-            let written = u32_to_decimal(fetch as u32, &mut dec).len();
-            label[6..6 + written].copy_from_slice(&dec[..written]);
-            let end = 6 + written;
-            // SAFETY: label only contains ASCII ("FETCH=" + decimal digits + spaces).
-            let s = unsafe { core::str::from_utf8_unchecked(&label[..end]) };
-            draw_boot_text(boot_info, 18, s, 255, 255, 255);
-        }
-    }
-
-    // Rows 19–24: USBSTS fault bits captured at first command timeout.
-    if let Some(usbsts) = awkernel_drivers::pcie::usb::xhci::xhci_usbsts_on_fail() {
-        if usbsts & (1 <<  0) != 0 {
-            draw_boot_bar(boot_info, 19, 200,   0,   0);
-            draw_boot_text(boot_info, 19, "HCH", 255, 255, 255);
-        }
-        if usbsts & (1 <<  2) != 0 {
-            draw_boot_bar(boot_info, 20, 200,   0,   0);
-            draw_boot_text(boot_info, 20, "HSE", 255, 255, 255);
-        }
-        if usbsts & (1 <<  3) != 0 {
-            draw_boot_bar(boot_info, 21, 255, 255,   0);
-            draw_boot_text(boot_info, 21, "EINT", 0, 0, 0);
-        }
-        if usbsts & (1 <<  4) != 0 {
-            draw_boot_bar(boot_info, 22,   0, 200, 200);
-            draw_boot_text(boot_info, 22, "PCD", 0, 0, 0);
-        }
-        if usbsts & (1 << 11) != 0 {
-            draw_boot_bar(boot_info, 23, 255, 140,   0);
-            draw_boot_text(boot_info, 23, "CNR", 0, 0, 0);
-        }
-        if usbsts & (1 << 12) != 0 {
-            draw_boot_bar(boot_info, 24, 200,   0,   0);
-            draw_boot_text(boot_info, 24, "HCE", 255, 255, 255);
-        }
-    }
-
     // 17. Initialize interrupt handlers.
     unsafe { interrupt_handler::init() };
+
+    if let Some(framebuffer) = boot_info.framebuffer.take() {
+        let info = framebuffer.info();
+        let buffer = framebuffer.into_buffer();
+
+        log::info!(
+            "Framebuffer: width = {}, height = {}, pixel_format = {:?}",
+            info.width,
+            info.height,
+            info.pixel_format
+        );
+
+        unsafe { awkernel_drivers::ic::x86_64::lfb::init(info, buffer) };
+    }
 
     BSP_READY.store(true, Ordering::SeqCst);
 
@@ -707,16 +394,8 @@ fn kernel_main2(
         core::hint::spin_loop();
     }
 
-    // Row 25: all APs done, about to sync TSC.
-    draw_boot_bar(boot_info, 25, 100, 100, 100);
-    draw_boot_text(boot_info, 25, "APS DONE", 255, 255, 255);
-
     // 18. Synchronize TSC.
     unsafe { synchronize_tsc(non_primary_cpus.len() + 1) };
-
-    // Row 26: TSC sync done, about to call main().
-    draw_boot_bar(boot_info, 26, 100, 100, 100);
-    draw_boot_text(boot_info, 26, "TSC SYNC", 255, 255, 255);
 
     log::info!("All CPUs are ready.");
 
@@ -1261,101 +940,4 @@ fn init_dma(
     };
 
     page_allocator
-}
-
-/// Overlay ASCII text onto the boot bar at `bar_index` using the built-in
-/// 8x8 font.  Text starts at x=4, centered vertically within the 16-pixel bar
-/// (y-offset = 4).  Unknown characters render as solid blocks.  Clips at the
-/// right edge of the framebuffer.
-fn draw_boot_text(boot_info: &mut BootInfo, bar_index: usize, text: &str, r: u8, g: u8, b: u8) {
-    use bootloader_api::info::PixelFormat;
-    use super::boot_font::{glyph, GLYPH_H, GLYPH_W};
-    let Some(fb) = boot_info.framebuffer.as_mut() else { return };
-    let info = fb.info();
-    let buf  = fb.buffer_mut();
-    const BAR_H: usize = 16;
-    const X_MARGIN: usize = 4;
-    let y_base = bar_index * BAR_H + (BAR_H - GLYPH_H) / 2;
-    if y_base + GLYPH_H > info.height { return; }
-
-    for (ci, ch) in text.bytes().enumerate() {
-        let gly = glyph(ch);
-        let x_base = X_MARGIN + ci * GLYPH_W;
-        if x_base + GLYPH_W > info.width { break; }
-        for (row, &bits) in gly.iter().enumerate() {
-            for col in 0..GLYPH_W {
-                if bits & (0x80 >> col) == 0 { continue; }
-                let x = x_base + col;
-                let y = y_base + row;
-                let off = (y * info.stride + x) * info.bytes_per_pixel;
-                if off + 3 > buf.len() { continue; }
-                match info.pixel_format {
-                    PixelFormat::Rgb => { buf[off]=r; buf[off+1]=g; buf[off+2]=b; }
-                    PixelFormat::Bgr => { buf[off]=b; buf[off+1]=g; buf[off+2]=r; }
-                    _ => {
-                        let luma = ((r as u16 + g as u16 + b as u16) / 3) as u8;
-                        buf[off] = luma;
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Format a u32 as a decimal string into `buf`, returning the written slice.
-/// Max 10 digits for u32.  Writes nothing beyond `buf.len()`.
-fn u32_to_decimal(mut n: u32, buf: &mut [u8]) -> &[u8] {
-    if n == 0 {
-        if !buf.is_empty() { buf[0] = b'0'; return &buf[..1]; }
-        return &[];
-    }
-    let mut tmp = [0u8; 10];
-    let mut len = 0;
-    while n > 0 && len < tmp.len() {
-        tmp[len] = b'0' + (n % 10) as u8;
-        n /= 10;
-        len += 1;
-    }
-    let out_len = len.min(buf.len());
-    for i in 0..out_len { buf[i] = tmp[len - 1 - i]; }
-    &buf[..out_len]
-}
-
-/// Format a u32 as 4 hex digits into `buf`.  Assumes buf.len() >= 4.
-fn u32_to_hex4(n: u32, buf: &mut [u8; 4]) {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    buf[0] = HEX[((n >> 12) & 0xF) as usize];
-    buf[1] = HEX[((n >>  8) & 0xF) as usize];
-    buf[2] = HEX[((n >>  4) & 0xF) as usize];
-    buf[3] = HEX[( n        & 0xF) as usize];
-}
-
-/// Draw a solid 16-pixel-high horizontal bar directly onto the bootloader
-/// framebuffer.  bar_index 0 → rows [0,16), index 1 → [16,32), …
-///
-/// Safe to call before any driver init and before the logger is ready.
-/// No-ops silently if the framebuffer is absent or already consumed.
-fn draw_boot_bar(boot_info: &mut BootInfo, bar_index: usize, r: u8, g: u8, b: u8) {
-    use bootloader_api::info::PixelFormat;
-    let Some(fb) = boot_info.framebuffer.as_mut() else { return };
-    let info = fb.info();
-    let buf  = fb.buffer_mut();
-    const BAR_H: usize = 16;
-    let y0 = bar_index * BAR_H;
-    let y1 = (y0 + BAR_H).min(info.height);
-    for y in y0..y1 {
-        for x in 0..info.width {
-            // stride is in pixels (bootloader_api spec)
-            let off = (y * info.stride + x) * info.bytes_per_pixel;
-            if off + 3 > buf.len() { break; }
-            match info.pixel_format {
-                PixelFormat::Rgb => { buf[off]=r; buf[off+1]=g; buf[off+2]=b; }
-                PixelFormat::Bgr => { buf[off]=b; buf[off+1]=g; buf[off+2]=r; }
-                _ => {
-                    let luma = ((r as u16 + g as u16 + b as u16) / 3) as u8;
-                    buf[off] = luma;
-                }
-            }
-        }
-    }
 }

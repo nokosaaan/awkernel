@@ -12,27 +12,7 @@
 //! ```
 
 use crate::{console::Console, delay};
-use core::sync::atomic::{AtomicBool, Ordering};
 use log::{Level, Log};
-
-static REBOOTING: AtomicBool = AtomicBool::new(false);
-static REBOOT_ON_WARN_ARMED: AtomicBool = AtomicBool::new(false);
-static REBOOT_PENDING: AtomicBool = AtomicBool::new(false);
-
-/// Start recording warn/error occurrences for deferred reboot.
-pub fn arm_reboot_on_warn() {
-    REBOOT_ON_WARN_ARMED.store(true, Ordering::SeqCst);
-}
-
-/// Reboot immediately if any warn/error was logged since arm_reboot_on_warn().
-/// Call this at the point in boot where you want reboot to actually happen.
-#[cfg(target_arch = "x86_64")]
-pub fn reboot_if_pending() {
-    if REBOOT_PENDING.load(Ordering::SeqCst) && !REBOOTING.swap(true, Ordering::SeqCst) {
-        crate::delay::wait_millisec(30000);
-        crate::arch::x86_64::power::reboot();
-    }
-}
 
 #[cfg(not(feature = "std"))]
 use alloc::string::String;
@@ -105,13 +85,6 @@ impl Log for Logger {
             log.log(record);
         } else if let Some(log) = self.raw_console {
             log.log(record);
-        }
-
-        #[cfg(target_arch = "x86_64")]
-        if matches!(record.level(), Level::Warn | Level::Error)
-            && REBOOT_ON_WARN_ARMED.load(Ordering::SeqCst)
-        {
-            REBOOT_PENDING.store(true, Ordering::SeqCst);
         }
     }
 
