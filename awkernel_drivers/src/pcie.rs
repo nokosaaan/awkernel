@@ -36,10 +36,14 @@ pub mod broadcom;
 mod capability;
 mod config_space;
 pub mod intel;
+#[cfg(feature = "xhci")]
+mod mmio;
 pub mod nvme;
 pub mod pcie_class;
 pub mod pcie_id;
 pub mod raspi;
+#[cfg(feature = "xhci")]
+pub mod usb;
 pub mod virtio;
 
 static PCIE_TREES: Mutex<BTreeMap<u16, Arc<PCIeTree>>> = Mutex::new(BTreeMap::new());
@@ -1124,6 +1128,15 @@ impl PCIeInfo {
 
     /// Initialize the PCIe device based on the information
     fn attach(self) -> Result<Arc<dyn PCIeDevice + Sync + Send>, PCIeDeviceErr> {
+        // Class-based detection runs before vendor matching so that USB host
+        // controllers are handled regardless of which silicon vendor made them.
+        #[cfg(feature = "xhci")]
+        if matches!(self.pcie_class, pcie_class::PCIeClass::SerialBusController)
+            && usb::is_xhci(&self)
+        {
+            return usb::attach(self);
+        }
+
         match self.vendor {
             pcie_id::INTEL_VENDOR_ID => {
                 return intel::attach(self);
@@ -1155,6 +1168,13 @@ impl PCIeInfo {
         }
 
         Ok(self.unknown_device())
+    }
+
+    pub fn enable_bus_master(&mut self) {
+        let reg = self.read_status_command();
+        self.write_status_command(
+            reg | registers::StatusCommand::BUS_MASTER | registers::StatusCommand::MEMORY_SPACE,
+        );
     }
 
     pub fn disable_legacy_interrupt(&mut self) {
