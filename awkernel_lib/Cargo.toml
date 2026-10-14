@@ -6,6 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+affinity_btree_queue = { path = "../affinity_btree_queue" }
 log = "0.4"
 rlsf = "0.2"
 bitflags = "2.3"
@@ -30,7 +31,7 @@ version = "0.2"
 optional = true
 
 [dependencies.riscv]
-version = "0.11.1"
+version = "0.16.1"
 optional = true
 
 [dependencies.x86_64]
@@ -94,7 +95,7 @@ x86 = [
 ]
 aarch64 = ["dep:awkernel_aarch64", "awkernel_sync/aarch64"]
 rv32 = ["dep:riscv", "awkernel_sync/rv32"]
-rv64 = ["awkernel_sync/rv64"]
+rv64 = ["dep:riscv", "awkernel_sync/rv64"]
 std = ["dep:libc", "dep:socket2", "awkernel_sync/std"]
 spinlock = ["awkernel_sync/spinlock"]
 # LFN (Long File Name) support

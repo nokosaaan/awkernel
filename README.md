@@ -9,8 +9,8 @@ It can execute async/await applications in kernel space safely.
 
 ```text
 $ sudo apt install clang qemu-system-arm qemu-system-x86 qemu-system-misc python3-pyelftools
-$ rustup toolchain install nightly-2026-06-13
-$ rustup default nightly-2026-06-13
+$ rustup toolchain install nightly-2026-07-20
+$ rustup default nightly-2026-07-20
 $ rustup component add rust-src llvm-tools-preview
 $ rustup target add x86_64-unknown-none aarch64-unknown-none riscv64gc-unknown-none-elf riscv32imac-unknown-none-elf
 ```
@@ -119,6 +119,29 @@ Debug build.
 ```text
 $ make x86_64
 ```
+
+#### Developing for x86_64 on macOS
+
+`kernel/asm/x86/mpboot.S` mixes 16/32/64-bit code and needs a real GNU assembler and linker.
+By default, Apple systems provide an alias so `gcc` points to `clang`.
+Also, modern Apple Silicon processors are aarch64.
+Therefore, we must install a GNU x86_64 ELF cross toolchain:
+
+```text
+$ brew install x86_64-elf-gcc x86_64-elf-binutils
+```
+
+Then, when building your application, point to this specific cross toolchain:
+
+```text
+$ make x86_64 RELEASE=1 CROSS_COMPILE=x86_64-elf-
+```
+
+> [!IMPORTANT]
+>
+> Do not remove the trailing `-`
+
+This way, Awkernel will use the `x86_64-elf-gcc` compiler and the `x86_64-elf-ld` linker.
 
 ### Boot
 
@@ -341,6 +364,46 @@ It will takes several minutes.
 ```text
 $ make loom
 ```
+
+## CI Checks
+
+`scripts/ci.sh` runs the same checks as the CI.
+It requires cargo-udeps in addition to the compiler tools.
+
+```text
+$ cargo binstall cargo-udeps
+$ scripts/ci.sh
+```
+
+Cargo.lock is not tracked, so the CI uses the latest compatible dependencies.
+If a check fails only on your machine, run `cargo update` and try again.
+
+To run the checks with [pre-commit](https://pre-commit.com/), install the hooks.
+The pre-commit hook runs `cargo fmt --check`, and the pre-push hook runs `scripts/ci.sh`.
+
+```text
+$ pre-commit install
+```
+
+### Running CI Checks on macOS
+
+`scripts/ci.sh` invokes `x86_64` builds via `make check_x86_64` and `make udeps`.
+As `cargo-udeps` checks the `x86` feature against the `x86_64-unknown-linux-gnu` target,
+that target must also be installed for the pinned nightly toolchain:
+
+```text
+$ rustup target add x86_64-unknown-linux-gnu
+```
+
+Therefore, as done for compiling x86 projects, you mut define the `CROSS_COMPILE` variable:
+
+```text
+$ CROSS_COMPILE=x86_64-elf- scripts/ci.sh
+```
+
+> [!IMPORTANT]
+>
+> Do not remove the trailing `-` of `x86_64-elf-`
 
 ## Publications
 
