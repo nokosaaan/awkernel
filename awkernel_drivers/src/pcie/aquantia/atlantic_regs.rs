@@ -3,10 +3,15 @@
 // Based on Linux kernel drivers/net/ethernet/aquantia/atlantic/:
 //   hw_atl/hw_atl_llh_internal.h (Atlantic 1)
 //   hw_atl2/hw_atl2_llh_internal.h (Atlantic 2)
+//
+// The driver uses a single TX/RX ring pair (ring 0), so per-ring registers are
+// given as ring-0 offsets.
 
 // ── Firmware / Boot ──────────────────────────────────────────────────────────
 /// Firmware boot-complete status. Non-zero once firmware is ready.
 pub const MPI_BOOT_COMPLETE: usize = 0x0360;
+/// Bit of `MPI_BOOT_COMPLETE` set once firmware has booted.
+pub const MPI_BOOT_COMPLETE_BIT: u32 = 0x10;
 /// Firmware boot code version register.
 pub const MPI_BOOT_CODE: usize = 0x0380;
 
@@ -18,26 +23,17 @@ pub const TDM_RING_DISABLE: usize = 0x7B08;
 /// TX DMA ring enable: write bit n to enable ring n.
 pub const TDM_RING_ENABLE: usize = 0x7B0C;
 
-/// TX descriptor ring base address (low 32 bits), stride 0x40.
-pub fn tx_ring_base_addrl(ring: usize) -> usize {
-    0x7C00 + ring * 0x40
-}
-/// TX descriptor ring base address (high 32 bits), stride 0x40.
-pub fn tx_ring_base_addrh(ring: usize) -> usize {
-    0x7C04 + ring * 0x40
-}
-/// TX descriptor ring length (number of descriptors − 1), stride 0x40.
-pub fn tx_ring_len(ring: usize) -> usize {
-    0x7C08 + ring * 0x40
-}
-/// TX descriptor ring head pointer (read-only from software), stride 0x40.
-pub fn tx_ring_head(ring: usize) -> usize {
-    0x7C0C + ring * 0x40
-}
+// TX ring 0 (per-ring stride 0x40).
+/// TX descriptor ring base address (low 32 bits).
+pub const TX_RING0_BASE_ADDRL: usize = 0x7C00;
+/// TX descriptor ring base address (high 32 bits).
+pub const TX_RING0_BASE_ADDRH: usize = 0x7C04;
+/// TX descriptor ring length (number of descriptors − 1).
+pub const TX_RING0_LEN: usize = 0x7C08;
+/// TX descriptor ring head pointer (read-only from software).
+pub const TX_RING0_HEAD: usize = 0x7C0C;
 /// TX descriptor ring tail pointer (driver writes to post new descriptors).
-pub fn tx_ring_tail(ring: usize) -> usize {
-    0x7C10 + ring * 0x40
-}
+pub const TX_RING0_TAIL: usize = 0x7C10;
 
 // TX descriptor control-word flags
 /// Descriptor type = data (bits [18:16] = 0).
@@ -57,43 +53,27 @@ pub const RDM_RING_DISABLE: usize = 0x5A18;
 /// RX DMA ring enable: write bit n to enable ring n.
 pub const RDM_RING_ENABLE: usize = 0x5A1C;
 
-/// RX descriptor ring base address (low 32 bits), stride 0x20.
-pub fn rx_ring_base_addrl(ring: usize) -> usize {
-    0x5B00 + ring * 0x20
-}
-/// RX descriptor ring base address (high 32 bits), stride 0x20.
-pub fn rx_ring_base_addrh(ring: usize) -> usize {
-    0x5B04 + ring * 0x20
-}
-/// RX descriptor ring length (number of descriptors − 1), stride 0x20.
-pub fn rx_ring_len(ring: usize) -> usize {
-    0x5B08 + ring * 0x20
-}
-/// RX descriptor ring head pointer (hardware advances this; read-only), stride 0x20.
-pub fn rx_ring_head(ring: usize) -> usize {
-    0x5B0C + ring * 0x20
-}
+// RX ring 0 (per-ring stride 0x20).
+/// RX descriptor ring base address (low 32 bits).
+pub const RX_RING0_BASE_ADDRL: usize = 0x5B00;
+/// RX descriptor ring base address (high 32 bits).
+pub const RX_RING0_BASE_ADDRH: usize = 0x5B04;
+/// RX descriptor ring length (number of descriptors − 1).
+pub const RX_RING0_LEN: usize = 0x5B08;
+/// RX descriptor ring head pointer (hardware advances this; read-only).
+pub const RX_RING0_HEAD: usize = 0x5B0C;
 /// RX descriptor ring tail pointer (driver writes to give descriptors to hardware).
-pub fn rx_ring_tail(ring: usize) -> usize {
-    0x5B10 + ring * 0x20
-}
+pub const RX_RING0_TAIL: usize = 0x5B10;
 
 // RX write-back status bits (field at offset 8 of the 16-byte write-back descriptor)
 /// Descriptor Done: hardware has written a received packet here.
 pub const RX_WB_DD: u16 = 1 << 0;
-/// End-of-Packet.
-#[allow(dead_code)]
-pub const RX_WB_EOP: u16 = 1 << 2;
 
 // ── MAC / L2 filtering ───────────────────────────────────────────────────────
-/// L2 unicast filter MAC address low word (bytes 2–5), stride 8.
-pub fn mac_filter_addrl(n: usize) -> usize {
-    0x5110 + n * 8
-}
-/// L2 unicast filter MAC address high word (bytes 0–1), stride 8.
-pub fn mac_filter_addrh(n: usize) -> usize {
-    0x5114 + n * 8
-}
+/// L2 unicast filter 0: MAC address low word (bytes 2–5).
+pub const MAC_FILTER0_ADDRL: usize = 0x5110;
+/// L2 unicast filter 0: MAC address high word (bytes 0–1).
+pub const MAC_FILTER0_ADDRH: usize = 0x5114;
 /// L2 unicast filter enable register.  Bit n enables filter n.
 pub const MAC_FILTER_ENABLE: usize = 0x5100;
 /// Enable broadcast reception.

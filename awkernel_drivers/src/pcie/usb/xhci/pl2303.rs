@@ -1,7 +1,9 @@
-/// PL2303 USB-to-serial chip family — Prolific Technology Inc.
-///
-/// This driver covers all major PL2303 variants (Original, HX, HXD, HXN) using
-/// the initialization sequence documented in FreeBSD sys/dev/usb/serial/uplcom.c.
+//! PL2303 USB-to-serial chip family — Prolific Technology Inc.
+//!
+//! This driver covers all major PL2303 variants (Original, HX, HXD, HXN) using
+//! the initialization sequence documented in FreeBSD sys/dev/usb/serial/uplcom.c.
+
+use super::desc::{self, Descriptor};
 
 /// Prolific USB Vendor ID.
 pub const VID: u16 = 0x067B;
@@ -35,7 +37,6 @@ pub enum ChipType {
 
 /// Bulk endpoint configuration decoded from the USB configuration descriptor.
 pub struct Pl2303Info {
-    pub chip_type: ChipType,
     pub config_val: u8,
     /// bInterfaceNumber of the data interface (used as wIndex in SET_LINE_CODING etc.)
     pub data_iface_no: u8,
@@ -55,64 +56,49 @@ pub fn is_pl2303(vid: u16, pid: u16) -> bool {
 /// — the caller must further probe with a vendor read of register 0x8080.
 pub fn detect_chip_type(bcd_device: u16, dev_class: u8, max_pkt0: u8) -> ChipType {
     match bcd_device {
-        0x0300          => ChipType::Hx,
+        0x0300 => ChipType::Hx,
         0x0400 | 0x0500 => ChipType::Hxd,
-        _ => {
-            if dev_class == 0x02    { ChipType::Original }
-            else if max_pkt0 == 64 { ChipType::Hx }
-            else                   { ChipType::Original }
-        }
+        _ if dev_class == 0x02 => ChipType::Original,
+        _ if max_pkt0 == 64 => ChipType::Hx,
+        _ => ChipType::Original,
     }
 }
 
 /// Walk the USB configuration descriptor for PL2303 bulk endpoints.
 ///
 /// PL2303 exposes a single interface with up to three endpoints:
-///   - Interrupt IN  (status / modem signals — ignored in TX-only mode)
-///   - Bulk IN       (RX data, host ← device)
-///   - Bulk OUT      (TX data, host → device)
-/// Returns `None` if no bulk IN + bulk OUT pair is found.
-pub fn find_bulk_endpoints(cfg: &[u8], len: usize) -> Option<Pl2303Info> {
-    let config_val    = if len >= 6 { cfg[5] } else { 1 };
-    let mut iface_no  = 0u8;
-    let mut bulk_in:  Option<u8> = None;
+/// - Interrupt IN  (status / modem signals — ignored in TX-only mode)
+/// - Bulk IN       (RX data, host ← device)
+/// - Bulk OUT      (TX data, host → device)
+///
+/// Returns `None` if the descriptor is malformed or has no bulk IN + bulk OUT pair.
+pub fn find_bulk_endpoints(cfg: &[u8]) -> Option<Pl2303Info> {
+    let config_val = desc::configuration_value(cfg)?;
+    let mut iface_no = 0u8;
+    let mut bulk_in: Option<u8> = None;
     let mut bulk_out: Option<u8> = None;
-    let mut max_pkt: u16         = 64;
-    let mut i = 0;
+    let mut max_pkt: u16 = 64;
 
-    while i < len {
-        let blen = cfg[i] as usize;
-        if blen < 2 || i + blen > len { break; }
-        let btype = cfg[i + 1];
-
-        match btype {
-            4 if blen >= 9 => {
-                iface_no = cfg[i + 2];
-            }
-            5 if blen >= 7 => {
-                let addr  = cfg[i + 2];
-                let attrs = cfg[i + 3];
-                let pkt   = u16::from_le_bytes([cfg[i + 4], cfg[i + 5]]);
-                if attrs & 0x3 == 2 {
-                    max_pkt = pkt;
-                    if addr & 0x80 != 0 { bulk_in  = Some(addr); }
-                    else                { bulk_out = Some(addr); }
+    for d in desc::descriptors(cfg) {
+        match d {
+            Descriptor::Interface(iface) => iface_no = iface.number,
+            Descriptor::Endpoint(ep) if ep.is_bulk() => {
+                max_pkt = ep.max_packet;
+                if ep.is_in() {
+                    bulk_in = Some(ep.address);
+                } else {
+                    bulk_out = Some(ep.address);
                 }
             }
             _ => {}
         }
-        i += blen;
     }
 
-    match (bulk_in, bulk_out) {
-        (Some(bi), Some(bo)) => Some(Pl2303Info {
-            chip_type:     ChipType::Original, // overwritten by caller after HXN probe
-            config_val,
-            data_iface_no: iface_no,
-            bulk_in_addr:  bi,
-            bulk_out_addr: bo,
-            max_pkt,
-        }),
-        _ => None,
-    }
+    Some(Pl2303Info {
+        config_val,
+        data_iface_no: iface_no,
+        bulk_in_addr: bulk_in?,
+        bulk_out_addr: bulk_out?,
+        max_pkt,
+    })
 }

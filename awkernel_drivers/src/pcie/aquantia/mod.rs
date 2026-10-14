@@ -5,9 +5,42 @@
 //! Register layout references:
 //! - Linux kernel `drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_llh_internal.h`
 //! - Linux kernel `drivers/net/ethernet/aquantia/atlantic/hw_atl2/hw_atl2_llh_internal.h`
+//!
+//! Path classification:
+//! - Non-RT: `attach`, `up`/`down`, `init`, interrupt setup.
+//! - RT (network fast path): `send`, `recv`, `interrupt`, `poll`,
+//!   `poll_in_service`.  See the WCET contract on each.
+//!
+//! The driver uses a single TX/RX ring pair (queue 0).
 
-use crate::pcie::{pcie_id::AQUANTIA_VENDOR_ID, PCIeDevice, PCIeDeviceErr, PCIeInfo};
-use alloc::{borrow::Cow, boxed::Box, collections::BTreeMap, format, sync::Arc, vec::Vec};
+// Hardening gates for this driver (see the rust-hardening policy):
+// panics, silent overflow, lossy casts and swallowed results are compile errors.
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::unwrap_in_result,
+    clippy::arithmetic_side_effects,
+    clippy::let_underscore_must_use,
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::allow_attributes_without_reason,
+    unsafe_op_in_unsafe_fn
+)]
+
+use crate::pcie::{
+    mmio::{Mmio, MmioErr},
+    pcie_id::AQUANTIA_VENDOR_ID,
+    PCIeDevice, PCIeDeviceErr, PCIeInfo,
+};
+use alloc::{borrow::Cow, boxed::Box, format, sync::Arc, vec::Vec};
 use awkernel_async_lib_verified::ringq::RingQ;
 use awkernel_lib::{
     addr::Addr,
@@ -25,6 +58,10 @@ use awkernel_lib::{
         mutex::{MCSNode, Mutex},
         rwlock::RwLock,
     },
+};
+use core::{
+    ptr::{read_volatile, write_volatile},
+    sync::atomic::{fence, Ordering},
 };
 
 mod atlantic_regs;
@@ -57,48 +94,47 @@ pub const AQUANTIA_DEVICES: &[(u16, u16)] = &[
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/// Number of TX / RX descriptors per ring (must be a power of 2, ≥ 32).
+/// Number of TX / RX descriptors per ring (power of 2, ≥ 32).
 const NUM_RING_DESC: usize = 256;
+/// Ring indices wrap modulo `NUM_RING_DESC`.
+const RING_MASK: usize = NUM_RING_DESC - 1;
 /// Maximum size of each DMA packet buffer (bytes).
 const PKT_BUF_SIZE: usize = 2048;
+/// Ethernet FCS that the hardware includes in the RX packet length.
+const FCS_LEN: usize = 4;
 /// Software RX queue depth (packets buffered before the network stack drains them).
 const SW_RX_QUEUE_SIZE: usize = 64;
-/// Number of milliseconds between periodic tick calls (link check, TX reclaim).
+/// Number of milliseconds between periodic tick calls (link check).
 const TICK_MSEC: u64 = 200;
-/// Firmware ready poll maximum iterations (each ~1 ms apart in delay::wait_millisec).
+/// Firmware ready poll maximum iterations (1 ms apart).
 const FIRMWARE_POLL_ITERS: u32 = 5000;
+/// The only queue this driver exposes.
+const QUEUE_ID: usize = 0;
+/// All DMA allocations go to NUMA node 0.
+const NUMA_NODE: usize = 0;
 
 // ── DMA ring types ───────────────────────────────────────────────────────────
 
 /// Raw 16-byte descriptor slot shared by both the TX and RX rings.
-type DescRing = [[u64; 2]; NUM_RING_DESC];
-/// Contiguous packet buffer backing an entire ring.
+type Desc = [u64; 2];
+type DescRing = [Desc; NUM_RING_DESC];
+/// One packet buffer per descriptor.
 type PktBuf = [[u8; PKT_BUF_SIZE]; NUM_RING_DESC];
 
+const _: () = assert!(NUM_RING_DESC.is_power_of_two());
 // Both rings use exactly one page: 256 × 16 = 4096 bytes.
 const _: () = assert!(
     core::mem::size_of::<DescRing>() == PAGESIZE,
     "DescRing must fit in one page"
 );
-// Packet buffers: 256 × 2048 = 524 288 bytes = 128 pages — fine for DMAPool.
-const _: () = assert!(core::mem::size_of::<PktBuf>() % PAGESIZE == 0);
+// Packet buffers: 256 × 2048 = 524 288 bytes = 128 pages.
+const _: () = assert!(core::mem::size_of::<PktBuf>().is_multiple_of(PAGESIZE));
+const DESC_RING_PAGES: usize = core::mem::size_of::<DescRing>() / PAGESIZE;
+const PKT_BUF_PAGES: usize = core::mem::size_of::<PktBuf>() / PAGESIZE;
 
-// ── Interrupt tracking ───────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IrqRole {
-    /// Combined RX + TX for queue n.
-    Queue(usize),
-    /// Link-status change interrupt.
-    #[allow(dead_code)]
-    LinkStatus,
-}
-
-#[derive(Debug)]
-enum PcieInt {
-    None,
-    Msi(#[allow(dead_code)] IRQ),
-    MsiX(#[allow(dead_code)] IRQ),
+/// Next index in a ring (modular ring arithmetic).
+fn ring_next(i: usize) -> usize {
+    i.wrapping_add(1) & RING_MASK
 }
 
 // ── Driver error type ─────────────────────────────────────────────────────────
@@ -106,10 +142,13 @@ enum PcieInt {
 #[derive(Debug, Clone, Copy)]
 pub enum AtlDriverErr {
     NoBar0,
-    ReadFailure,
+    Mmio(MmioErr),
     DmaAlloc,
-    InitInterrupt,
     FirmwareTimeout,
+    Overflow,
+    TxRingFull,
+    FrameTooLarge,
+    InvalidQueue,
 }
 
 impl core::fmt::Display for AtlDriverErr {
@@ -120,6 +159,12 @@ impl core::fmt::Display for AtlDriverErr {
 
 impl core::error::Error for AtlDriverErr {}
 
+impl From<MmioErr> for AtlDriverErr {
+    fn from(e: MmioErr) -> Self {
+        AtlDriverErr::Mmio(e)
+    }
+}
+
 impl From<AtlDriverErr> for PCIeDeviceErr {
     fn from(e: AtlDriverErr) -> Self {
         log::error!("atl: {e}");
@@ -127,17 +172,39 @@ impl From<AtlDriverErr> for PCIeDeviceErr {
     }
 }
 
-// ── Register helpers ─────────────────────────────────────────────────────────
-
-fn read_reg(info: &PCIeInfo, offset: usize) -> Result<u32, AtlDriverErr> {
-    let bar0 = info.get_bar(0).ok_or(AtlDriverErr::NoBar0)?;
-    bar0.read32(offset).ok_or(AtlDriverErr::ReadFailure)
+/// Fast-path conversion: no logging (called per packet).
+impl From<AtlDriverErr> for NetDevError {
+    fn from(_: AtlDriverErr) -> Self {
+        NetDevError::DeviceError
+    }
 }
 
-fn write_reg(info: &PCIeInfo, offset: usize, value: u32) -> Result<(), AtlDriverErr> {
-    let mut bar0 = info.get_bar(0).ok_or(AtlDriverErr::NoBar0)?;
-    bar0.write32(offset, value);
-    Ok(())
+fn phys_of<T>(pool: &DMAPool<T>) -> Result<u64, AtlDriverErr> {
+    u64::try_from(pool.get_phy_addr().as_usize()).map_err(|_| AtlDriverErr::Overflow)
+}
+
+/// Physical address of packet buffer `i` inside `pool`.
+fn pkt_buf_phys(pool: &DMAPool<PktBuf>, i: usize) -> Result<u64, AtlDriverErr> {
+    let offset = i
+        .checked_mul(PKT_BUF_SIZE)
+        .and_then(|o| u64::try_from(o).ok())
+        .ok_or(AtlDriverErr::Overflow)?;
+    phys_of(pool)?
+        .checked_add(offset)
+        .ok_or(AtlDriverErr::Overflow)
+}
+
+/// Ring index as the value of a head/tail register.
+fn ring_reg(i: usize) -> Result<u32, AtlDriverErr> {
+    u32::try_from(i).map_err(|_| AtlDriverErr::Overflow)
+}
+
+fn check_queue(que_id: usize) -> Result<(), AtlDriverErr> {
+    if que_id == QUEUE_ID {
+        Ok(())
+    } else {
+        Err(AtlDriverErr::InvalidQueue)
+    }
 }
 
 // ── TX queue ─────────────────────────────────────────────────────────────────
@@ -154,53 +221,72 @@ struct Tx {
 }
 
 impl Tx {
-    fn ring_len() -> usize {
-        NUM_RING_DESC
-    }
-
-    /// True when the ring is full (one slot kept empty as sentinel).
-    fn is_full(&self) -> bool {
-        (self.sw_tail + 1) % Self::ring_len() == self.sw_head
-    }
-
-    /// Number of free TX descriptor slots.
+    /// Number of free descriptor slots; one slot is kept empty so that
+    /// head == tail means "empty".  Computed modulo `NUM_RING_DESC`.
     fn free_slots(&self) -> usize {
-        let len = Self::ring_len();
-        (self.sw_head + len - self.sw_tail - 1) % len
+        self.sw_head.wrapping_sub(self.sw_tail).wrapping_sub(1) & RING_MASK
     }
 
-    /// Post a packet: copy payload to the DMA buffer and fill the descriptor.
-    /// The caller is responsible for writing the updated tail to hardware afterwards.
-    fn post_packet(&mut self, data: &[u8]) -> bool {
-        if self.is_full() || data.len() > PKT_BUF_SIZE {
-            return false;
+    /// Copy `data` into the next DMA buffer and fill its descriptor.
+    /// The caller publishes the new tail to hardware afterwards.
+    ///
+    /// WCET: one copy of at most `PKT_BUF_SIZE` bytes, no allocation.
+    fn post_packet(&mut self, data: &[u8]) -> Result<(), AtlDriverErr> {
+        if self.free_slots() == 0 {
+            return Err(AtlDriverErr::TxRingFull);
+        }
+        let len = u32::try_from(data.len()).map_err(|_| AtlDriverErr::FrameTooLarge)?;
+        if data.len() > PKT_BUF_SIZE {
+            return Err(AtlDriverErr::FrameTooLarge);
         }
 
         let i = self.sw_tail;
-        let buf_phys = self.pkt_buf.get_phy_addr().as_usize() + i * PKT_BUF_SIZE;
+        self.pkt_buf
+            .as_mut()
+            .get_mut(i)
+            .and_then(|buf| buf.get_mut(..data.len()))
+            .ok_or(AtlDriverErr::Overflow)?
+            .copy_from_slice(data);
+        let buf_phys = pkt_buf_phys(&self.pkt_buf, i)?;
 
-        // Copy into DMA buffer.
-        let dst = &mut self.pkt_buf.as_mut()[i];
-        dst[..data.len()].copy_from_slice(data);
+        // [0] = buffer address, [1] = ctl (low 32) | pay_len (high 32, 0 for non-TSO).
+        let ctl = (len & 0xFFFF) | TX_DESC_TYPE_DATA | TX_DESC_EOP | TX_DESC_FCS | TX_DESC_WB;
+        let desc = self
+            .desc_ring
+            .as_mut()
+            .get_mut(i)
+            .ok_or(AtlDriverErr::Overflow)?;
+        // SAFETY: `desc` is a valid, aligned descriptor inside the DMA page.
+        unsafe { write_volatile(desc, [buf_phys, u64::from(ctl)]) };
 
-        // Fill descriptor: [0] = physical buffer address,
-        //                  [1] = ctl (low 32) | pay_len (high 32, 0 for non-TSO)
-        let ctl: u32 = (data.len() as u32 & 0xFFFF)
-            | TX_DESC_TYPE_DATA
-            | TX_DESC_EOP
-            | TX_DESC_FCS
-            | TX_DESC_WB;
-        self.desc_ring.as_mut()[i] = [buf_phys as u64, ctl as u64];
-
-        self.sw_tail = (self.sw_tail + 1) % Self::ring_len();
-        true
+        self.sw_tail = ring_next(i);
+        Ok(())
     }
 
     /// Reclaim descriptors by reading the hardware head pointer.
-    fn reclaim(&mut self, info: &PCIeInfo, ring_idx: usize) {
-        if let Ok(hw_head) = read_reg(info, tx_ring_head(ring_idx)) {
-            self.sw_head = hw_head as usize % Self::ring_len();
+    fn reclaim(&mut self, mmio: &Mmio) -> Result<(), AtlDriverErr> {
+        let head = mmio.read32(TX_RING0_HEAD)?;
+        self.sw_head = usize::try_from(head).map_err(|_| AtlDriverErr::Overflow)? & RING_MASK;
+        Ok(())
+    }
+
+    /// Empty the ring and program its base/length/head/tail registers.
+    fn reset(&mut self, mmio: &Mmio) -> Result<(), AtlDriverErr> {
+        self.sw_tail = 0;
+        self.sw_head = 0;
+        for desc in self.desc_ring.as_mut().iter_mut() {
+            // SAFETY: `desc` is a valid, aligned descriptor inside the DMA page.
+            unsafe { write_volatile(desc, [0; 2]) };
         }
+        mmio.write64(
+            TX_RING0_BASE_ADDRL,
+            TX_RING0_BASE_ADDRH,
+            phys_of(&self.desc_ring)?,
+        )?;
+        mmio.write32(TX_RING0_LEN, ring_reg(RING_MASK)?)?;
+        mmio.write32(TX_RING0_HEAD, 0)?;
+        mmio.write32(TX_RING0_TAIL, 0)?;
+        Ok(())
     }
 }
 
@@ -217,125 +303,143 @@ struct Rx {
     pkt_buf: DMAPool<PktBuf>,
     /// Software queue holding received frames waiting to be consumed.
     recv_queue: RingQ<EtherFrameBuf>,
-    /// Number of packets dropped due to full software queue.
+    /// Packets dropped because the software queue was full (saturating counter).
     dropped: u64,
 }
 
 impl Rx {
-    fn ring_len() -> usize {
-        NUM_RING_DESC
+    /// Hand descriptor slot `i` back to hardware with its buffer address.
+    fn refill_desc(&mut self, i: usize) -> Result<(), AtlDriverErr> {
+        let buf_phys = pkt_buf_phys(&self.pkt_buf, i)?;
+        let desc = self
+            .desc_ring
+            .as_mut()
+            .get_mut(i)
+            .ok_or(AtlDriverErr::Overflow)?;
+        // Submit format: [0] = buf_addr, [1] = 0 (no header split; clears DD).
+        // SAFETY: `desc` is a valid, aligned descriptor inside the DMA page.
+        unsafe { write_volatile(desc, [buf_phys, 0]) };
+        Ok(())
     }
 
-    /// Refill descriptor slot `i` by writing a fresh buffer address.
-    fn refill_desc(&mut self, i: usize) {
-        let buf_phys = self.pkt_buf.get_phy_addr().as_usize() + i * PKT_BUF_SIZE;
-        // Submit format: [0] = buf_addr, [1] = 0 (no header split).
-        self.desc_ring.as_mut()[i] = [buf_phys as u64, 0];
-    }
+    /// Move completed descriptors into the software queue and recycle them.
+    /// Returns the number of frames queued.
+    ///
+    /// WCET: visits at most `NUM_RING_DESC` descriptors; one heap allocation of
+    /// at most `PKT_BUF_SIZE` bytes per received frame (the `EtherFrameBuf` API
+    /// owns a `Vec<u8>`); no blocking, no logging.
+    fn drain(&mut self, mmio: &Mmio) -> Result<usize, AtlDriverErr> {
+        let mut count: usize = 0;
 
-    /// Scan for completed descriptors, drain them into the software queue, and
-    /// recycle slots back to hardware.  Returns the number of frames received.
-    fn drain(&mut self, info: &PCIeInfo, ring_idx: usize) -> usize {
-        let mut count = 0;
-
-        loop {
+        for _ in 0..NUM_RING_DESC {
             if self.recv_queue.is_full() {
                 break;
             }
 
             let i = self.hw_head;
-            // Write-back layout: raw[1] = status(16) | pkt_len(16) | next(16) | vlan(16)
-            // Use volatile read so the compiler never caches the descriptor value.
-            let raw1 =
-                unsafe { core::ptr::read_volatile(&self.desc_ring.as_ref()[i][1] as *const u64) };
-
-            let status = (raw1 & 0xFFFF) as u16;
-            if status & RX_WB_DD == 0 {
+            let desc = self
+                .desc_ring
+                .as_ref()
+                .get(i)
+                .ok_or(AtlDriverErr::Overflow)?;
+            // SAFETY: `desc` is a valid, aligned descriptor inside the DMA page;
+            // volatile because the NIC writes it back.
+            let [_, wb] = unsafe { read_volatile(desc) };
+            // Write-back word: status[15:0] | pkt_len[31:16] | next | vlan.
+            let [s0, s1, l0, l1, ..] = wb.to_le_bytes();
+            if u16::from_le_bytes([s0, s1]) & RX_WB_DD == 0 {
                 break; // hardware hasn't written this descriptor yet
             }
+            // Read the packet buffer only after observing DD.
+            fence(Ordering::Acquire);
 
-            let pkt_len_raw = ((raw1 >> 16) & 0xFFFF) as usize;
-            // Strip 4-byte Ethernet FCS that the hardware appends to pkt_len.
-            let pkt_len = pkt_len_raw.saturating_sub(4);
-
-            if pkt_len > 0 && pkt_len <= PKT_BUF_SIZE {
-                let src = &self.pkt_buf.as_ref()[i];
-                let data = src[..pkt_len].to_vec();
-                let vlan = None; // TODO: parse VLAN from RX WB if needed
+            // Runt frames shorter than the FCS end up as length 0 and are dropped.
+            let pkt_len = usize::from(u16::from_le_bytes([l0, l1])).saturating_sub(FCS_LEN);
+            if (1..=PKT_BUF_SIZE).contains(&pkt_len) {
+                let data = self
+                    .pkt_buf
+                    .as_ref()
+                    .get(i)
+                    .and_then(|buf| buf.get(..pkt_len))
+                    .ok_or(AtlDriverErr::Overflow)?
+                    .to_vec();
                 if self
                     .recv_queue
-                    .push(EtherFrameBuf { data, vlan })
+                    .push(EtherFrameBuf { data, vlan: None })
                     .is_err()
                 {
-                    self.dropped += 1;
+                    self.dropped = self.dropped.saturating_add(1);
                 } else {
-                    count += 1;
+                    count = count.saturating_add(1);
                 }
             }
 
-            // Recycle the descriptor slot.
-            self.refill_desc(i);
-
-            self.hw_head = (self.hw_head + 1) % Self::ring_len();
-            self.sw_tail = (self.sw_tail + 1) % Self::ring_len();
+            self.refill_desc(i)?;
+            self.hw_head = ring_next(self.hw_head);
+            self.sw_tail = ring_next(self.sw_tail);
         }
 
         if count > 0 {
-            // Inform hardware of new tail (more descriptors available).
-            let _ = write_reg(info, rx_ring_tail(ring_idx), self.sw_tail as u32);
+            // Descriptors must be visible before the NIC sees the new tail.
+            fence(Ordering::Release);
+            mmio.write32(RX_RING0_TAIL, ring_reg(self.sw_tail)?)?;
         }
-
-        count
+        Ok(count)
     }
-}
 
-// ── Per-queue container ───────────────────────────────────────────────────────
-
-struct Queue {
-    tx: Mutex<Tx>,
-    rx: Mutex<Rx>,
-    /// Hardware ring index (= software queue index for us, always 0).
-    #[allow(dead_code)]
-    idx: usize,
+    /// Give every descriptor to hardware and program the ring registers.
+    fn reset(&mut self, mmio: &Mmio) -> Result<(), AtlDriverErr> {
+        self.hw_head = 0;
+        self.sw_tail = RING_MASK;
+        for i in 0..NUM_RING_DESC {
+            self.refill_desc(i)?;
+        }
+        mmio.write64(
+            RX_RING0_BASE_ADDRL,
+            RX_RING0_BASE_ADDRH,
+            phys_of(&self.desc_ring)?,
+        )?;
+        mmio.write32(RX_RING0_LEN, ring_reg(RING_MASK)?)?;
+        // Tell hardware where the last valid descriptor is.
+        fence(Ordering::Release);
+        mmio.write32(RX_RING0_TAIL, ring_reg(self.sw_tail)?)?;
+        Ok(())
+    }
 }
 
 // ── Inner device state ────────────────────────────────────────────────────────
 
 struct AtlInner {
     info: PCIeInfo,
+    mmio: Mmio,
     mac_addr: [u8; 6],
     flags: NetFlags,
     capabilities: NetCapabilities,
-    pcie_int: PcieInt,
-    irq_to_role: BTreeMap<u16, IrqRole>,
+    /// Registered MSI-X/MSI vector; dropping it unregisters the handler.
+    irq: Option<IRQ>,
+    irq_num: Option<u16>,
     is_poll_mode: bool,
     link_up: bool,
     link_mbps: u64,
     multicast_addrs: MulticastAddrs,
-    que: Vec<Queue>,
+    tx: Mutex<Tx>,
+    rx: Mutex<Rx>,
 }
 
 impl AtlInner {
-    /// Read the MAC address that firmware loaded into the L2 unicast filter registers.
-    fn read_mac_addr(info: &PCIeInfo) -> Result<[u8; 6], AtlDriverErr> {
-        let lo = read_reg(info, mac_filter_addrl(0))?;
-        let hi = read_reg(info, mac_filter_addrh(0))?;
-        Ok([
-            ((hi >> 8) & 0xFF) as u8,
-            (hi & 0xFF) as u8,
-            ((lo >> 24) & 0xFF) as u8,
-            ((lo >> 16) & 0xFF) as u8,
-            ((lo >> 8) & 0xFF) as u8,
-            (lo & 0xFF) as u8,
-        ])
+    /// Read the MAC address that firmware loaded into L2 unicast filter 0.
+    fn read_mac_addr(mmio: &Mmio) -> Result<[u8; 6], AtlDriverErr> {
+        let [m2, m3, m4, m5] = mmio.read32(MAC_FILTER0_ADDRL)?.to_be_bytes();
+        let [_, _, m0, m1] = mmio.read32(MAC_FILTER0_ADDRH)?.to_be_bytes();
+        Ok([m0, m1, m2, m3, m4, m5])
     }
 
-    /// Wait until firmware signals it has completed boot.
-    fn wait_firmware(info: &PCIeInfo) -> Result<(), AtlDriverErr> {
+    /// Wait until firmware signals it has completed boot (≤ FIRMWARE_POLL_ITERS ms).
+    fn wait_firmware(mmio: &Mmio) -> Result<(), AtlDriverErr> {
         for _ in 0..FIRMWARE_POLL_ITERS {
-            let status = read_reg(info, MPI_BOOT_COMPLETE).unwrap_or(0);
-            let code = read_reg(info, MPI_BOOT_CODE).unwrap_or(0);
-            if code != 0 || (status & 0x10 != 0) {
+            let status = mmio.read32(MPI_BOOT_COMPLETE)?;
+            let code = mmio.read32(MPI_BOOT_CODE)?;
+            if code != 0 || status & MPI_BOOT_COMPLETE_BIT != 0 {
                 return Ok(());
             }
             awkernel_lib::delay::wait_millisec(1);
@@ -343,271 +447,184 @@ impl AtlInner {
         Err(AtlDriverErr::FirmwareTimeout)
     }
 
-    /// Allocate DMA descriptor ring + packet buffer for one queue.
-    fn alloc_queue(info: &PCIeInfo, idx: usize) -> Result<Queue, AtlDriverErr> {
-        let ring_pages = core::mem::size_of::<DescRing>() / PAGESIZE;
-        let buf_pages = core::mem::size_of::<PktBuf>() / PAGESIZE;
-        let numa = info.get_segment_group() as usize;
-
-        let tx_desc = DMAPool::<DescRing>::new(numa, ring_pages).ok_or(AtlDriverErr::DmaAlloc)?;
-        let tx_buf = DMAPool::<PktBuf>::new(numa, buf_pages).ok_or(AtlDriverErr::DmaAlloc)?;
-
-        let rx_desc = DMAPool::<DescRing>::new(numa, ring_pages).ok_or(AtlDriverErr::DmaAlloc)?;
-        let rx_buf = DMAPool::<PktBuf>::new(numa, buf_pages).ok_or(AtlDriverErr::DmaAlloc)?;
-
-        Ok(Queue {
-            tx: Mutex::new(Tx {
-                sw_tail: 0,
-                sw_head: 0,
-                desc_ring: tx_desc,
-                pkt_buf: tx_buf,
-            }),
-            rx: Mutex::new(Rx {
-                hw_head: 0,
-                sw_tail: NUM_RING_DESC - 1,
-                desc_ring: rx_desc,
-                pkt_buf: rx_buf,
-                recv_queue: RingQ::new(SW_RX_QUEUE_SIZE),
-                dropped: 0,
-            }),
-            idx,
-        })
-    }
-
     /// Full device initialization sequence (called from `up()`).
     fn init(&mut self) -> Result<(), AtlDriverErr> {
+        let mmio = self.mmio;
+
         // 1. Disable TX and RX while reconfiguring.
-        write_reg(&self.info, TPB_TX_BUF_ENABLE, 0)?;
-        write_reg(&self.info, RPB_RX_BUF_ENABLE, 0)?;
-        // Disable ring 0 explicitly.
-        write_reg(&self.info, TDM_RING_DISABLE, 1)?;
-        write_reg(&self.info, RDM_RING_DISABLE, 1)?;
+        mmio.write32(TPB_TX_BUF_ENABLE, 0)?;
+        mmio.write32(RPB_RX_BUF_ENABLE, 0)?;
+        mmio.write32(TDM_RING_DISABLE, 1)?;
+        mmio.write32(RDM_RING_DISABLE, 1)?;
 
-        // 2. Configure TX ring 0.
+        // 2. Configure and enable TX ring 0.
         {
-            let que = &self.que[0];
             let mut node = MCSNode::new();
-            let mut tx = que.tx.lock(&mut node);
-
-            tx.sw_tail = 0;
-            tx.sw_head = 0;
-
-            // Zero the descriptor ring so there are no stale descriptors.
-            for slot in tx.desc_ring.as_mut().iter_mut() {
-                *slot = [0u64; 2];
-            }
-
-            let phys = tx.desc_ring.get_phy_addr().as_usize() as u64;
-            write_reg(&self.info, tx_ring_base_addrl(0), phys as u32)?;
-            write_reg(&self.info, tx_ring_base_addrh(0), (phys >> 32) as u32)?;
-            write_reg(&self.info, tx_ring_len(0), (NUM_RING_DESC - 1) as u32)?;
-            write_reg(&self.info, tx_ring_head(0), 0)?;
-            write_reg(&self.info, tx_ring_tail(0), 0)?;
+            let mut tx = self.tx.lock(&mut node);
+            tx.reset(&mmio)?;
         }
-        // Enable TX ring 0.
-        write_reg(&self.info, TDM_RING_ENABLE, 1)?;
+        mmio.write32(TDM_RING_ENABLE, 1)?;
 
-        // 3. Configure RX ring 0 — pre-fill all descriptors with buffer addresses.
+        // 3. Configure and enable RX ring 0 (all descriptors pre-filled).
         {
-            let que = &self.que[0];
             let mut node = MCSNode::new();
-            let mut rx = que.rx.lock(&mut node);
-
-            rx.hw_head = 0;
-            rx.sw_tail = NUM_RING_DESC - 1;
-
-            let buf_base = rx.pkt_buf.get_phy_addr().as_usize();
-            for (i, slot) in rx.desc_ring.as_mut().iter_mut().enumerate() {
-                *slot = [(buf_base + i * PKT_BUF_SIZE) as u64, 0u64];
-            }
-
-            let phys = rx.desc_ring.get_phy_addr().as_usize() as u64;
-            write_reg(&self.info, rx_ring_base_addrl(0), phys as u32)?;
-            write_reg(&self.info, rx_ring_base_addrh(0), (phys >> 32) as u32)?;
-            write_reg(&self.info, rx_ring_len(0), (NUM_RING_DESC - 1) as u32)?;
-            // Tell hardware where the last valid descriptor is.
-            write_reg(&self.info, rx_ring_tail(0), rx.sw_tail as u32)?;
+            let mut rx = self.rx.lock(&mut node);
+            rx.reset(&mmio)?;
         }
-        // Enable RX ring 0.
-        write_reg(&self.info, RDM_RING_ENABLE, 1)?;
+        mmio.write32(RDM_RING_ENABLE, 1)?;
 
-        // 4. Configure MAC unicast filter with our address.
-        let mac = self.mac_addr;
-        let lo: u32 = ((mac[2] as u32) << 24)
-            | ((mac[3] as u32) << 16)
-            | ((mac[4] as u32) << 8)
-            | (mac[5] as u32);
-        let hi: u32 = ((mac[0] as u32) << 8) | (mac[1] as u32);
-        write_reg(&self.info, mac_filter_addrl(0), lo)?;
-        write_reg(&self.info, mac_filter_addrh(0), hi)?;
-        // Enable filter 0 and broadcast.
-        write_reg(&self.info, MAC_FILTER_ENABLE, 1)?;
-        write_reg(&self.info, MAC_BCAST_ENABLE, 1)?;
+        // 4. Unicast filter 0 = our address; enable it and broadcast.
+        let [m0, m1, m2, m3, m4, m5] = self.mac_addr;
+        mmio.write32(MAC_FILTER0_ADDRL, u32::from_be_bytes([m2, m3, m4, m5]))?;
+        mmio.write32(MAC_FILTER0_ADDRH, u32::from_be_bytes([0, 0, m0, m1]))?;
+        mmio.write32(MAC_FILTER_ENABLE, 1)?;
+        mmio.write32(MAC_BCAST_ENABLE, 1)?;
 
         // 5. Re-enable TX and RX packet buffers.
-        write_reg(&self.info, TPB_TX_BUF_ENABLE, 1)?;
-        write_reg(&self.info, RPB_RX_BUF_ENABLE, 1)?;
+        mmio.write32(TPB_TX_BUF_ENABLE, 1)?;
+        mmio.write32(RPB_RX_BUF_ENABLE, 1)?;
 
         self.flags |= NetFlags::RUNNING;
 
-        // 6. Set up interrupts (MSI) or fall through to poll mode.
+        // 6. Interrupts (MSI-X → MSI → poll mode).
         self.init_interrupts()?;
 
-        // 7. Read initial link status.
-        self.update_link_status();
-
-        Ok(())
+        // 7. Initial link status.
+        self.update_link_status()
     }
 
-    /// Try MSI-X → MSI → poll mode.
+    /// Register an interrupt vector: MSI-X first, then MSI, else poll mode.
     fn init_interrupts(&mut self) -> Result<(), AtlDriverErr> {
+        if self.irq.is_some() {
+            return Ok(()); // already registered by a previous `up()`
+        }
         self.info.disable_legacy_interrupt();
 
-        let seg = self.info.get_segment_group() as usize;
+        let seg = usize::from(self.info.get_segment_group());
         let bdf = self.info.get_bdf();
         let irq_name = format!("{DEVICE_SHORT_NAME}-{bdf}");
-        let cpu = awkernel_lib::cpu::raw_cpu_id() as u32;
+        let cpu =
+            u32::try_from(awkernel_lib::cpu::raw_cpu_id()).map_err(|_| AtlDriverErr::Overflow)?;
 
-        // ── Try MSI-X first (AQC113 natively supports MSI-X) ─────────────────
         if let Some(msi) = self.info.get_msi_mut() {
             msi.disable();
         }
+
+        let mut registered: Option<IRQ> = None;
         if let Some(msix) = self.info.get_msix_mut() {
             msix.disable();
             match msix.register_handler(
                 irq_name.clone().into(),
-                Box::new(|irq| awkernel_lib::net::net_interrupt(irq)),
+                Box::new(awkernel_lib::net::net_interrupt),
                 seg,
                 cpu,
                 0, // vector 0 = queue 0
             ) {
                 Ok(mut irq) => {
                     irq.enable();
-                    self.info.get_msix_mut().unwrap().enable();
-                    let irq_num = irq.get_irq();
-                    self.irq_to_role.insert(irq_num, IrqRole::Queue(0));
-                    self.pcie_int = PcieInt::MsiX(irq);
-                    self.is_poll_mode = false;
-                    let _ = write_reg(
-                        &self.info,
-                        ATL2_ITR_MASK_SET,
-                        ITR_RX0 | ITR_TX0 | ITR_LSC,
-                    );
-                    return Ok(());
+                    msix.enable();
+                    registered = Some(irq);
                 }
-                Err(_) => {
-                    log::error!("atl {bdf}: MSI-X allocation failed, trying MSI");
+                Err(e) => log::error!("atl {bdf}: MSI-X allocation failed ({e:?}), trying MSI"),
+            }
+        }
+
+        if registered.is_none() {
+            if let Some(msi) = self.info.get_msi_mut() {
+                msi.disable();
+                match msi.register_handler(
+                    irq_name.into(),
+                    Box::new(awkernel_lib::net::net_interrupt),
+                    seg,
+                    cpu,
+                ) {
+                    Ok(mut irq) => {
+                        irq.enable();
+                        msi.enable();
+                        registered = Some(irq);
+                    }
+                    Err(e) => {
+                        log::warn!("atl {bdf}: MSI allocation failed ({e:?}), using poll mode")
+                    }
                 }
             }
         }
 
-        // ── Fall back to plain MSI ────────────────────────────────────────────
-        if let Some(msi) = self.info.get_msi_mut() {
-            msi.disable();
-            match msi.register_handler(
-                irq_name.into(),
-                Box::new(|irq| awkernel_lib::net::net_interrupt(irq)),
-                seg,
-                cpu,
-            ) {
-                Ok(mut irq) => {
-                    irq.enable();
-                    self.info.get_msi_mut().unwrap().enable();
-                    let irq_num = irq.get_irq();
-                    self.irq_to_role.insert(irq_num, IrqRole::Queue(0));
-                    self.pcie_int = PcieInt::Msi(irq);
-                    self.is_poll_mode = false;
-                    let _ = write_reg(
-                        &self.info,
-                        ATL2_ITR_MASK_SET,
-                        ITR_RX0 | ITR_TX0 | ITR_LSC,
-                    );
-                    return Ok(());
-                }
-                Err(_) => {
-                    log::warn!("atl {bdf}: MSI allocation failed, using poll mode");
-                }
+        match registered {
+            Some(irq) => {
+                self.irq_num = Some(irq.get_irq());
+                self.irq = Some(irq);
+                self.is_poll_mode = false;
+                self.mmio
+                    .write32(ATL2_ITR_MASK_SET, ITR_RX0 | ITR_TX0 | ITR_LSC)?;
             }
+            None => self.is_poll_mode = true,
         }
-
-        // ── Fall back to poll mode ────────────────────────────────────────────
-        self.is_poll_mode = true;
         Ok(())
     }
 
-    /// Stop TX/RX and disable interrupts.
-    fn stop(&mut self) {
-        match &self.pcie_int {
-            PcieInt::Msi(_) | PcieInt::MsiX(_) => {
-                let _ = write_reg(&self.info, ATL2_ITR_MASK_CLR, !0u32);
-            }
-            PcieInt::None => {}
+    /// Mask interrupts and stop TX/RX.
+    fn stop(&mut self) -> Result<(), AtlDriverErr> {
+        if self.irq.is_some() {
+            self.mmio.write32(ATL2_ITR_MASK_CLR, !0u32)?;
         }
-        let _ = write_reg(&self.info, TPB_TX_BUF_ENABLE, 0);
-        let _ = write_reg(&self.info, RPB_RX_BUF_ENABLE, 0);
+        self.mmio.write32(TPB_TX_BUF_ENABLE, 0)?;
+        self.mmio.write32(RPB_RX_BUF_ENABLE, 0)?;
         self.flags.remove(NetFlags::RUNNING);
+        Ok(())
     }
 
     /// Update cached link status from the PHY status register.
-    fn update_link_status(&mut self) {
-        if let Ok(phy) = read_reg(&self.info, PHY_STATUS) {
-            let old = self.link_up;
-            if phy & PHY_STATUS_10G != 0 {
-                self.link_up = true;
-                self.link_mbps = 10_000;
-            } else if phy & PHY_STATUS_5G != 0 {
-                self.link_up = true;
-                self.link_mbps = 5_000;
-            } else if phy & PHY_STATUS_2_5G != 0 {
-                self.link_up = true;
-                self.link_mbps = 2_500;
-            } else if phy & PHY_STATUS_1G != 0 {
-                self.link_up = true;
-                self.link_mbps = 1_000;
-            } else if phy & PHY_STATUS_100M != 0 {
-                self.link_up = true;
-                self.link_mbps = 100;
+    fn update_link_status(&mut self) -> Result<(), AtlDriverErr> {
+        let phy = self.mmio.read32(PHY_STATUS)?;
+        let old = self.link_up;
+        self.link_mbps = if phy & PHY_STATUS_10G != 0 {
+            10_000
+        } else if phy & PHY_STATUS_5G != 0 {
+            5_000
+        } else if phy & PHY_STATUS_2_5G != 0 {
+            2_500
+        } else if phy & PHY_STATUS_1G != 0 {
+            1_000
+        } else if phy & PHY_STATUS_100M != 0 {
+            100
+        } else {
+            0
+        };
+        self.link_up = self.link_mbps != 0;
+
+        if old != self.link_up {
+            if self.link_up {
+                log::info!(
+                    "atl {}: link up, {} Mbps",
+                    self.info.get_bdf(),
+                    self.link_mbps
+                );
             } else {
-                self.link_up = false;
-                self.link_mbps = 0;
-            }
-            if old != self.link_up {
-                if self.link_up {
-                    log::info!(
-                        "atl {}: link up, {} Mbps",
-                        self.info.get_bdf(),
-                        self.link_mbps
-                    );
-                } else {
-                    log::info!("atl {}: link down", self.info.get_bdf());
-                }
+                log::info!("atl {}: link down", self.info.get_bdf());
             }
         }
+        Ok(())
     }
 
-    /// Handle an interrupt: drain RX queue and update link status.
-    fn handle_interrupt(&self, irq: u16) {
-        // Read and acknowledge interrupt status.
-        if let Ok(status) = read_reg(&self.info, ATL2_ITR_STATUS) {
-            if status & (ITR_RX0 | ITR_TX0) != 0 {
-                self.rx_drain(0);
-            }
-            // Re-arm the interrupt.
-            let _ = write_reg(&self.info, ATL2_ITR_MASK_SET, status);
+    /// Acknowledge an interrupt and drain RX.  Link changes are picked up by
+    /// the periodic `tick` (it needs `&mut self`).
+    ///
+    /// WCET: one RX drain (see `Rx::drain`) plus two register accesses.
+    fn handle_interrupt(&self) -> Result<(), AtlDriverErr> {
+        let status = self.mmio.read32(ATL2_ITR_STATUS)?;
+        if status & (ITR_RX0 | ITR_TX0) != 0 {
+            self.rx_drain()?;
         }
-
-        // If this is the link IRQ, schedule a link-status update.
-        if let Some(IrqRole::LinkStatus) = self.irq_to_role.get(&irq) {
-            // Cannot call update_link_status here (needs &mut self); the tick will handle it.
-        }
+        // Re-arm the causes we just observed.
+        self.mmio.write32(ATL2_ITR_MASK_SET, status)?;
+        Ok(())
     }
 
-    /// Drain received packets from RX queue `q` into the software ring.
-    fn rx_drain(&self, q: usize) {
-        let que = &self.que[q];
+    fn rx_drain(&self) -> Result<usize, AtlDriverErr> {
         let mut node = MCSNode::new();
-        let mut rx = que.rx.lock(&mut node);
-        rx.drain(&self.info, q);
+        let mut rx = self.rx.lock(&mut node);
+        rx.drain(&self.mmio)
     }
 }
 
@@ -639,38 +656,57 @@ pub fn attach(mut info: PCIeInfo) -> Result<Arc<dyn PCIeDevice + Sync + Send>, P
 }
 
 impl Atlantic {
-    fn new(info: PCIeInfo) -> Result<Self, PCIeDeviceErr> {
-        // Wait for firmware to signal readiness.
-        if let Err(e) = AtlInner::wait_firmware(&info) {
-            log::warn!("atl {}: firmware not ready ({e}), continuing anyway", info.get_bdf());
+    fn new(info: PCIeInfo) -> Result<Self, AtlDriverErr> {
+        let mmio = Mmio::from_bar(info.get_bar(0)).map_err(|_| AtlDriverErr::NoBar0)?;
+
+        // Contract: a firmware that never reports "boot complete" is tolerated
+        // (the MAC registers are still readable on the boards seen so far);
+        // register access failures are not.
+        match AtlInner::wait_firmware(&mmio) {
+            Ok(()) => {}
+            Err(AtlDriverErr::FirmwareTimeout) => log::warn!(
+                "atl {}: firmware not ready after {FIRMWARE_POLL_ITERS} ms, continuing",
+                info.get_bdf()
+            ),
+            Err(e) => return Err(e),
         }
 
-        let mac_addr = AtlInner::read_mac_addr(&info).unwrap_or([0u8; 6]);
+        let mac_addr = AtlInner::read_mac_addr(&mmio)?;
+        let [m0, m1, m2, m3, m4, m5] = mac_addr;
         log::info!(
-            "atl {}: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            "atl {}: MAC {m0:02x}:{m1:02x}:{m2:02x}:{m3:02x}:{m4:02x}:{m5:02x}",
             info.get_bdf(),
-            mac_addr[0],
-            mac_addr[1],
-            mac_addr[2],
-            mac_addr[3],
-            mac_addr[4],
-            mac_addr[5],
         );
 
-        let que0 = AtlInner::alloc_queue(&info, 0)?;
+        let tx = Tx {
+            sw_tail: 0,
+            sw_head: 0,
+            desc_ring: DMAPool::new(NUMA_NODE, DESC_RING_PAGES).ok_or(AtlDriverErr::DmaAlloc)?,
+            pkt_buf: DMAPool::new(NUMA_NODE, PKT_BUF_PAGES).ok_or(AtlDriverErr::DmaAlloc)?,
+        };
+        let rx = Rx {
+            hw_head: 0,
+            sw_tail: RING_MASK,
+            desc_ring: DMAPool::new(NUMA_NODE, DESC_RING_PAGES).ok_or(AtlDriverErr::DmaAlloc)?,
+            pkt_buf: DMAPool::new(NUMA_NODE, PKT_BUF_PAGES).ok_or(AtlDriverErr::DmaAlloc)?,
+            recv_queue: RingQ::new(SW_RX_QUEUE_SIZE),
+            dropped: 0,
+        };
 
         let inner = AtlInner {
             info,
+            mmio,
             mac_addr,
             flags: NetFlags::BROADCAST | NetFlags::SIMPLEX | NetFlags::MULTICAST,
             capabilities: NetCapabilities::VLAN_MTU,
-            pcie_int: PcieInt::None,
-            irq_to_role: BTreeMap::new(),
+            irq: None,
+            irq_num: None,
             is_poll_mode: true,
             link_up: false,
             link_mbps: 0,
             multicast_addrs: MulticastAddrs::new(),
-            que: alloc::vec![que0],
+            tx: Mutex::new(tx),
+            rx: Mutex::new(rx),
         };
 
         Ok(Self {
@@ -714,8 +750,7 @@ impl NetDevice for Atlantic {
     }
 
     fn link_status(&self) -> LinkStatus {
-        let inner = self.inner.read();
-        if inner.link_up {
+        if self.inner.read().link_up {
             LinkStatus::UpFullDuplex
         } else {
             LinkStatus::Down
@@ -755,77 +790,71 @@ impl NetDevice for Atlantic {
         if !inner.flags.contains(NetFlags::UP) {
             return Err(NetDevError::AlreadyDown);
         }
-        inner.stop();
+        inner.stop().map_err(|e| {
+            log::error!("atl: stop failed: {e}");
+            NetDevError::DeviceError
+        })?;
         inner.flags.remove(NetFlags::UP);
         Ok(())
     }
 
     // ── TX ────────────────────────────────────────────────────────────────────
 
+    /// WCET: one head-register read when the ring looks full, one copy of at
+    /// most `PKT_BUF_SIZE` bytes, one tail-register write.  No allocation, no
+    /// logging; the TX mutex is held only for this bounded work.
     fn send(&self, data: EtherFrameRef, que_id: usize) -> Result<(), NetDevError> {
+        check_queue(que_id)?;
         let inner = self.inner.read();
-
         if !inner.flags.contains(NetFlags::RUNNING) || !inner.link_up {
             return Err(NetDevError::DeviceError);
         }
 
-        let que = &inner.que[que_id];
         let mut node = MCSNode::new();
-        let mut tx = que.tx.lock(&mut node);
-
-        // Reclaim completed descriptors to make room.
+        let mut tx = inner.tx.lock(&mut node);
         if tx.free_slots() == 0 {
-            tx.reclaim(&inner.info, que_id);
+            tx.reclaim(&inner.mmio)?;
         }
+        tx.post_packet(data.data)?;
 
-        if !tx.post_packet(data.data) {
-            return Err(NetDevError::DeviceError);
-        }
-
-        // Notify hardware of the new tail.
-        write_reg(&inner.info, tx_ring_tail(que_id), tx.sw_tail as u32)
-            .map_err(|_| NetDevError::DeviceError)
+        // Descriptor must be visible before the NIC sees the new tail.
+        fence(Ordering::Release);
+        inner
+            .mmio
+            .write32(TX_RING0_TAIL, ring_reg(tx.sw_tail)?)
+            .map_err(AtlDriverErr::from)?;
+        Ok(())
     }
 
     // ── RX ────────────────────────────────────────────────────────────────────
 
+    /// WCET: one queue pop, or one RX drain (see `Rx::drain`) followed by a pop.
     fn recv(&self, que_id: usize) -> Result<Option<EtherFrameBuf>, NetDevError> {
+        check_queue(que_id)?;
         let inner = self.inner.read();
 
-        // First try the software queue.
-        {
-            let que = &inner.que[que_id];
-            let mut node = MCSNode::new();
-            let mut rx = que.rx.lock(&mut node);
-            if let Some(frame) = rx.recv_queue.pop() {
-                return Ok(Some(frame));
-            }
-        }
-
-        // Drain hardware ring into software queue.
-        inner.rx_drain(que_id);
-
-        let que = &inner.que[que_id];
         let mut node = MCSNode::new();
-        let mut rx = que.rx.lock(&mut node);
+        let mut rx = inner.rx.lock(&mut node);
+        if let Some(frame) = rx.recv_queue.pop() {
+            return Ok(Some(frame));
+        }
+        rx.drain(&inner.mmio)?;
         Ok(rx.recv_queue.pop())
     }
 
     // ── Interrupts ────────────────────────────────────────────────────────────
 
-    fn interrupt(&self, irq: u16) -> Result<(), NetDevError> {
-        let inner = self.inner.read();
-        inner.handle_interrupt(irq);
+    fn interrupt(&self, _irq: u16) -> Result<(), NetDevError> {
+        self.inner.read().handle_interrupt()?;
         Ok(())
     }
 
     fn irqs(&self) -> Vec<u16> {
-        let inner = self.inner.read();
-        inner.irq_to_role.keys().copied().collect()
+        self.inner.read().irq_num.into_iter().collect()
     }
 
     fn rx_irq_to_que_id(&self, _irq: u16) -> Option<usize> {
-        Some(0)
+        Some(QUEUE_ID)
     }
 
     // ── Polling ───────────────────────────────────────────────────────────────
@@ -834,25 +863,31 @@ impl NetDevice for Atlantic {
         self.inner.read().is_poll_mode
     }
 
+    /// Returns true when the hardware head has moved past our software head.
+    ///
+    /// The `bool` API cannot carry an error, so a failed register read reports
+    /// `true`: the following `poll_in_service` performs the same access and
+    /// returns the error to the caller instead of hiding it.
     fn poll(&self) -> bool {
         let inner = self.inner.read();
         if !inner.flags.contains(NetFlags::RUNNING) {
             return false;
         }
-        // Check if the hardware head has advanced (= new data arrived).
-        if let Ok(hw_head) = read_reg(&inner.info, rx_ring_head(0)) {
-            let que = &inner.que[0];
-            let mut node = MCSNode::new();
-            let rx = que.rx.lock(&mut node);
-            (hw_head as usize % Rx::ring_len()) != rx.hw_head
-        } else {
-            false
-        }
+        let Some(hw_head) = inner
+            .mmio
+            .read32(RX_RING0_HEAD)
+            .ok()
+            .and_then(|h| usize::try_from(h).ok())
+        else {
+            return true;
+        };
+        let mut node = MCSNode::new();
+        let rx = inner.rx.lock(&mut node);
+        hw_head & RING_MASK != rx.hw_head
     }
 
     fn poll_in_service(&self) -> Result<(), NetDevError> {
-        let inner = self.inner.read();
-        inner.rx_drain(0);
+        self.inner.read().rx_drain()?;
         Ok(())
     }
 
@@ -863,27 +898,24 @@ impl NetDevice for Atlantic {
     }
 
     fn tick(&self) -> Result<(), NetDevError> {
-        let mut inner = self.inner.write();
-        inner.update_link_status();
+        self.inner.write().update_link_status()?;
         Ok(())
     }
 
     // ── Multicast ─────────────────────────────────────────────────────────────
 
+    /// The address is recorded only: the hardware multicast filter is not
+    /// programmed yet, so reception follows the controller's default filter.
     fn add_multicast_addr(&self, addr: &[u8; 6]) -> Result<(), NetDevError> {
-        let mut inner = self.inner.write();
-        inner.multicast_addrs.add_addr(*addr);
-        // Enable promiscuous multicast so all multicast frames pass.
-        // A proper hash-filter implementation can replace this later.
-        if inner.flags.contains(NetFlags::UP) {
-            let _ = write_reg(&inner.info, RPB_RX_BUF_ENABLE, 1);
-        }
+        self.inner.write().multicast_addrs.add_addr(*addr);
         Ok(())
     }
 
     fn remove_multicast_addr(&self, addr: &[u8; 6]) -> Result<(), NetDevError> {
-        let mut inner = self.inner.write();
-        inner.multicast_addrs.remove_addr(addr);
-        Ok(())
+        if self.inner.write().multicast_addrs.remove_addr(addr) {
+            Ok(())
+        } else {
+            Err(NetDevError::MulticastAddrError)
+        }
     }
 }

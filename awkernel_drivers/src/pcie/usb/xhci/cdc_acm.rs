@@ -1,3 +1,17 @@
+//! USB CDC-ACM (Abstract Control Model) endpoint discovery.
+
+use super::desc::{self, Descriptor};
+
+/// bInterfaceClass of a CDC Communication interface.
+const CLASS_CDC: u8 = 0x02;
+/// bInterfaceSubClass of the Abstract Control Model.
+const SUBCLASS_ACM: u8 = 0x02;
+/// bInterfaceClass of a CDC Data interface.
+const CLASS_CDC_DATA: u8 = 0x0A;
+/// bInterfaceProtocol 0xFF on an ACM interface means RNDIS (Microsoft's
+/// vendor protocol), which does not implement the ACM line-coding requests.
+const PROTOCOL_VENDOR: u8 = 0xFF;
+
 /// USB CDC-ACM interface information decoded from the configuration descriptor.
 ///
 /// A CDC-ACM device exposes two interface groups:
@@ -21,63 +35,47 @@ pub struct CdcAcmInfo {
 
 /// Walk a USB configuration descriptor and return CDC-ACM endpoint information.
 ///
-/// Looks for a Communication interface (class=0x02, subclass=0x02) paired with a Data
-/// interface (class=0x0A) that has one Bulk IN and one Bulk OUT endpoint.
-/// Returns `None` if no such pair is present in `desc[..len]`.
-pub fn find_cdcacm_endpoints(desc: &[u8], len: usize) -> Option<CdcAcmInfo> {
-    let config_val  = if len >= 6 { desc[5] } else { 1 };
+/// Looks for a Communication interface (class=0x02, subclass=0x02, protocol≠0xFF)
+/// paired with a Data interface (class=0x0A) that has one Bulk IN and one Bulk OUT
+/// endpoint.
+/// Returns `None` if the descriptor is malformed or no such pair is present.
+pub fn find_cdcacm_endpoints(cfg: &[u8]) -> Option<CdcAcmInfo> {
+    let config_val = desc::configuration_value(cfg)?;
     let mut ctrl_if: Option<u8> = None;
-    let mut in_data_if            = false;
-    let mut bulk_in:  Option<u8> = None;
+    let mut in_data_if = false;
+    let mut bulk_in: Option<u8> = None;
     let mut bulk_out: Option<u8> = None;
-    let mut max_pkt: u16         = 64;
-    let mut i                    = 0;
+    let mut max_pkt: u16 = 64;
 
-    while i < len {
-        let blen = desc[i] as usize;
-        if blen < 2 || i + blen > len { break; }
-        let btype = desc[i + 1];
-
-        match btype {
-            // Interface Descriptor (bDescriptorType = 4)
-            4 if blen >= 9 => {
-                let if_num   = desc[i + 2];
-                let if_class = desc[i + 5];
-                let if_sub   = desc[i + 6];
-                in_data_if   = false;
-                if if_class == 0x02 && if_sub == 0x02 {
-                    // CDC Abstract Control Model — control interface
-                    ctrl_if = Some(if_num);
-                } else if if_class == 0x0A {
-                    // CDC Data interface — bulk endpoints live here
-                    in_data_if = true;
+    for d in desc::descriptors(cfg) {
+        match d {
+            Descriptor::Interface(iface) => {
+                in_data_if = iface.class == CLASS_CDC_DATA;
+                if iface.class == CLASS_CDC
+                    && iface.subclass == SUBCLASS_ACM
+                    && iface.protocol != PROTOCOL_VENDOR
+                {
+                    ctrl_if = Some(iface.number);
                 }
             }
-            // Endpoint Descriptor (bDescriptorType = 5) — only on the Data interface
-            5 if blen >= 7 && in_data_if => {
-                let addr  = desc[i + 2];
-                let attrs = desc[i + 3];
-                let pkt   = u16::from_le_bytes([desc[i + 4], desc[i + 5]]);
-                if attrs & 0x3 == 2 {
-                    // Bulk endpoint
-                    max_pkt = pkt;
-                    if addr & 0x80 != 0 { bulk_in  = Some(addr); }
-                    else                { bulk_out = Some(addr); }
+            // Bulk endpoints of interest live only on the Data interface.
+            Descriptor::Endpoint(ep) if in_data_if && ep.is_bulk() => {
+                max_pkt = ep.max_packet;
+                if ep.is_in() {
+                    bulk_in = Some(ep.address);
+                } else {
+                    bulk_out = Some(ep.address);
                 }
             }
             _ => {}
         }
-        i += blen;
     }
 
-    match (ctrl_if, bulk_in, bulk_out) {
-        (Some(ci), Some(bi), Some(bo)) => Some(CdcAcmInfo {
-            config_val,
-            ctrl_if_num:  ci,
-            bulk_in_addr:  bi,
-            bulk_out_addr: bo,
-            max_pkt,
-        }),
-        _ => None,
-    }
+    Some(CdcAcmInfo {
+        config_val,
+        ctrl_if_num: ctrl_if?,
+        bulk_in_addr: bulk_in?,
+        bulk_out_addr: bulk_out?,
+        max_pkt,
+    })
 }

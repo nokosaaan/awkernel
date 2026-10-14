@@ -188,7 +188,9 @@ pub(super) fn attach(
         Ok(v) => {
             if v == 0xffffffff {
                 let bdf = info.get_bdf();
-                log::warn!("NVMe: invalid MMIO response (0xffffffff) at {bdf}, skipping NVMe driver");
+                log::warn!(
+                    "NVMe: invalid MMIO response (0xffffffff) at {bdf}, skipping NVMe driver"
+                );
                 return Ok(info.unknown_device());
             }
         }

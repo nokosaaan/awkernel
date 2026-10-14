@@ -31,17 +31,21 @@ use self::{
 
 pub mod pcie_device_tree;
 
-mod base_address;
+#[cfg(feature = "aquantia")]
 pub mod aquantia;
+mod base_address;
 pub mod broadcom;
 mod capability;
 mod config_space;
 pub mod intel;
+#[cfg(any(feature = "xhci", feature = "aquantia"))]
+mod mmio;
 #[cfg(feature = "nvme")]
 pub mod nvme;
 pub mod pcie_class;
 pub mod pcie_id;
 pub mod raspi;
+#[cfg(feature = "xhci")]
 pub mod usb;
 pub mod virtio;
 
@@ -1130,13 +1134,10 @@ impl PCIeInfo {
         // Class-based detection runs before vendor matching so that USB host
         // controllers are handled regardless of which silicon vendor made them.
         #[cfg(feature = "xhci")]
-        if matches!(self.pcie_class, pcie_class::PCIeClass::SerialBusController) {
-            let cls = self.config_space.read_u32(registers::CLASS_CODE_REVISION_ID);
-            let sub_class = ((cls >> 16) & 0xff) as u8;
-            let prog_if = ((cls >> 8) & 0xff) as u8;
-            if sub_class == 0x03 && prog_if == 0x30 {
-                return usb::attach(self);
-            }
+        if matches!(self.pcie_class, pcie_class::PCIeClass::SerialBusController)
+            && usb::is_xhci(&self)
+        {
+            return usb::attach(self);
         }
 
         match self.vendor {
@@ -1159,8 +1160,8 @@ impl PCIeInfo {
             pcie_id::VIRTIO_VENDOR_ID => {
                 return virtio::attach(self);
             }
-            pcie_id::AQUANTIA_VENDOR_ID => {
-                #[cfg(feature = "aquantia")]
+            #[cfg(feature = "aquantia")]
+            pcie_id::AQUANTIA_VENDOR_ID if aquantia::match_device(self.vendor, self.id) => {
                 return aquantia::attach(self);
             }
             _ => {

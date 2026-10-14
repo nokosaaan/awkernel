@@ -125,41 +125,45 @@ fn pit_calibrate_tsc() -> Result<u128, &'static str> {
 
     const PIT_FREQ_HZ: u64 = 1_193_182;
     const CALIBRATE_MS: u64 = 50;
-    const LATCH: u16 = ((PIT_FREQ_HZ * CALIBRATE_MS) / 1000) as u16;
+    // 59_659 ticks: fits the 16-bit PIT counter.
+    const LATCH: u64 = PIT_FREQ_HZ * CALIBRATE_MS / 1000;
+    const _: () = assert!(LATCH <= 0xFFFF);
+    // Upper bound on status polls (~seconds); the gate normally rises after 50 ms.
+    const POLL_LIMIT: u64 = 1_000_000_000;
 
+    let [latch_lo, latch_hi, ..] = LATCH.to_le_bytes();
     let mut pit_cmd: PortWriteOnly<u8> = PortWriteOnly::new(0x43);
     let mut pit_ch2: Port<u8> = Port::new(0x42);
     let mut speaker: Port<u8> = Port::new(0x61);
 
+    // SAFETY: ports 0x42/0x43/0x61 are the legacy PIT channel 2 and its gate;
+    // only channel 2 (speaker timer) is touched, so the system timer is unaffected.
+    let saved = unsafe { speaker.read() };
     unsafe {
         // Enable channel 2 gate, disable speaker output.
-        let v = speaker.read();
-        speaker.write((v & 0xFC) | 0x01);
-
-        // Channel 2, lobyte/hibyte, mode 0, binary.
+        speaker.write((saved & 0xFC) | 0x01);
+        // Channel 2, lobyte/hibyte, mode 0 (interrupt on terminal count), binary.
         pit_cmd.write(0xB0);
-        pit_ch2.write(LATCH as u8);
-        pit_ch2.write((LATCH >> 8) as u8);
-
-        let tsc_start = read_tsc();
-
-        let mut timeout: u64 = 1_000_000_000;
-        while speaker.read() & 0x20 == 0 {
-            timeout -= 1;
-            if timeout == 0 {
-                return Err("PIT calibration timed out");
-            }
-        }
-
-        let tsc_end = read_tsc();
-
-        if tsc_end <= tsc_start {
-            return Err("TSC did not advance during PIT calibration");
-        }
-
-        let diff = (tsc_end - tsc_start) as u128;
-        Ok(diff * 1000 / CALIBRATE_MS as u128)
+        pit_ch2.write(latch_lo);
+        pit_ch2.write(latch_hi);
     }
+
+    let tsc_start = read_tsc();
+    // OUT2 (bit 5 of port 0x61) goes high when the counter reaches zero.
+    // SAFETY: reading the PIT gate/status port has no side effects.
+    let expired = (0..POLL_LIMIT).any(|_| unsafe { speaker.read() } & 0x20 != 0);
+    let tsc_end = read_tsc();
+    // SAFETY: restores the gate/speaker bits read above.
+    unsafe { speaker.write(saved) };
+
+    if !expired {
+        return Err("PIT calibration timed out");
+    }
+    let diff = tsc_end
+        .checked_sub(tsc_start)
+        .filter(|d| *d > 0)
+        .ok_or("TSC did not advance during PIT calibration")?;
+    Ok(u128::from(diff) * 1000 / u128::from(CALIBRATE_MS))
 }
 
 fn init_hpet(

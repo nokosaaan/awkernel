@@ -565,10 +565,13 @@ impl InterruptController for X2Apic {
         } else {
             // Compatibility Format fallback for systems without interrupt remapping
             // (e.g. AMD with no VT-d/AMD-Vi support initialized).
-            // Only works for APIC IDs < 256; edge-triggered, fixed delivery.
+            // Edge-triggered, fixed delivery.  The destination field is 8 bits wide,
+            // so APIC IDs >= 256 cannot be addressed without remapping.
+            let dest = u8::try_from(target)
+                .map_err(|_| "MSI compatibility format cannot target an APIC ID >= 256")?;
             unsafe {
-                write_volatile(message_data, irq as u32);
-                write_volatile(message_address, 0xfee0_0000 | ((target & 0xFF) << 12));
+                write_volatile(message_data, u32::from(irq));
+                write_volatile(message_address, 0xfee0_0000 | (u32::from(dest) << 12));
                 if let Some(addr_upper) = message_address_upper {
                     write_volatile(addr_upper, 0);
                 }
