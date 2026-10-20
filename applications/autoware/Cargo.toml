@@ -24,3 +24,4 @@ stop_filter = { path = "./stop_filter", default-features = false }
 twist2accel = { path = "./twist2accel", default-features = false }
 trajectory_follower = { path = "./trajectory_follower", default-features = false }
 command_gate = { path = "./command_gate", default-features = false }
+constant_jerk_deceleration_controller = { path = "./constant_jerk_deceleration_controller", default-features = false }
