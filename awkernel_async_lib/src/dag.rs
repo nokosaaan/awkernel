@@ -898,17 +898,21 @@ fn validate_single_publisher_per_topic(dag: &Dag) -> Result<(), Vec<DagError>> {
     let mut node = MCSNode::new();
     let graph = dag.graph.lock(&mut node);
 
-    let publisher_counts_by_topic = graph.edge_references().fold(
-        BTreeMap::<Cow<'static, str>, usize>::new(),
+    // Count distinct publishing nodes, not edges: one publisher fanning out to several
+    // subscribers creates one edge per subscriber but is still a single publisher.
+    let publishers_by_topic = graph.edge_references().fold(
+        BTreeMap::<Cow<'static, str>, BTreeSet<NodeIndex>>::new(),
         |mut acc, edge| {
-            *acc.entry(edge.weight().topic_name.clone()).or_insert(0) += 1;
+            acc.entry(edge.weight().topic_name.clone())
+                .or_default()
+                .insert(edge.source());
             acc
         },
     );
 
-    let errors: Vec<_> = publisher_counts_by_topic
+    let errors: Vec<_> = publishers_by_topic
         .into_iter()
-        .filter(|(_, count)| *count > 1)
+        .filter(|(_, publishers)| publishers.len() > 1)
         .map(|(topic, _)| DagError::TopicHasMultiplePublishers(dag.id, topic))
         .collect();
 
@@ -1169,6 +1173,31 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_publisher_fanning_out_to_two_subscribers_is_valid() {
+        let dag = create_dag();
+        dag.add_node_with_topic_edges(&[], &["fan_out_topic".into()]);
+        dag.add_node_with_topic_edges(&["fan_out_topic".into()], &[]);
+        dag.add_node_with_topic_edges(&["fan_out_topic".into()], &[]);
+
+        assert!(validate_single_publisher_per_topic(&dag).is_ok());
+    }
+
+    #[test]
+    fn two_publishers_on_one_topic_are_rejected() {
+        let dag = create_dag();
+        dag.add_node_with_topic_edges(&[], &["two_pub_topic".into()]);
+        dag.add_node_with_topic_edges(&[], &["two_pub_topic".into()]);
+        dag.add_node_with_topic_edges(&["two_pub_topic".into()], &[]);
+
+        let errors = validate_single_publisher_per_topic(&dag).unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(
+            &errors[0],
+            DagError::TopicHasMultiplePublishers(_, topic) if topic == "two_pub_topic"
+        ));
+    }
 
     #[test]
     fn late_node_keeps_the_deadline_of_its_job() {
