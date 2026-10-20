@@ -11,4 +11,5 @@ crate-type = ["rlib"]
 localization_types = { path = "../localization_types", default-features = false }
 nalgebra = { version = "0.32", default-features = false }
 libm = "0.2"
+heapless = "0.8"
 awkernel_lib = { path = "../../../awkernel_lib", default-features = false }

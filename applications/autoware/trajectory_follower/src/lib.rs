@@ -69,6 +69,30 @@ const FIX_POINTS: [TrajectoryPoint; 10] = [
     TrajectoryPoint::new(18.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0),
 ];
 
+/// Upper bound on a replaced trajectory (`autoware_planning_msgs/Trajectory` is unbounded upstream).
+pub const MAX_TRAJECTORY_POINTS: usize = 512;
+
+/// The trajectory being followed: `FIX_POINTS` until [`set_trajectory`] replaces it
+/// (the C++ node subscribes `~/input/trajectory`; here the replay / fixed-route data is set once).
+static TRAJECTORY: Mutex<Option<heapless::Vec<TrajectoryPoint, MAX_TRAJECTORY_POINTS>>> =
+    Mutex::new(None);
+
+/// Replace the followed trajectory. Returns `false` (and keeps the previous one) when `points`
+/// is empty or longer than [`MAX_TRAJECTORY_POINTS`].
+pub fn set_trajectory(points: &[TrajectoryPoint]) -> bool {
+    if points.is_empty() {
+        return false;
+    }
+    match heapless::Vec::from_slice(points) {
+        Ok(v) => {
+            let mut node = MCSNode::new();
+            *TRAJECTORY.lock(&mut node) = Some(v);
+            true
+        }
+        Err(()) => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Geometry helpers (ported from t_utils_pose_deviation_impl.rs)
 // ---------------------------------------------------------------------------
@@ -149,14 +173,30 @@ pub fn follow(ks: &KinematicState, _accel: &AccelWithCovarianceStamped) -> Contr
     let (use_external_target_vel, external_target_vel, lateral_deviation) = {
         let mut node = MCSNode::new();
         let cfg = CONFIG.lock(&mut node);
-        (cfg.use_external_target_vel, cfg.external_target_vel, cfg.lateral_deviation)
+        (
+            cfg.use_external_target_vel,
+            cfg.external_target_vel,
+            cfg.lateral_deviation,
+        )
     };
 
     let ego_pos = &ks.pose.pose.point;
 
     // 1. Find the closest trajectory point.
-    let closest_idx = find_nearest_index(&FIX_POINTS, ego_pos).min(FIX_POINTS.len() - 1);
-    let closest = &FIX_POINTS[closest_idx];
+    let closest = {
+        let mut node = MCSNode::new();
+        let traj = TRAJECTORY.lock(&mut node);
+        let points: &[TrajectoryPoint] = match traj.as_ref() {
+            Some(v) => v.as_slice(),
+            None => &FIX_POINTS,
+        };
+        let idx = find_nearest_index(points, ego_pos);
+        match points.get(idx) {
+            Some(p) => p.clone(),
+            None => return Control::default(),
+        }
+    };
+    let closest = &closest;
 
     // Timestamp is captured here — after updateClosest, before calcSteerCmd/calcAccCmd.
     // Mirrors the order in simple_trajectory_follower.cpp onTimer().
@@ -176,7 +216,11 @@ pub fn follow(ks: &KinematicState, _accel: &AccelWithCovarianceStamped) -> Contr
 
     // 3. Longitudinal control: P-controller on velocity error.
     let traj_vel = closest.longitudinal_velocity_mps;
-    let target_vel = if use_external_target_vel { external_target_vel } else { traj_vel };
+    let target_vel = if use_external_target_vel {
+        external_target_vel
+    } else {
+        traj_vel
+    };
     let vel_err = vx - target_vel;
     let acc = (-KP_LONGITUDINAL * vel_err).max(-ACC_LIM).min(ACC_LIM);
 
@@ -190,4 +234,59 @@ pub fn follow(ks: &KinematicState, _accel: &AccelWithCovarianceStamped) -> Contr
     ctrl.longitudinal.acceleration = acc;
 
     ctrl
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn point(x: f64, y: f64, v: f64) -> TrajectoryPoint {
+        TrajectoryPoint::new(x, y, 0.0, 1.0, 0.0, 0.0, 0.0, v)
+    }
+
+    fn follow_at(x: f64, y: f64) -> Control {
+        let mut ks = KinematicState::default();
+        ks.pose.pose.point.x = x;
+        ks.pose.pose.point.y = y;
+        ks.pose.pose.orientation.w = 1.0;
+        follow(&ks, &AccelWithCovarianceStamped::default())
+    }
+
+    // One test: TRAJECTORY and CONFIG are process-global, so the steps must not run in parallel.
+    #[test]
+    fn set_trajectory_replaces_the_followed_route_and_rejects_bad_input() {
+        // The default config overrides the speed with `external_target_vel`.
+        assert_eq!(follow_at(0.0, 0.0).longitudinal.velocity, 5.0);
+        // Follow the trajectory's own speed from here on.
+        configure(false, 0.0, 0.0);
+        // Built-in FIX_POINTS: the closest point to x = 10 has 5 m/s, to x = 4 has 2 m/s.
+        assert_eq!(follow_at(10.0, 0.0).longitudinal.velocity, 5.0);
+        assert_eq!(follow_at(4.0, 0.0).longitudinal.velocity, 2.0);
+
+        // Rejected inputs keep the current trajectory.
+        assert!(!set_trajectory(&[]));
+        let too_long: [TrajectoryPoint; MAX_TRAJECTORY_POINTS + 1] =
+            core::array::from_fn(|_| point(0.0, 0.0, 1.0));
+        assert!(!set_trajectory(&too_long));
+        assert_eq!(follow_at(4.0, 0.0).longitudinal.velocity, 2.0);
+
+        // A route offset to y = 2 with its own speed is followed from now on.
+        let route: [TrajectoryPoint; 3] = [
+            point(0.0, 2.0, 3.0),
+            point(10.0, 2.0, 7.0),
+            point(20.0, 2.0, 0.0),
+        ];
+        assert!(set_trajectory(&route));
+        let ctrl = follow_at(10.0, 0.0);
+        assert_eq!(ctrl.longitudinal.velocity, 7.0);
+        // The route is to the left (+y): steer left (positive), within the limit.
+        assert!(ctrl.lateral.steering_tire_angle > 0.0);
+        assert!(ctrl.lateral.steering_tire_angle <= STEER_LIM);
+
+        // Exactly MAX_TRAJECTORY_POINTS is accepted.
+        let full: [TrajectoryPoint; MAX_TRAJECTORY_POINTS] =
+            core::array::from_fn(|_| point(0.0, 0.0, 1.0));
+        assert!(set_trajectory(&full));
+        assert_eq!(follow_at(0.0, 0.0).longitudinal.velocity, 1.0);
+    }
 }
