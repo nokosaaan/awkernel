@@ -9,7 +9,7 @@ use super::{Scheduler, SchedulerType, Task};
 use crate::{
     scheduler::{
         gedf::calculate_and_update_dag_deadline, get_priority, peek_preemption_pending,
-        push_preemption_pending, ClusteredTask, GLOBAL_WAKE_GET_MUTEX,
+        push_preemption_pending, ClusteredTask, GLOBAL_WAKE_GET_MUTEX, PREEMPTION_ENABLED,
     },
     task::{
         get_task, get_task_running, set_current_task, set_need_preemption, State, MAX_TASK_PRIORITY,
@@ -45,7 +45,7 @@ impl Scheduler for ClusteredEDFScheduler {
                 SchedulerType::ClusteredEDF(relative_deadline, _) => {
                     let wake_time = awkernel_lib::delay::uptime();
                     let absolute_deadline = if let Some(ref dag_info) = dag_info {
-                        calculate_and_update_dag_deadline(dag_info, wake_time)
+                        calculate_and_update_dag_deadline(dag_info, wake_time, info.state)
                     } else {
                         // If dag_info is not present, the task is treated as a regular task, and
                         // the absolute_deadline is calculated using the scheduler's relative_deadline.
@@ -154,6 +154,10 @@ pub static SCHEDULER: ClusteredEDFScheduler = ClusteredEDFScheduler {
 
 impl ClusteredEDFScheduler {
     fn invoke_preemption(&self, task: Arc<Task>) -> bool {
+        if !PREEMPTION_ENABLED {
+            return false;
+        }
+
         let cpu_set = task.cpu_set.expect("Task has no CPU set");
 
         // Find the CPU whose target (running or pending-preemption) task has
@@ -193,7 +197,7 @@ impl ClusteredEDFScheduler {
             return false;
         };
 
-        if task > target_task {
+        if task.preempts(&target_task) {
             push_preemption_pending(victim_cpu, task);
             let preempt_irq = awkernel_lib::interrupt::get_preempt_irq();
             set_need_preemption(target_task.id, victim_cpu);
