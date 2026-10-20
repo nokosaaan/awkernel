@@ -190,7 +190,9 @@ async fn localization_dag() -> Arc<Dag> {
             let poses = POSE_QUEUE.drain();
             let mut twists = TWIST_QUEUE.drain();
             (nodes::ekf_localizer(
-                nodes::EkfDt::Fixed(period_sec),
+                nodes::EkfDt::Measured {
+                    nominal: period_sec,
+                },
                 &poses,
                 &mut twists,
             ),)

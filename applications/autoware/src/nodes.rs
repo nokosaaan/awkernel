@@ -79,17 +79,52 @@ static SYNTHETIC_WORLD: Mutex<Option<World>> = Mutex::new(None);
 /// initial guess; it is shared state rather than a DAG edge because EKF -> NDT -> EKF is a cycle.
 static EKF_BIASED_POSE: Latest<Pose> = Latest::new();
 static EKF_INITIALIZED: Mutex<bool> = Mutex::new(false);
+/// (`last_predict_time_sec_` [ns], `ekf_dt_` [s]) for `EkfDt::Measured`.
+#[cfg(feature = "dag_multi")]
+static EKF_TIMING: Mutex<(Option<u64>, f64)> = Mutex::new((None, 0.0));
+
 /// How the EKF prediction step is sized.
 #[derive(Clone, Copy)]
 pub enum EkfDt {
-    /// Advance by a fixed step every cycle.
+    /// Advance by a fixed step every cycle. Used by the single DAG, where every cycle carries
+    /// exactly one source period's worth of data, so EKF time follows data time.
+    #[cfg(not(feature = "dag_multi"))]
     Fixed(f64),
+    /// Upstream `timer_callback`: dt is the measured time since the previous cycle (capped at
+    /// 10 s, kept unchanged on a backwards jump), and `accumulate_delay_time` runs only once a
+    /// previous cycle exists. `nominal` is the step used before the first measured interval.
+    #[cfg(feature = "dag_multi")]
+    Measured { nominal: f64 },
 }
 
 /// Returns `(dt, accumulate)` for this cycle.
-fn ekf_step(mode: EkfDt) -> (f64, bool) {
+fn ekf_step(mode: EkfDt, now_ns: u64) -> (f64, bool) {
     match mode {
-        EkfDt::Fixed(dt) => (dt, true),
+        #[cfg(not(feature = "dag_multi"))]
+        EkfDt::Fixed(dt) => {
+            let _ = now_ns; // only the measured mode reads the clock
+            (dt, true)
+        }
+        #[cfg(feature = "dag_multi")]
+        EkfDt::Measured { nominal } => {
+            let mut node = MCSNode::new();
+            let mut timing = EKF_TIMING.lock(&mut node);
+            let (last, prev_dt) = *timing;
+            let prev_dt = if prev_dt > 0.0 { prev_dt } else { nominal };
+            let step = match last {
+                Some(last_ns) if now_ns >= last_ns => {
+                    let dt = ((now_ns - last_ns) as f64 / 1.0e9).min(10.0);
+                    (dt, true)
+                }
+                Some(_) => {
+                    log::warn!("[EKF] Detected jump back in time");
+                    (prev_dt, false)
+                }
+                None => (prev_dt, false),
+            };
+            *timing = (Some(now_ns), step.0);
+            step
+        }
     }
 }
 
@@ -442,7 +477,7 @@ pub fn ekf_localizer(
     if initialized {
         // Both calls are required every predict tick -- `predict_with_delay` does not age the
         // delay-time buffer itself (see its doc comment).
-        let (dt, accumulate) = ekf_step(dt_mode);
+        let (dt, accumulate) = ekf_step(dt_mode, current_time);
         if accumulate {
             ekf.accumulate_delay_time(dt);
         }
