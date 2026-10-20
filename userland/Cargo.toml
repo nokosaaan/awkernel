@@ -93,6 +93,8 @@ perf = ["awkernel_services/perf"]
 # Evaluation applications
 rd_gen_to_dags = ["dep:rd_gen_to_dags"]
 autoware = ["dep:autoware"]
+# Autoware with one DAG per period (default build uses a single DAG).
+autoware_dag_multi = ["autoware", "autoware/dag_multi"]
 
 # Test applications
 test_network = ["dep:test_network"]
