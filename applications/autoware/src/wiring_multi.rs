@@ -21,6 +21,7 @@ use localization_types::{
     AccelWithCovarianceStamped, Control, GearCommand, HazardLightsCommand, KinematicState,
     TurnIndicatorsCommand,
 };
+#[cfg(not(feature = "replay"))]
 use ndt_scan_matcher::PointCloud;
 use vehicle_velocity_converter::TwistWithCovarianceStamped;
 
@@ -144,22 +145,46 @@ async fn twist_estimator_dag() -> Arc<Dag> {
 async fn pose_estimator_dag() -> Arc<Dag> {
     let dag = create_dag();
 
-    dag.register_periodic_reactor::<_, (PointCloud,)>(
-        "pointcloud_dummy_generator".into(),
-        || -> (PointCloud,) { (nodes::pointcloud_dummy_generator(),) },
-        vec![Cow::from("/localization/util/downsample/pointcloud")],
+    // Source: synthetic LiDAR (then NDT), or the recorded Main ECU pose with `replay`.
+    #[cfg(not(feature = "replay"))]
+    {
+        dag.register_periodic_reactor::<_, (PointCloud,)>(
+            "pointcloud_dummy_generator".into(),
+            || -> (PointCloud,) { (nodes::pointcloud_dummy_generator(),) },
+            vec![Cow::from("/localization/util/downsample/pointcloud")],
+            SchedulerType::GEDF(5),
+            POSE_PERIOD,
+        )
+        .await;
+
+        dag.register_reactor::<_, (PointCloud,), (Option<PoseWithCovarianceStamped>,)>(
+            "ndt_scan_matcher".into(),
+            |(cloud,): (PointCloud,)| -> (Option<PoseWithCovarianceStamped>,) {
+                (nodes::ndt_scan_matcher(&cloud),)
+            },
+            vec![Cow::from("/localization/util/downsample/pointcloud")],
+            vec![Cow::from("/localization/pose_estimator/pose_with_covariance")],
+            SchedulerType::GEDF(5),
+        )
+        .await;
+    }
+    #[cfg(feature = "replay")]
+    dag.register_periodic_reactor::<_, (Option<PoseWithCovarianceStamped>,)>(
+        "pose_replay".into(),
+        || -> (Option<PoseWithCovarianceStamped>,) { (nodes::pose_replay(),) },
+        vec![Cow::from("/localization/pose_estimator/pose_with_covariance")],
         SchedulerType::GEDF(5),
         POSE_PERIOD,
     )
     .await;
 
-    dag.register_reactor::<_, (PointCloud,), (Option<PoseWithCovarianceStamped>,)>(
-        "ndt_scan_matcher".into(),
-        |(cloud,): (PointCloud,)| -> (Option<PoseWithCovarianceStamped>,) {
-            (nodes::ndt_scan_matcher(&cloud),)
+    dag.register_reactor::<_, (Option<PoseWithCovarianceStamped>,), (Option<PoseWithCovarianceStamped>,)>(
+        "topic_relay_controller_pose".into(),
+        |(pose,): (Option<PoseWithCovarianceStamped>,)| -> (Option<PoseWithCovarianceStamped>,) {
+            (nodes::pose_relay(pose),)
         },
-        vec![Cow::from("/localization/util/downsample/pointcloud")],
         vec![Cow::from("/localization/pose_estimator/pose_with_covariance")],
+        vec![Cow::from("/main/localization/pose_with_covariance")],
         SchedulerType::GEDF(5),
     )
     .await;
@@ -171,7 +196,7 @@ async fn pose_estimator_dag() -> Arc<Dag> {
                 POSE_QUEUE.push(pose);
             }
         },
-        vec![Cow::from("/localization/pose_estimator/pose_with_covariance")],
+        vec![Cow::from("/main/localization/pose_with_covariance")],
         SchedulerType::GEDF(5),
         POSE_PERIOD,
     )

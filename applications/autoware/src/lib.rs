@@ -4,6 +4,8 @@ extern crate alloc;
 
 mod bridge;
 mod nodes;
+#[cfg(feature = "replay")]
+mod replay;
 mod shared;
 #[cfg(not(feature = "dag_multi"))]
 mod wiring_single;
@@ -16,7 +18,8 @@ use awkernel_async_lib::net::IpAddr;
 use awkernel_lib::delay::wait_microsec;
 use awkernel_lib::sync::mutex::Mutex;
 use core::net::Ipv4Addr;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
+use shared::{Latest, Queue};
 use core::time::Duration;
 use csv_core::{ReadRecordResult, Reader};
 
@@ -29,11 +32,16 @@ pub(crate) const LOG_ENABLE: bool = false;
 const INTERFACE_ID: u64 = 0;
 const INTERFACE_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 64);
 const UDP_TCP_DST_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
+/// EKF odometry JSON (read by `awkernel_script/ekf_view/run_ekf_monitoring.py`).
 const UDP_DST_PORT: u16 = 26099;
+/// `/control/command/*` JSON, one packet per sink period (read by `awsim_bridge`).
+const UDP_CMD_DST_PORT: u16 = 26100;
 
-static mut LATEST_JSON_DATA: Option<String> = None;
-static JSON_DATA_READY: AtomicBool = AtomicBool::new(false);
-static JSON_DATA_LENGTH: AtomicUsize = AtomicUsize::new(0);
+/// Newest odometry JSON with a sequence number, so the sender only sends new ones.
+static ODOMETRY_JSON: Latest<(u32, String)> = Latest::new();
+static ODOMETRY_SEQ: AtomicU32 = AtomicU32::new(0);
+/// Command packets waiting for the sender task (oldest dropped when full, counted).
+static COMMAND_JSON: Queue<String, 16> = Queue::new();
 
 include!(concat!(env!("OUT_DIR"), "/csv_data.rs"));
 
@@ -56,6 +64,29 @@ pub async fn run() {
     if let Err(e) = initialize_csv_data() {
         log::warn!("Failed to initialize CSV data: {}", e);
     }
+    #[cfg(feature = "replay")]
+    if let Err(e) = replay::load() {
+        log::error!("{}", e);
+    }
+
+    // The network and the UDP sender come up before the DAGs, so the first vehicle command (and
+    // the start of the replay timeline) already reaches the host instead of being dropped.
+    log::info!("=== Network test start ===");
+    log::info!("Interface ID: {}", INTERFACE_ID);
+    log::info!("Interface IP: {}", INTERFACE_ADDR);
+    log::info!("Destination IP: {}", UDP_TCP_DST_ADDR);
+    awkernel_lib::net::add_ipv4_addr(INTERFACE_ID, INTERFACE_ADDR, 24);
+    log::info!(
+        "Configured IPv4 address {} on interface {}",
+        INTERFACE_ADDR,
+        INTERFACE_ID
+    );
+
+    log::info!("Waiting for network stack initialization...");
+    awkernel_async_lib::sleep(Duration::from_secs(2)).await;
+
+    log::info!("Starting periodic UDP sender task");
+    start_periodic_udp_sender().await;
 
     nodes::configure_nodes();
 
@@ -80,37 +111,6 @@ pub async fn run() {
     }
 
     log::info!("Autoware test application DAG completed");
-
-    log::info!("=== Network test start ===");
-    log::info!("Interface ID: {}", INTERFACE_ID);
-    log::info!("Interface IP: {}", INTERFACE_ADDR);
-    log::info!("Destination IP: {}", UDP_TCP_DST_ADDR);
-    awkernel_lib::net::add_ipv4_addr(INTERFACE_ID, INTERFACE_ADDR, 24);
-    log::info!(
-        "Configured IPv4 address {} on interface {}",
-        INTERFACE_ADDR,
-        INTERFACE_ID
-    );
-
-    log::info!("Waiting for network stack initialization...");
-    awkernel_async_lib::sleep(Duration::from_secs(2)).await;
-
-    log::info!("Starting periodic UDP sender task");
-    start_periodic_udp_sender().await;
-
-    log::info!("Waiting for JSON data to become ready...");
-    let mut wait_count = 0;
-    const MAX_WAIT_COUNT: u32 = 3;
-
-    while !JSON_DATA_READY.load(Ordering::Relaxed) && wait_count < MAX_WAIT_COUNT {
-        awkernel_async_lib::sleep(Duration::from_secs(1)).await;
-        wait_count += 1;
-    }
-
-    if JSON_DATA_READY.load(Ordering::Relaxed) {
-    } else {
-        log::warn!("JSON data was not ready. Periodic UDP sender task remains waiting");
-    }
 
     log::info!("Autoware test application completed");
 }
@@ -189,14 +189,15 @@ fn parse_velocity_csv(csv: &str) -> Result<Vec<VelocityCsvRow>, &'static str> {
     Ok(rows)
 }
 
-fn parse_csv_records<F>(csv: &str, mut on_record: F) -> Result<(), &'static str>
+pub(crate) fn parse_csv_records<F>(csv: &str, mut on_record: F) -> Result<(), &'static str>
 where
     F: FnMut(&[&str]) -> Result<(), &'static str>,
 {
     let mut reader = Reader::new();
     let mut input = csv.as_bytes();
     let mut output = vec![0u8; 4096];
-    let mut ends = vec![0usize; 32];
+    // Field end offsets of one record; the pose CSV is the widest (9 + 36 covariance columns).
+    let mut ends = vec![0usize; 64];
     let mut header_skipped = false;
 
     loop {
@@ -206,6 +207,10 @@ where
 
         if matches!(result, ReadRecordResult::OutputFull) {
             return Err("CSV output buffer is too small");
+        }
+        // Without this check the rest of the record would be read as a new, misaligned record.
+        if matches!(result, ReadRecordResult::OutputEndsFull) {
+            return Err("CSV record has too many fields");
         }
 
         if num_fields == 0 {
@@ -238,7 +243,7 @@ where
     Ok(())
 }
 
-fn parse_timestamp(sec: &str, nsec: &str) -> Result<u64, &'static str> {
+pub(crate) fn parse_timestamp(sec: &str, nsec: &str) -> Result<u64, &'static str> {
     let sec_val = parse_u64(sec)?;
     let nsec_val = parse_u64(nsec)?;
     let ts = sec_val
@@ -256,7 +261,7 @@ fn parse_u64(field: &str) -> Result<u64, &'static str> {
     trimmed.parse::<u64>().map_err(|_| "Failed to parse u64")
 }
 
-fn parse_f64(field: &str) -> Result<f64, &'static str> {
+pub(crate) fn parse_f64(field: &str) -> Result<f64, &'static str> {
     let trimmed = field.trim();
     if trimmed.is_empty() {
         return Ok(0.0);
@@ -283,76 +288,59 @@ pub async fn start_periodic_udp_sender() {
 }
 
 async fn periodic_udp_sender_task() {
-    let socket_result = awkernel_async_lib::net::udp::UdpSocket::bind_on_interface(
+    let mut socket = match awkernel_async_lib::net::udp::UdpSocket::bind_on_interface(
         INTERFACE_ID,
         &Default::default(),
-    );
-
-    let mut socket = match socket_result {
+    ) {
         Ok(socket) => socket,
         Err(e) => {
-            log::error!(
-                "Periodic UDP sender task: failed to create UDP socket: {:?}",
-                e
-            );
+            log::error!("UDP sender: failed to create UDP socket: {:?}", e);
             return;
         }
     };
 
     let dst_addr = IpAddr::new_v4(UDP_TCP_DST_ADDR);
-    let mut counter = 0;
+    let mut last_odometry_seq = None;
+    let mut sent_commands: u64 = 0;
 
+    // Each command is sent exactly once, as soon as the sink produced it; the odometry is sent
+    // when a new one exists. No reply is awaited (the old 100 ms receive wait capped the send
+    // rate at about 9 Hz).
     loop {
-        if !JSON_DATA_READY.load(Ordering::Relaxed) {
-            awkernel_async_lib::sleep(Duration::from_secs(1)).await;
-            continue;
-        }
-
-        let json_data = unsafe { LATEST_JSON_DATA.clone() };
-
-        if let Some(data) = json_data {
-            match socket.send(data.as_bytes(), &dst_addr, UDP_DST_PORT).await {
+        for json in COMMAND_JSON.drain() {
+            match socket.send(json.as_bytes(), &dst_addr, UDP_CMD_DST_PORT).await {
                 Ok(_) => {
-                    counter += 1;
-                    log::info!(
-                        "Periodic UDP sender task: send success #{} ({} bytes)",
-                        counter,
-                        data.len()
-                    );
-
-                    let mut buf = [0u8; 1024];
-                    if let Some(Ok((n, src_addr, src_port))) = awkernel_async_lib::timeout(
-                        Duration::from_millis(100),
-                        socket.recv(&mut buf),
-                    )
-                    .await
-                    {
-                        if let Ok(response) = core::str::from_utf8(&buf[..n]) {
-                            log::debug!(
-                                "Periodic UDP sender task: response received: {}:{} - {}",
-                                src_addr.get_addr(),
-                                src_port,
-                                response
-                            );
-                        }
+                    sent_commands += 1;
+                    if sent_commands % 200 == 1 {
+                        log::info!(
+                            "UDP sender: {} command packets sent ({} dropped before send)",
+                            sent_commands,
+                            COMMAND_JSON.dropped()
+                        );
                     }
                 }
-                Err(e) => {
-                    log::warn!("Periodic UDP sender task: send failed: {:?}", e);
+                Err(e) => log::warn!("UDP sender: command send failed: {:?}", e),
+            }
+        }
+
+        if let Some((seq, json)) = ODOMETRY_JSON.get() {
+            if last_odometry_seq != Some(seq) {
+                last_odometry_seq = Some(seq);
+                if let Err(e) = socket.send(json.as_bytes(), &dst_addr, UDP_DST_PORT).await {
+                    log::warn!("UDP sender: odometry send failed: {:?}", e);
                 }
             }
-        } else {
-            log::warn!("Periodic UDP sender task: failed to get JSON data");
         }
 
         awkernel_async_lib::sleep(Duration::from_millis(5)).await;
     }
 }
 
-pub(crate) fn save_json_data_to_global(json_data: String) {
-    unsafe {
-        LATEST_JSON_DATA = Some(json_data.clone());
-    }
-    JSON_DATA_READY.store(true, Ordering::Relaxed);
-    JSON_DATA_LENGTH.store(json_data.len(), Ordering::Relaxed);
+pub(crate) fn publish_odometry_json(json: String) {
+    let seq = ODOMETRY_SEQ.fetch_add(1, Ordering::Relaxed);
+    ODOMETRY_JSON.set((seq, json));
+}
+
+pub(crate) fn publish_command_json(json: String) {
+    COMMAND_JSON.push(json);
 }

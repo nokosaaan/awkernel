@@ -11,7 +11,6 @@
 //!   `KeepLast(N)` behaviour); drops are counted.
 
 use awkernel_lib::sync::mutex::{MCSNode, Mutex};
-#[cfg(feature = "dag_multi")]
 use core::sync::atomic::{AtomicU32, Ordering};
 
 pub struct Latest<T: Send> {
@@ -37,13 +36,11 @@ impl<T: Clone + Send> Latest<T> {
     }
 }
 
-#[cfg(feature = "dag_multi")]
 pub struct Queue<T: Send, const N: usize> {
     items: Mutex<heapless::Deque<T, N>>,
     dropped: AtomicU32,
 }
 
-#[cfg(feature = "dag_multi")]
 impl<T: Send, const N: usize> Queue<T, N> {
     pub const fn new() -> Self {
         Self {

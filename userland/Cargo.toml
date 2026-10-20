@@ -95,6 +95,8 @@ rd_gen_to_dags = ["dep:rd_gen_to_dags"]
 autoware = ["dep:autoware"]
 # Autoware with one DAG per period (default build uses a single DAG).
 autoware_dag_multi = ["autoware", "autoware/dag_multi"]
+# Autoware replaying recorded CSVs (open-loop AWSIM comparison).
+autoware_replay = ["autoware", "autoware/replay"]
 
 # Test applications
 test_network = ["dep:test_network"]

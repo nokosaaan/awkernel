@@ -32,3 +32,6 @@ ndt_scan_matcher = { path = "./ndt_scan_matcher", default-features = false }
 [features]
 # One DAG per period of the node diagram instead of a single 33 ms DAG.
 dag_multi = []
+# Replay recorded inputs (POSE / TRAJECTORY / MRM_TRIGGER / IMU / VELOCITY CSVs) instead of
+# the synthetic LiDAR + NDT and the dummy MRM trigger.
+replay = []
