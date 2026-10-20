@@ -16,7 +16,7 @@
 #![no_std]
 
 use awkernel_lib::sync::{mcs::MCSNode, mutex::Mutex};
-use awkernel_lib::time::Time;
+use awkernel_lib::time::Instant;
 use localization_types::{Control, KinematicState};
 
 // ---------------------------------------------------------------------------
@@ -54,7 +54,7 @@ struct FilterState {
     params: FilterParams,
     enable: bool,
     prev_cmd: Control,
-    prev_time: Option<Time>,
+    prev_time: Option<Instant>,
 }
 
 static STATE: Mutex<Option<FilterState>> = Mutex::new(None);
@@ -100,7 +100,7 @@ pub fn filter(ctrl: &Control, ks: &KinematicState) -> Control {
     // Proxy: no SteeringReport in DAG yet. Add explicit input when wired.
     let current_steer = state.prev_cmd.lateral.steering_tire_angle;
 
-    let now = Time::now();
+    let now = Instant::now();
     let dt = match state.prev_time {
         None => 0.0,
         Some(prev) => now.saturating_duration_since(prev).as_secs_f64(),

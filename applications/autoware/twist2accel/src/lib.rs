@@ -13,7 +13,7 @@
 
 use awkernel_lib::{
     sync::{mcs::MCSNode, mutex::Mutex},
-    time::Time,
+    time::Instant,
 };
 use localization_types::{AccelWithCovarianceStamped, Header, KinematicState, TwistWithCovariance};
 
@@ -51,9 +51,9 @@ struct Twist2AccelState {
     /// Selects input: true = KinematicState (odom), false = TwistWithCovariance.
     /// Mirrors `use_odom_` in the C++ node.
     use_odom: bool,
-    /// Timestamp of the last processed sample (`Time::zero()` ≡ no previous sample).
+    /// Timestamp of the last processed sample (`Instant::zero()` ≡ no previous sample).
     /// Mirrors `prev_twist_ptr_ != nullptr` guard in `estimate_accel()`.
-    prev_stamp: Time,
+    prev_stamp: Instant,
     prev_linear_x: f64,
     prev_linear_y: f64,
     prev_linear_z: f64,
@@ -72,7 +72,7 @@ impl Twist2AccelState {
     const fn new() -> Self {
         Self {
             use_odom: true,
-            prev_stamp: Time::zero(),
+            prev_stamp: Instant::zero(),
             prev_linear_x: 0.0,
             prev_linear_y: 0.0,
             prev_linear_z: 0.0,
@@ -182,7 +182,7 @@ pub fn on_twist(
 
 fn estimate_accel(
     state: &mut Twist2AccelState,
-    curr_stamp: Time,
+    curr_stamp: Instant,
     lin_x: f64,
     lin_y: f64,
     lin_z: f64,
@@ -194,7 +194,7 @@ fn estimate_accel(
     let mut out = AccelWithCovarianceStamped::default();
     out.header = out_header;
 
-    if state.prev_stamp != Time::zero() {
+    if state.prev_stamp != Instant::zero() {
         let dt = {
             let d = curr_stamp
                 .saturating_duration_since(state.prev_stamp)

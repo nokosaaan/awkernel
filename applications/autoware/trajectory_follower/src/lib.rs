@@ -160,7 +160,7 @@ pub fn follow(ks: &KinematicState, _accel: &AccelWithCovarianceStamped) -> Contr
 
     // Timestamp is captured here — after updateClosest, before calcSteerCmd/calcAccCmd.
     // Mirrors the order in simple_trajectory_follower.cpp onTimer().
-    let now = awkernel_lib::time::Time::now();
+    let now = awkernel_lib::time::Instant::now();
 
     // 2. Lateral control: linearised pure pursuit.
     let lat_err = calc_lateral_deviation(&closest.pose, ego_pos) - lateral_deviation;

@@ -2,7 +2,7 @@
 //! Types use nalgebra for linear algebra and heapless for fixed-size strings.
 #![no_std]
 
-pub use awkernel_lib::time::Time;
+pub use awkernel_lib::time::Instant;
 
 // ---------------------------------------------------------------------------
 // Header
@@ -10,14 +10,14 @@ pub use awkernel_lib::time::Time;
 
 #[derive(Clone)]
 pub struct Header {
-    pub time_stamp: Time,
+    pub time_stamp: Instant,
     pub frame_id: heapless::String<256>,
 }
 
 impl Header {
     pub const fn new() -> Self {
         Self {
-            time_stamp: Time::zero(),
+            time_stamp: Instant::zero(),
             frame_id: heapless::String::new(),
         }
     }
@@ -191,8 +191,8 @@ impl Default for AccelWithCovarianceStamped {
 
 #[derive(Clone)]
 pub struct Lateral {
-    pub stamp: Time,
-    pub control_time: Time,
+    pub stamp: Instant,
+    pub control_time: Instant,
     pub steering_tire_angle: f64,
     pub steering_tire_rotation_rate: f64,
     pub is_defined_steering_tire_rotation_rate: bool,
@@ -201,8 +201,8 @@ pub struct Lateral {
 impl Default for Lateral {
     fn default() -> Self {
         Self {
-            stamp: Time::zero(),
-            control_time: Time::zero(),
+            stamp: Instant::zero(),
+            control_time: Instant::zero(),
             steering_tire_angle: 0.0,
             steering_tire_rotation_rate: 0.0,
             is_defined_steering_tire_rotation_rate: false,
@@ -212,8 +212,8 @@ impl Default for Lateral {
 
 #[derive(Clone)]
 pub struct Longitudinal {
-    pub stamp: Time,
-    pub control_time: Time,
+    pub stamp: Instant,
+    pub control_time: Instant,
     pub velocity: f64,
     pub acceleration: f64,
     pub jerk: f64,
@@ -224,8 +224,8 @@ pub struct Longitudinal {
 impl Default for Longitudinal {
     fn default() -> Self {
         Self {
-            stamp: Time::zero(),
-            control_time: Time::zero(),
+            stamp: Instant::zero(),
+            control_time: Instant::zero(),
             velocity: 0.0,
             acceleration: 0.0,
             jerk: 0.0,
@@ -237,8 +237,8 @@ impl Default for Longitudinal {
 
 #[derive(Clone)]
 pub struct Control {
-    pub stamp: Time,
-    pub control_time: Time,
+    pub stamp: Instant,
+    pub control_time: Instant,
     pub lateral: Lateral,
     pub longitudinal: Longitudinal,
 }
@@ -246,8 +246,8 @@ pub struct Control {
 impl Default for Control {
     fn default() -> Self {
         Self {
-            stamp: Time::zero(),
-            control_time: Time::zero(),
+            stamp: Instant::zero(),
+            control_time: Instant::zero(),
             lateral: Lateral::default(),
             longitudinal: Longitudinal::default(),
         }
