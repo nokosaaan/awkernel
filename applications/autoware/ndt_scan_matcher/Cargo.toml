@@ -1,0 +1,16 @@
+[package]
+name = "ndt_scan_matcher"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[dependencies]
+common_types = { path = "../common_types", default-features = false }
+ekf_localizer = { path = "../ekf_localizer", default-features = false }
+libm = "0.2"
+# ROS-free, no_std NDT engine (tier4/realtime_core). Single-core build (no `mt`): the engine is
+# `!Sync`, and the node keeps it behind its own mutex.
+realtime_ndt_scan_matcher = { git = "https://github.com/tier4/realtime_core", rev = "33a51c831f32778519beb913e531128bb7e09b30", default-features = false }
