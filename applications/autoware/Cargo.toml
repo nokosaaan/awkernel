@@ -28,3 +28,7 @@ trajectory_follower = { path = "./trajectory_follower", default-features = false
 command_gate = { path = "./command_gate", default-features = false }
 constant_jerk_deceleration_controller = { path = "./constant_jerk_deceleration_controller", default-features = false }
 ndt_scan_matcher = { path = "./ndt_scan_matcher", default-features = false }
+
+[features]
+# One DAG per period of the node diagram instead of a single 33 ms DAG.
+dag_multi = []
