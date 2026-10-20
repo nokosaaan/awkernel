@@ -255,6 +255,101 @@ impl Default for Control {
 }
 
 // ---------------------------------------------------------------------------
+// Vehicle commands (autoware_vehicle_msgs)
+// ---------------------------------------------------------------------------
+
+/// Mirrors `autoware_vehicle_msgs/msg/GearCommand`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GearCommand {
+    pub stamp: Instant,
+    pub command: u8,
+}
+
+impl GearCommand {
+    pub const NONE: u8 = 0;
+    pub const NEUTRAL: u8 = 1;
+    pub const DRIVE: u8 = 2;
+    pub const REVERSE: u8 = 20;
+    pub const PARK: u8 = 22;
+    pub const LOW: u8 = 23;
+}
+
+impl Default for GearCommand {
+    fn default() -> Self {
+        Self {
+            stamp: Instant::zero(),
+            command: Self::NONE,
+        }
+    }
+}
+
+/// Mirrors `autoware_vehicle_msgs/msg/TurnIndicatorsCommand`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TurnIndicatorsCommand {
+    pub stamp: Instant,
+    pub command: u8,
+}
+
+impl TurnIndicatorsCommand {
+    pub const NO_COMMAND: u8 = 0;
+    pub const DISABLE: u8 = 1;
+    pub const ENABLE_LEFT: u8 = 2;
+    pub const ENABLE_RIGHT: u8 = 3;
+}
+
+impl Default for TurnIndicatorsCommand {
+    fn default() -> Self {
+        Self {
+            stamp: Instant::zero(),
+            command: Self::NO_COMMAND,
+        }
+    }
+}
+
+/// Mirrors `autoware_vehicle_msgs/msg/HazardLightsCommand`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HazardLightsCommand {
+    pub stamp: Instant,
+    pub command: u8,
+}
+
+impl HazardLightsCommand {
+    pub const NO_COMMAND: u8 = 0;
+    pub const DISABLE: u8 = 1;
+    pub const ENABLE: u8 = 2;
+}
+
+impl Default for HazardLightsCommand {
+    fn default() -> Self {
+        Self {
+            stamp: Instant::zero(),
+            command: Self::NO_COMMAND,
+        }
+    }
+}
+
+/// Mirrors `tier4_control_msgs/msg/ConstantJerkDecelerationTrigger`
+/// (tier4/tier4_autoware_msgs#230). The `f32` fields match the `float32` message fields.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ConstantJerkDecelerationTrigger {
+    pub stamp: Instant,
+    pub trigger: bool,
+    pub target_acceleration: f32,
+    pub target_jerk: f32,
+}
+
+impl Default for ConstantJerkDecelerationTrigger {
+    fn default() -> Self {
+        Self {
+            stamp: Instant::zero(),
+            trigger: false,
+            target_acceleration: 0.0,
+            target_jerk: 0.0,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Trajectory
 // ---------------------------------------------------------------------------
 
