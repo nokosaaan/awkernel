@@ -22,8 +22,16 @@ use localization_types::{
 use ndt_scan_matcher::PointCloud;
 use vehicle_velocity_converter::TwistWithCovarianceStamped;
 
-use crate::nodes;
+use crate::nodes::{self, Commands};
 use crate::shared::Latest;
+
+/// Commands of one period; `None` when the topic was not published this period.
+type MaybeCommands = (
+    Option<Control>,
+    Option<GearCommand>,
+    Option<HazardLightsCommand>,
+    Option<TurnIndicatorsCommand>,
+);
 
 /// `/localization/pose_twist_fusion_filter/kinematic_state` for the sink's odometry export.
 static LATEST_ODOMETRY: Latest<EKFOdometry> = Latest::new();
@@ -184,9 +192,11 @@ pub async fn build() -> Vec<Arc<Dag>> {
     )
     .await;
 
-    dag.register_reactor::<_, (KinematicState,), (Control,)>(
+    // `None` until the EKF is initialized (upstream publishes nothing then); the "no message"
+    // case is carried down to the gate, which outputs its builtin source meanwhile.
+    dag.register_reactor::<_, (KinematicState,), (Option<Control>,)>(
         "trajectory_follower".into(),
-        |(ks,): (KinematicState,)| -> (Control,) { (nodes::trajectory_follower(&ks),) },
+        |(ks,): (KinematicState,)| -> (Option<Control>,) { (nodes::trajectory_follower(&ks),) },
         vec![Cow::from("/localization/kinematic_state")],
         vec![Cow::from("/control/trajectory_follower/control_cmd")],
         SchedulerType::GEDF(5),
@@ -202,21 +212,21 @@ pub async fn build() -> Vec<Arc<Dag>> {
     )
     .await;
 
-    dag.register_reactor::<_, (Control, ConstantJerkDecelerationTrigger), (
-        Control,
-        GearCommand,
-        HazardLightsCommand,
-        TurnIndicatorsCommand,
-    )>(
+    dag.register_reactor::<_, (Option<Control>, ConstantJerkDecelerationTrigger), MaybeCommands>(
         "constant_jerk_deceleration_controller".into(),
-        |(control, trigger): (Control, ConstantJerkDecelerationTrigger)| -> (
-            Control,
-            GearCommand,
-            HazardLightsCommand,
-            TurnIndicatorsCommand,
-        ) {
-            let out = nodes::constant_jerk_deceleration_controller(&control, &trigger);
-            (out.control, out.gear, out.hazard_lights, out.turn_indicators)
+        |(control, trigger): (Option<Control>, ConstantJerkDecelerationTrigger)| -> MaybeCommands {
+            match control {
+                Some(control) => {
+                    let out = nodes::constant_jerk_deceleration_controller(&control, &trigger);
+                    (
+                        Some(out.control),
+                        Some(out.gear),
+                        Some(out.hazard_lights),
+                        Some(out.turn_indicators),
+                    )
+                }
+                None => (None, None, None, None),
+            }
         },
         vec![
             Cow::from("/control/trajectory_follower/control_cmd"),
@@ -233,21 +243,25 @@ pub async fn build() -> Vec<Arc<Dag>> {
     .await;
 
     dag.register_reactor::<_, (
-        Control,
-        GearCommand,
-        HazardLightsCommand,
-        TurnIndicatorsCommand,
+        Option<Control>,
+        Option<GearCommand>,
+        Option<HazardLightsCommand>,
+        Option<TurnIndicatorsCommand>,
         KinematicState,
-    ), (Control, GearCommand, HazardLightsCommand, TurnIndicatorsCommand)>(
+    ), Commands>(
         "control_command_gate".into(),
         |(control, gear, hazard_lights, turn_indicators, ks): (
-            Control,
-            GearCommand,
-            HazardLightsCommand,
-            TurnIndicatorsCommand,
+            Option<Control>,
+            Option<GearCommand>,
+            Option<HazardLightsCommand>,
+            Option<TurnIndicatorsCommand>,
             KinematicState,
-        )| -> (Control, GearCommand, HazardLightsCommand, TurnIndicatorsCommand) {
-            nodes::control_command_gate(Some((control, gear, hazard_lights, turn_indicators)), &ks)
+        )| -> Commands {
+            let main = match (control, gear, hazard_lights, turn_indicators) {
+                (Some(c), Some(g), Some(h), Some(t)) => Some((c, g, h, t)),
+                _ => None,
+            };
+            nodes::control_command_gate(main, &ks)
         },
         vec![
             Cow::from("/control/control_command_gate/inputs/in_lane_stop/control"),

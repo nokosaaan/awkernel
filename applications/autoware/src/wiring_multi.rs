@@ -277,7 +277,7 @@ async fn control_dag() -> Arc<Dag> {
         || -> (Option<Control>,) {
             let control = LATEST_KINEMATIC_STATE
                 .get()
-                .map(|ks| nodes::trajectory_follower(&ks));
+                .and_then(|ks| nodes::trajectory_follower(&ks));
             (control,)
         },
         vec![Cow::from("/control/trajectory_follower/control_cmd")],

@@ -185,6 +185,8 @@ static COMMAND_SEQ: AtomicU32 = AtomicU32::new(0);
 static GATE_ENGAGED: AtomicBool = AtomicBool::new(false);
 static GATE_PAUSED: AtomicBool = AtomicBool::new(false);
 static GATE_START_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Whether source "main" had a command this period (upstream: the source is not timed out).
+static GATE_MAIN_PRESENT: AtomicBool = AtomicBool::new(false);
 /// Steering of the previous gate output (the builtin source holds it).
 static GATE_PREV_STEER: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
 static LAST_PIPELINE_LOG: Mutex<Option<Instant>> = Mutex::new(None);
@@ -703,10 +705,27 @@ pub fn stop_filter(odom: &EKFOdometry) -> KinematicState {
 
 /// simple_trajectory_follower subscribes to the odometry (and the trajectory) only; the
 /// acceleration argument of `follow` is unused, so none is wired in.
-pub fn trajectory_follower(ks: &KinematicState) -> Control {
+///
+/// `None` until the EKF is initialized: upstream ekf_localizer publishes nothing before its
+/// initial pose (timer_callback returns early), so the follower's onTimer stays at "data not
+/// ready" and publishes nothing. Here the EKF node runs every period regardless (its output is a
+/// DAG edge), so the follower checks the EKF state instead.
+pub fn trajectory_follower(ks: &KinematicState) -> Option<Control> {
+    if !ekf_initialized() {
+        return None;
+    }
     let stamp_ns = u64::try_from(ks.header.time_stamp.uptime().as_nanos()).unwrap_or(u64::MAX);
     CONTROL_INPUT_AGE_US.store(age_us(stamp_ns), Ordering::Relaxed);
-    trajectory_follower::follow(ks, &AccelWithCovarianceStamped::default())
+    Some(trajectory_follower::follow(
+        ks,
+        &AccelWithCovarianceStamped::default(),
+    ))
+}
+
+fn ekf_initialized() -> bool {
+    let mut node = MCSNode::new();
+    let initialized = *EKF_INITIALIZED.lock(&mut node);
+    initialized
 }
 
 /// MRM trigger source: the recorded (`replay`) or received (`live`) trigger, otherwise a dummy
@@ -810,6 +829,7 @@ fn gate_input() -> GateInput {
 /// and resends gear / lights only on a source change; here it is evaluated every period.
 pub fn control_command_gate(main: Option<Commands>, ks: &KinematicState) -> Commands {
     let gate = gate_input();
+    GATE_MAIN_PRESENT.store(main.is_some(), Ordering::Relaxed);
     let (mut control, gear, hazard_lights, turn_indicators) = match main {
         Some(commands) if gate.engaged => commands,
         _ => builtin_emergency(),
@@ -909,10 +929,11 @@ fn command_json(
 ) -> String {
     let stamp_ns = |t: Instant| u64::try_from(t.uptime().as_nanos()).unwrap_or(u64::MAX);
     format!(
-        r#"{{"type":"command","seq":{},"stamp_ns":{},"mrm":{},"engaged":{},"paused":{},"start_requested":{},"control":{{"velocity":{:.6},"acceleration":{:.6},"jerk":{:.6},"is_defined_acceleration":{},"is_defined_jerk":{},"steering_tire_angle":{:.6},"steering_tire_rotation_rate":{:.6},"is_defined_steering_tire_rotation_rate":{}}},"gear":{},"hazard_lights":{},"turn_indicators":{}}}"#,
+        r#"{{"type":"command","seq":{},"stamp_ns":{},"mrm":{},"main":{},"engaged":{},"paused":{},"start_requested":{},"control":{{"velocity":{:.6},"acceleration":{:.6},"jerk":{:.6},"is_defined_acceleration":{},"is_defined_jerk":{},"steering_tire_angle":{:.6},"steering_tire_rotation_rate":{:.6},"is_defined_steering_tire_rotation_rate":{}}},"gear":{},"hazard_lights":{},"turn_indicators":{}}}"#,
         COMMAND_SEQ.fetch_add(1, Ordering::Relaxed),
         stamp_ns(control.stamp),
         mrm_active(),
+        GATE_MAIN_PRESENT.load(Ordering::Relaxed),
         GATE_ENGAGED.load(Ordering::Relaxed),
         GATE_PAUSED.load(Ordering::Relaxed),
         GATE_START_REQUESTED.load(Ordering::Relaxed),
