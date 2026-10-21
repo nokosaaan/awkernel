@@ -75,6 +75,11 @@ const MRM_TARGET_ACCELERATION: f32 = -2.5;
 #[cfg(not(feature = "replay"))]
 const MRM_TARGET_JERK: f32 = -1.5;
 
+/// autoware_launch `stop_filter.param.yaml` (`vx_threshold`, `wz_threshold`); the crate defaults
+/// are 0.0 (the node's declare_parameter fallbacks), which never report a stop.
+const STOP_FILTER_VX_THRESHOLD: f64 = 0.1;
+const STOP_FILTER_WZ_THRESHOLD: f64 = 0.02;
+
 /// One pipeline summary line per this interval.
 const PIPELINE_LOG_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -185,8 +190,9 @@ fn age_us(stamp_ns: u64) -> u32 {
 // ---------------------------------------------------------------------------
 
 pub fn configure_nodes() {
-    // twist2accel subscribes to the twist estimator output in this pipeline (see the node diagram).
-    twist2accel::configure(false);
+    // autoware_launch `twist2accel.param.yaml`: `use_odom: true`, i.e. it differentiates
+    // `/localization/kinematic_state` (the stop-filtered EKF output), not the twist estimator.
+    twist2accel::configure(true);
 
     // Map loading happens before the pose estimator is activated upstream (pose_initializer
     // triggers NDT only once the map is in); doing it here keeps the first scan off the map
@@ -413,13 +419,12 @@ pub fn gyro_odometer(
     }
 }
 
-pub fn twist2accel(twist: &TwistWithCovarianceStamped) -> AccelWithCovarianceStamped {
-    let (header, twist) = bridge::twist_to_localization(twist);
-    // `use_odom = false` is set in `configure_nodes`, so `on_twist` always yields.
-    twist2accel::on_twist(&header, &twist).unwrap_or_else(|| {
-        log::warn!("twist2accel: configured for odometry input; publishing zero accel");
+/// twist2accel with `use_odom: true`: the acceleration of the stop-filtered kinematic state.
+pub fn twist2accel(ks: &KinematicState) -> AccelWithCovarianceStamped {
+    twist2accel::on_odom(ks).unwrap_or_else(|| {
+        log::warn!("twist2accel: configured for twist input; publishing zero accel");
         AccelWithCovarianceStamped {
-            header,
+            header: ks.header.clone(),
             ..Default::default()
         }
     })
@@ -657,8 +662,8 @@ fn take_new(last: &AtomicU64, stamp_ns: u64) -> bool {
 pub fn stop_filter(odom: &EKFOdometry) -> KinematicState {
     stop_filter::apply(
         bridge::odometry_to_kinematic_state(odom),
-        stop_filter::DEFAULT_VX_THRESHOLD,
-        stop_filter::DEFAULT_WZ_THRESHOLD,
+        STOP_FILTER_VX_THRESHOLD,
+        STOP_FILTER_WZ_THRESHOLD,
     )
 }
 
@@ -666,10 +671,12 @@ pub fn stop_filter(odom: &EKFOdometry) -> KinematicState {
 // Control
 // ---------------------------------------------------------------------------
 
-pub fn trajectory_follower(ks: &KinematicState, accel: &AccelWithCovarianceStamped) -> Control {
+/// simple_trajectory_follower subscribes to the odometry (and the trajectory) only; the
+/// acceleration argument of `follow` is unused, so none is wired in.
+pub fn trajectory_follower(ks: &KinematicState) -> Control {
     let stamp_ns = u64::try_from(ks.header.time_stamp.uptime().as_nanos()).unwrap_or(u64::MAX);
     CONTROL_INPUT_AGE_US.store(age_us(stamp_ns), Ordering::Relaxed);
-    trajectory_follower::follow(ks, accel)
+    trajectory_follower::follow(ks, &AccelWithCovarianceStamped::default())
 }
 
 /// MRM trigger source: the recorded trigger with `replay`, otherwise a dummy that fires

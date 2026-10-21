@@ -2,6 +2,9 @@
 //! approach of merging several sources into one). Everything runs at the source period;
 //! the LiDAR branch only does work every `LIDAR_DIVIDER`-th tick, and the EKF predicts by
 //! the source period instead of its own 20 ms timer.
+//!
+//! A node has at most five input topics, so the EKF odometry reaches the sink (for the UDP
+//! odometry export) through `LATEST_ODOMETRY` instead of a sixth sink input.
 
 use alloc::{borrow::Cow, sync::Arc, vec, vec::Vec};
 use awkernel_async_lib::dag::{create_dag, Dag};
@@ -20,6 +23,10 @@ use ndt_scan_matcher::PointCloud;
 use vehicle_velocity_converter::TwistWithCovarianceStamped;
 
 use crate::nodes;
+use crate::shared::Latest;
+
+/// `/localization/pose_twist_fusion_filter/kinematic_state` for the sink's odometry export.
+static LATEST_ODOMETRY: Latest<EKFOdometry> = Latest::new();
 
 /// Source period: the IMU / vehicle status rate (33 ms in the RTNS node diagram).
 const PERIOD: Duration = Duration::from_millis(33);
@@ -144,7 +151,9 @@ pub async fn build() -> Vec<Arc<Dag>> {
         move |(pose, twist): (Option<PoseWithCovarianceStamped>, TwistWithCovarianceStamped)| -> (EKFOdometry,) {
             let poses: Vec<_> = pose.into_iter().collect();
             let mut twists = [twist];
-            (nodes::ekf_localizer(nodes::EkfDt::Fixed(period_sec), &poses, &mut twists),)
+            let odom = nodes::ekf_localizer(nodes::EkfDt::Fixed(period_sec), &poses, &mut twists);
+            LATEST_ODOMETRY.set(odom.clone());
+            (odom,)
         },
         vec![
             Cow::from("/main/localization/pose_with_covariance"),
@@ -164,26 +173,21 @@ pub async fn build() -> Vec<Arc<Dag>> {
     )
     .await;
 
-    dag.register_reactor::<_, (TwistWithCovarianceStamped,), (AccelWithCovarianceStamped,)>(
+    dag.register_reactor::<_, (KinematicState,), (AccelWithCovarianceStamped,)>(
         "twist2accel".into(),
-        |(twist,): (TwistWithCovarianceStamped,)| -> (AccelWithCovarianceStamped,) {
-            (nodes::twist2accel(&twist),)
+        |(ks,): (KinematicState,)| -> (AccelWithCovarianceStamped,) {
+            (nodes::twist2accel(&ks),)
         },
-        vec![Cow::from("/localization/twist_estimator/twist_with_covariance")],
+        vec![Cow::from("/localization/kinematic_state")],
         vec![Cow::from("/localization/acceleration")],
         SchedulerType::GEDF(5),
     )
     .await;
 
-    dag.register_reactor::<_, (KinematicState, AccelWithCovarianceStamped), (Control,)>(
+    dag.register_reactor::<_, (KinematicState,), (Control,)>(
         "trajectory_follower".into(),
-        |(ks, accel): (KinematicState, AccelWithCovarianceStamped)| -> (Control,) {
-            (nodes::trajectory_follower(&ks, &accel),)
-        },
-        vec![
-            Cow::from("/localization/kinematic_state"),
-            Cow::from("/localization/acceleration"),
-        ],
+        |(ks,): (KinematicState,)| -> (Control,) { (nodes::trajectory_follower(&ks),) },
+        vec![Cow::from("/localization/kinematic_state")],
         vec![Cow::from("/control/trajectory_follower/control_cmd")],
         SchedulerType::GEDF(5),
     )
@@ -272,23 +276,26 @@ pub async fn build() -> Vec<Arc<Dag>> {
         GearCommand,
         HazardLightsCommand,
         TurnIndicatorsCommand,
-        EKFOdometry,
+        AccelWithCovarianceStamped,
     )>(
         "vehicle_cmd_sink".into(),
-        |(control, gear, hazard_lights, turn_indicators, odom): (
+        // `/localization/acceleration` has no consumer in this pipeline (the follower does not
+        // use it); it ends here, as an unsubscribed topic does upstream.
+        |(control, gear, hazard_lights, turn_indicators, _accel): (
             Control,
             GearCommand,
             HazardLightsCommand,
             TurnIndicatorsCommand,
-            EKFOdometry,
+            AccelWithCovarianceStamped,
         )| {
+            let odom = LATEST_ODOMETRY.get();
             nodes::vehicle_cmd_sink(
                 "single",
                 &control,
                 &gear,
                 &hazard_lights,
                 &turn_indicators,
-                Some(&odom),
+                odom.as_ref(),
                 None,
             );
         },
@@ -297,7 +304,7 @@ pub async fn build() -> Vec<Arc<Dag>> {
             Cow::from("/control/command/gear_cmd"),
             Cow::from("/control/command/hazard_lights_cmd"),
             Cow::from("/control/command/turn_indicators_cmd"),
-            Cow::from("/localization/pose_twist_fusion_filter/kinematic_state"),
+            Cow::from("/localization/acceleration"),
         ],
         SchedulerType::GEDF(5),
         PERIOD,

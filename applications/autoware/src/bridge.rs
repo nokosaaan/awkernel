@@ -8,7 +8,6 @@
 use core::time::Duration;
 use ekf_localizer::EKFOdometry;
 use localization_types::{Header, Instant, KinematicState, PoseWithCovariance, TwistWithCovariance};
-use vehicle_velocity_converter::TwistWithCovarianceStamped;
 
 pub fn ns_to_instant(ns: u64) -> Instant {
     Instant::zero() + Duration::from_nanos(ns)
@@ -73,10 +72,4 @@ pub fn odometry_to_kinematic_state(odom: &EKFOdometry) -> KinematicState {
         twist: twist(&odom.twist),
         accel: Default::default(),
     }
-}
-
-/// `/localization/twist_estimator/twist_with_covariance` -> the `(header, twist)` pair that
-/// `twist2accel::on_twist` takes.
-pub fn twist_to_localization(msg: &TwistWithCovarianceStamped) -> (Header, TwistWithCovariance) {
-    (header(&msg.header), twist(&msg.twist))
 }

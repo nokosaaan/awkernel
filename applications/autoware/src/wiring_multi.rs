@@ -4,10 +4,13 @@
 //!
 //! | DAG | period | source | nodes | sink -> shared |
 //! |---|---|---|---|---|
-//! | twist estimator | 33 ms | sensor start | imu_driver, vehicle_velocity_converter, imu_corrector, gyro_odometer, twist2accel | twist queue, latest accel |
-//! | pose estimator | 100 ms | pointcloud_dummy_generator | ndt_scan_matcher | pose queue |
-//! | localization | 20 ms | ekf_localizer (its own timer) | stop_filter | latest kinematic state / odometry |
+//! | twist estimator | 33 ms | sensor start | imu_driver, vehicle_velocity_converter, imu_corrector, gyro_odometer | twist queue |
+//! | pose estimator | 100 ms | pointcloud_dummy_generator (or pose_input) | ndt_scan_matcher | pose queue |
+//! | localization | 20 ms | ekf_localizer (its own timer) | stop_filter, twist2accel | latest kinematic state / odometry / accel |
 //! | control | 30 ms | trajectory_follower (its own timer) | constant_jerk_deceleration_controller, control_command_gate | UDP export |
+//!
+//! twist2accel follows stop_filter because it differentiates `/localization/kinematic_state`
+//! (`use_odom: true`); upstream it is a callback on that topic, i.e. at the EKF rate.
 
 use alloc::{borrow::Cow, sync::Arc, vec, vec::Vec};
 use awkernel_async_lib::dag::{create_dag, Dag};
@@ -40,6 +43,7 @@ const MEASUREMENT_QUEUE: usize = 8;
 
 static TWIST_QUEUE: Queue<TwistWithCovarianceStamped, MEASUREMENT_QUEUE> = Queue::new();
 static POSE_QUEUE: Queue<PoseWithCovarianceStamped, MEASUREMENT_QUEUE> = Queue::new();
+/// `/localization/acceleration`: no consumer in this pipeline (the follower does not use it).
 static LATEST_ACCEL: Latest<AccelWithCovarianceStamped> = Latest::new();
 static LATEST_KINEMATIC_STATE: Latest<KinematicState> = Latest::new();
 static LATEST_ODOMETRY: Latest<EKFOdometry> = Latest::new();
@@ -113,27 +117,12 @@ async fn twist_estimator_dag() -> Arc<Dag> {
     )
     .await;
 
-    dag.register_reactor::<_, (TwistWithCovarianceStamped,), (AccelWithCovarianceStamped,)>(
-        "twist2accel".into(),
-        |(twist,): (TwistWithCovarianceStamped,)| -> (AccelWithCovarianceStamped,) {
-            (nodes::twist2accel(&twist),)
+    dag.register_sink_reactor::<_, (TwistWithCovarianceStamped,)>(
+        "twist_sink".into(),
+        |(twist,): (TwistWithCovarianceStamped,)| {
+            TWIST_QUEUE.push(twist);
         },
         vec![Cow::from("/localization/twist_estimator/twist_with_covariance")],
-        vec![Cow::from("/localization/acceleration")],
-        SchedulerType::GEDF(5),
-    )
-    .await;
-
-    dag.register_sink_reactor::<_, (TwistWithCovarianceStamped, AccelWithCovarianceStamped)>(
-        "twist_sink".into(),
-        |(twist, accel): (TwistWithCovarianceStamped, AccelWithCovarianceStamped)| {
-            TWIST_QUEUE.push(twist);
-            LATEST_ACCEL.set(accel);
-        },
-        vec![
-            Cow::from("/localization/twist_estimator/twist_with_covariance"),
-            Cow::from("/localization/acceleration"),
-        ],
         SchedulerType::GEDF(5),
         TWIST_PERIOD,
     )
@@ -237,15 +226,28 @@ async fn localization_dag() -> Arc<Dag> {
     )
     .await;
 
-    dag.register_sink_reactor::<_, (KinematicState, EKFOdometry)>(
+    dag.register_reactor::<_, (KinematicState,), (AccelWithCovarianceStamped,)>(
+        "twist2accel".into(),
+        |(ks,): (KinematicState,)| -> (AccelWithCovarianceStamped,) {
+            (nodes::twist2accel(&ks),)
+        },
+        vec![Cow::from("/localization/kinematic_state")],
+        vec![Cow::from("/localization/acceleration")],
+        SchedulerType::GEDF(5),
+    )
+    .await;
+
+    dag.register_sink_reactor::<_, (KinematicState, EKFOdometry, AccelWithCovarianceStamped)>(
         "kinematic_sink".into(),
-        |(ks, odom): (KinematicState, EKFOdometry)| {
+        |(ks, odom, accel): (KinematicState, EKFOdometry, AccelWithCovarianceStamped)| {
             LATEST_KINEMATIC_STATE.set(ks);
             LATEST_ODOMETRY.set(odom);
+            LATEST_ACCEL.set(accel);
         },
         vec![
             Cow::from("/localization/kinematic_state"),
             Cow::from("/localization/pose_twist_fusion_filter/kinematic_state"),
+            Cow::from("/localization/acceleration"),
         ],
         SchedulerType::GEDF(5),
         EKF_PERIOD,
@@ -263,12 +265,9 @@ async fn control_dag() -> Arc<Dag> {
     dag.register_periodic_reactor::<_, (Option<Control>,)>(
         "trajectory_follower".into(),
         || -> (Option<Control>,) {
-            let control = LATEST_KINEMATIC_STATE.get().map(|ks| {
-                // `follow` does not use the acceleration yet (see its doc comment), so a
-                // missing one only matters for API completeness.
-                let accel = LATEST_ACCEL.get().unwrap_or_default();
-                nodes::trajectory_follower(&ks, &accel)
-            });
+            let control = LATEST_KINEMATIC_STATE
+                .get()
+                .map(|ks| nodes::trajectory_follower(&ks));
             (control,)
         },
         vec![Cow::from("/control/trajectory_follower/control_cmd")],
