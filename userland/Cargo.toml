@@ -97,6 +97,8 @@ autoware = ["dep:autoware"]
 autoware_dag_multi = ["autoware", "autoware/dag_multi"]
 # Autoware replaying recorded CSVs (open-loop AWSIM comparison).
 autoware_replay = ["autoware", "autoware/replay"]
+# Autoware fed live from AWSIM over UDP (closed-loop AWSIM comparison).
+autoware_live = ["autoware", "autoware/live"]
 
 # Test applications
 test_network = ["dep:test_network"]

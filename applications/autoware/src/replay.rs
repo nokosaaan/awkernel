@@ -9,22 +9,28 @@
 //! | `POSE_CSV_PATH` | `timestamp_sec,timestamp_nanosec,x,y,z,qx,qy,qz,qw,cov_0..cov_35` (Main ECU NDT output) |
 //! | `TRAJECTORY_CSV_PATH` | `x,y,z,qx,qy,qz,qw,longitudinal_velocity_mps` (the fixed route) |
 //! | `MRM_TRIGGER_CSV_PATH` | `timestamp_sec,timestamp_nanosec,trigger,target_acceleration,target_jerk` |
+//! | `GATE_CSV_PATH` (optional) | `timestamp_sec,timestamp_nanosec,engaged,paused` |
 //!
 //! Timeline: bag time `t0` (the earliest IMU / velocity / pose stamp) is mapped to the DAG start
 //! on the Awkernel clock. A row becomes due once `stamp - t0` has elapsed, and its header stamp is
 //! that mapped time, so message ages and duplicate detection behave as on the original topics.
+//!
+//! The same API is provided by `live` (closed loop); `nodes` only calls it through `crate::input`.
 
 use alloc::vec::Vec;
 use awkernel_lib::sync::mutex::{MCSNode, Mutex};
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use ekf_localizer::{Point3D, Pose, PoseWithCovariance, PoseWithCovarianceStamped, Quaternion};
-use localization_types::{ConstantJerkDecelerationTrigger, Instant, TrajectoryPoint};
+use ekf_localizer::{Pose, PoseWithCovariance, PoseWithCovarianceStamped};
+use imu_driver::ImuCsvRow;
+use localization_types::{ConstantJerkDecelerationTrigger, Instant};
+use vehicle_velocity_converter::VelocityCsvRow;
 
+use crate::awsim_rows::{gate_row, load_trajectory, pose_row, trigger_row};
+use crate::nodes::GateInput;
 use crate::{
-    bridge, get_awkernel_uptime_timestamp, parse_csv_records, parse_f64, parse_timestamp,
-    IMU_CSV_DATA, MRM_TRIGGER_CSV_DATA_STR, POSE_CSV_DATA_STR, TRAJECTORY_CSV_DATA_STR,
-    VELOCITY_CSV_DATA,
+    bridge, get_awkernel_uptime_timestamp, parse_csv_records, GATE_CSV_DATA_STR, IMU_CSV_DATA,
+    MRM_TRIGGER_CSV_DATA_STR, POSE_CSV_DATA_STR, TRAJECTORY_CSV_DATA_STR, VELOCITY_CSV_DATA,
 };
 
 #[derive(Clone)]
@@ -42,38 +48,67 @@ struct TriggerRow {
     target_jerk: f32,
 }
 
+#[derive(Clone, Copy)]
+struct GateRow {
+    stamp_ns: u64,
+    state: GateInput,
+}
+
 static POSES: Mutex<Vec<PoseRow>> = Mutex::new(Vec::new());
 static TRIGGERS: Mutex<Vec<TriggerRow>> = Mutex::new(Vec::new());
+static GATE_EVENTS: Mutex<Vec<GateRow>> = Mutex::new(Vec::new());
 
 /// Bag time of the first sample, and the Awkernel uptime the replay started at.
 static BAG_T0_NS: AtomicU64 = AtomicU64::new(0);
 static START_UPTIME_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Read cursors: index of the next not-yet-due row of each stream.
-pub(crate) static IMU_CURSOR: Mutex<usize> = Mutex::new(0);
-pub(crate) static VELOCITY_CURSOR: Mutex<usize> = Mutex::new(0);
+static IMU_CURSOR: Mutex<usize> = Mutex::new(0);
+static VELOCITY_CURSOR: Mutex<usize> = Mutex::new(0);
 static POSE_CURSOR: Mutex<usize> = Mutex::new(0);
 static TRIGGER_CURSOR: Mutex<usize> = Mutex::new(0);
+static GATE_CURSOR: Mutex<usize> = Mutex::new(0);
 
 /// Parse the replay CSVs, set the followed trajectory, and fix the bag time origin.
 /// IMU / velocity rows are parsed by `initialize_csv_data` beforehand.
 pub fn load() -> Result<(), &'static str> {
-    let poses = parse_pose_csv(POSE_CSV_DATA_STR)?;
-    let triggers = parse_trigger_csv(MRM_TRIGGER_CSV_DATA_STR)?;
-    let trajectory = parse_trajectory_csv(TRAJECTORY_CSV_DATA_STR)?;
+    let mut poses = Vec::new();
+    parse_csv_records(POSE_CSV_DATA_STR, |f| {
+        let (stamp_ns, pose, covariance) = pose_row(f)?;
+        poses.push(PoseRow {
+            stamp_ns,
+            pose,
+            covariance,
+        });
+        Ok(())
+    })?;
+    let mut triggers = Vec::new();
+    parse_csv_records(MRM_TRIGGER_CSV_DATA_STR, |f| {
+        let (stamp_ns, trigger, target_acceleration, target_jerk) = trigger_row(f)?;
+        triggers.push(TriggerRow {
+            stamp_ns,
+            trigger,
+            target_acceleration,
+            target_jerk,
+        });
+        Ok(())
+    })?;
+    let mut gate = Vec::new();
+    parse_csv_records(GATE_CSV_DATA_STR, |f| {
+        let (stamp_ns, state) = gate_row(f)?;
+        gate.push(GateRow { stamp_ns, state });
+        Ok(())
+    })?;
+    let trajectory = load_trajectory(TRAJECTORY_CSV_DATA_STR)?;
     log::info!(
-        "replay: {} poses, {} trigger rows, {} trajectory points",
+        "replay: {} poses, {} trigger rows, {} gate events, {} trajectory points",
         poses.len(),
         triggers.len(),
-        trajectory.len()
+        gate.len(),
+        trajectory
     );
-
-    if !trajectory.is_empty() && !trajectory_follower::set_trajectory(&trajectory) {
-        log::error!(
-            "replay: trajectory has {} points (max {}); keeping the built-in one",
-            trajectory.len(),
-            trajectory_follower::MAX_TRAJECTORY_POINTS
-        );
+    if gate.is_empty() {
+        log::warn!("replay: no gate events recorded; the gate is engaged from the start");
     }
 
     let first_imu = unsafe { IMU_CSV_DATA.as_ref() }.and_then(|v| v.first().map(|r| r.timestamp));
@@ -91,6 +126,8 @@ pub fn load() -> Result<(), &'static str> {
     *POSES.lock(&mut node) = poses;
     let mut node = MCSNode::new();
     *TRIGGERS.lock(&mut node) = triggers;
+    let mut node = MCSNode::new();
+    *GATE_EVENTS.lock(&mut node) = gate;
     Ok(())
 }
 
@@ -112,7 +149,7 @@ pub fn to_uptime(stamp_ns: u64) -> u64 {
 
 /// Advance `cursor` past every due row; return the latest due row's index and whether it was
 /// newly reached on this call. `None` before the first row is due.
-pub(crate) fn latest_due<T>(
+fn latest_due<T>(
     rows: &[T],
     cursor: &Mutex<usize>,
     stamp_ns: impl Fn(&T) -> u64,
@@ -129,6 +166,22 @@ pub(crate) fn latest_due<T>(
         *next += 1;
     }
     next.checked_sub(1).map(|idx| (idx, *next != before))
+}
+
+/// The newest due IMU row and its replay stamp (the first row before any is due).
+pub fn imu() -> Option<(ImuCsvRow, u64)> {
+    let csv = unsafe { IMU_CSV_DATA.as_ref() }?;
+    let (idx, _) = latest_due(csv, &IMU_CURSOR, |r| r.timestamp).unwrap_or((0, false));
+    csv.get(idx)
+        .map(|row| (row.clone(), to_uptime(row.timestamp)))
+}
+
+/// The newest due velocity row and its replay stamp.
+pub fn velocity() -> Option<(VelocityCsvRow, u64)> {
+    let csv = unsafe { VELOCITY_CSV_DATA.as_ref() }?;
+    let (idx, _) = latest_due(csv, &VELOCITY_CURSOR, |r| r.timestamp).unwrap_or((0, false));
+    csv.get(idx)
+        .map(|row| (row.clone(), to_uptime(row.timestamp)))
 }
 
 /// The newest pose that became due since the previous call (`/localization/pose_estimator/
@@ -173,86 +226,27 @@ pub fn trigger_state() -> ConstantJerkDecelerationTrigger {
     }
 }
 
+/// The recorded gate state (source selection, ADAPI pause) at the current replay time. Before
+/// the first event the gate holds its builtin source; without any events (bags recorded before
+/// they were), it is engaged from the start as in the earlier replays.
+pub fn gate_state() -> GateInput {
+    let mut node = MCSNode::new();
+    let events = GATE_EVENTS.lock(&mut node);
+    if events.is_empty() {
+        return GateInput {
+            engaged: true,
+            paused: false,
+        };
+    }
+    latest_due(&events, &GATE_CURSOR, |r| r.stamp_ns)
+        .and_then(|(idx, _)| events.get(idx).map(|r| r.state))
+        .unwrap_or_default()
+}
+
 /// Whether every replay stream has run out (logged once by the caller).
 pub fn finished() -> bool {
     let imu_len = unsafe { IMU_CSV_DATA.as_ref() }.map_or(0, Vec::len);
     let mut node = MCSNode::new();
     let imu_next = *IMU_CURSOR.lock(&mut node);
     imu_next >= imu_len
-}
-
-// ---------------------------------------------------------------------------
-// CSV parsing
-// ---------------------------------------------------------------------------
-
-fn field<'a>(fields: &[&'a str], i: usize) -> Result<&'a str, &'static str> {
-    fields
-        .get(i)
-        .copied()
-        .ok_or("replay CSV has too few columns")
-}
-
-fn f64_at(fields: &[&str], i: usize) -> Result<f64, &'static str> {
-    parse_f64(field(fields, i)?)
-}
-
-fn parse_pose_csv(csv: &str) -> Result<Vec<PoseRow>, &'static str> {
-    let mut rows = Vec::new();
-    parse_csv_records(csv, |f| {
-        let mut covariance = [0.0; 36];
-        for (i, c) in covariance.iter_mut().enumerate() {
-            *c = f64_at(f, 9 + i)?;
-        }
-        rows.push(PoseRow {
-            stamp_ns: parse_timestamp(field(f, 0)?, field(f, 1)?)?,
-            pose: Pose {
-                position: Point3D {
-                    x: f64_at(f, 2)?,
-                    y: f64_at(f, 3)?,
-                    z: f64_at(f, 4)?,
-                },
-                orientation: Quaternion {
-                    x: f64_at(f, 5)?,
-                    y: f64_at(f, 6)?,
-                    z: f64_at(f, 7)?,
-                    w: f64_at(f, 8)?,
-                },
-            },
-            covariance,
-        });
-        Ok(())
-    })?;
-    Ok(rows)
-}
-
-fn parse_trigger_csv(csv: &str) -> Result<Vec<TriggerRow>, &'static str> {
-    let mut rows = Vec::new();
-    parse_csv_records(csv, |f| {
-        rows.push(TriggerRow {
-            stamp_ns: parse_timestamp(field(f, 0)?, field(f, 1)?)?,
-            trigger: f64_at(f, 2)? != 0.0,
-            target_acceleration: f64_at(f, 3)? as f32,
-            target_jerk: f64_at(f, 4)? as f32,
-        });
-        Ok(())
-    })?;
-    Ok(rows)
-}
-
-fn parse_trajectory_csv(csv: &str) -> Result<Vec<TrajectoryPoint>, &'static str> {
-    let mut points = Vec::new();
-    parse_csv_records(csv, |f| {
-        points.push(TrajectoryPoint::new(
-            f64_at(f, 0)?,
-            f64_at(f, 1)?,
-            f64_at(f, 2)?,
-            f64_at(f, 6)?, // qw
-            f64_at(f, 3)?, // qx
-            f64_at(f, 4)?, // qy
-            f64_at(f, 5)?, // qz
-            f64_at(f, 7)?,
-        ));
-        Ok(())
-    })?;
-    Ok(points)
 }

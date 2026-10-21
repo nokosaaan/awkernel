@@ -18,7 +18,7 @@ use localization_types::{
     AccelWithCovarianceStamped, ConstantJerkDecelerationTrigger, Control, GearCommand,
     HazardLightsCommand, KinematicState, TurnIndicatorsCommand,
 };
-#[cfg(not(feature = "replay"))]
+#[cfg(not(awsim_input))]
 use ndt_scan_matcher::PointCloud;
 use vehicle_velocity_converter::TwistWithCovarianceStamped;
 
@@ -31,7 +31,7 @@ static LATEST_ODOMETRY: Latest<EKFOdometry> = Latest::new();
 /// Source period: the IMU / vehicle status rate (33 ms in the RTNS node diagram).
 const PERIOD: Duration = Duration::from_millis(33);
 /// LiDAR runs at 100 ms, i.e. every third 33 ms tick.
-#[cfg(not(feature = "replay"))]
+#[cfg(not(awsim_input))]
 const LIDAR_DIVIDER: u32 = 3;
 
 pub async fn build() -> Vec<Arc<Dag>> {
@@ -98,8 +98,8 @@ pub async fn build() -> Vec<Arc<Dag>> {
     )
     .await;
 
-    // Pose estimator: synthetic LiDAR + NDT, or the recorded Main ECU pose with `replay`.
-    #[cfg(not(feature = "replay"))]
+    // Pose estimator: synthetic LiDAR + NDT, or the Main ECU pose from AWSIM (recorded / live).
+    #[cfg(not(awsim_input))]
     {
         dag.register_reactor::<_, (u32,), (Option<PointCloud>,)>(
             "pointcloud_dummy_generator".into(),
@@ -125,10 +125,10 @@ pub async fn build() -> Vec<Arc<Dag>> {
         )
         .await;
     }
-    #[cfg(feature = "replay")]
+    #[cfg(awsim_input)]
     dag.register_reactor::<_, (u32,), (Option<PoseWithCovarianceStamped>,)>(
-        "pose_replay".into(),
-        |(_tick,): (u32,)| -> (Option<PoseWithCovarianceStamped>,) { (nodes::pose_replay(),) },
+        "pose_input".into(),
+        |(_tick,): (u32,)| -> (Option<PoseWithCovarianceStamped>,) { (nodes::pose_input(),) },
         vec![Cow::from("start_lidar")],
         vec![Cow::from("/localization/pose_estimator/pose_with_covariance")],
         SchedulerType::GEDF(5),
@@ -247,12 +247,7 @@ pub async fn build() -> Vec<Arc<Dag>> {
             TurnIndicatorsCommand,
             KinematicState,
         )| -> (Control, GearCommand, HazardLightsCommand, TurnIndicatorsCommand) {
-            (
-                nodes::control_command_gate(&control, &ks),
-                gear,
-                hazard_lights,
-                turn_indicators,
-            )
+            nodes::control_command_gate(Some((control, gear, hazard_lights, turn_indicators)), &ks)
         },
         vec![
             Cow::from("/control/control_command_gate/inputs/in_lane_stop/control"),

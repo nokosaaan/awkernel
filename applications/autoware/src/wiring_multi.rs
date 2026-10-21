@@ -24,11 +24,11 @@ use localization_types::{
     AccelWithCovarianceStamped, Control, GearCommand, HazardLightsCommand, KinematicState,
     TurnIndicatorsCommand,
 };
-#[cfg(not(feature = "replay"))]
+#[cfg(not(awsim_input))]
 use ndt_scan_matcher::PointCloud;
 use vehicle_velocity_converter::TwistWithCovarianceStamped;
 
-use crate::nodes;
+use crate::nodes::{self, Commands};
 use crate::shared::{Latest, Queue};
 
 const TWIST_PERIOD: Duration = Duration::from_millis(33);
@@ -48,12 +48,22 @@ static LATEST_ACCEL: Latest<AccelWithCovarianceStamped> = Latest::new();
 static LATEST_KINEMATIC_STATE: Latest<KinematicState> = Latest::new();
 static LATEST_ODOMETRY: Latest<EKFOdometry> = Latest::new();
 
-type Commands = (
+/// Commands of one control period; `None` when the topic was not published this period.
+type MaybeCommands = (
     Option<Control>,
     Option<GearCommand>,
     Option<HazardLightsCommand>,
     Option<TurnIndicatorsCommand>,
 );
+
+fn some_commands((control, gear, hazard_lights, turn_indicators): Commands) -> MaybeCommands {
+    (
+        Some(control),
+        Some(gear),
+        Some(hazard_lights),
+        Some(turn_indicators),
+    )
+}
 
 pub async fn build() -> Vec<Arc<Dag>> {
     vec![
@@ -134,8 +144,8 @@ async fn twist_estimator_dag() -> Arc<Dag> {
 async fn pose_estimator_dag() -> Arc<Dag> {
     let dag = create_dag();
 
-    // Source: synthetic LiDAR (then NDT), or the recorded Main ECU pose with `replay`.
-    #[cfg(not(feature = "replay"))]
+    // Source: synthetic LiDAR (then NDT), or the Main ECU pose from AWSIM (recorded / live).
+    #[cfg(not(awsim_input))]
     {
         dag.register_periodic_reactor::<_, (PointCloud,)>(
             "pointcloud_dummy_generator".into(),
@@ -157,10 +167,10 @@ async fn pose_estimator_dag() -> Arc<Dag> {
         )
         .await;
     }
-    #[cfg(feature = "replay")]
+    #[cfg(awsim_input)]
     dag.register_periodic_reactor::<_, (Option<PoseWithCovarianceStamped>,)>(
-        "pose_replay".into(),
-        || -> (Option<PoseWithCovarianceStamped>,) { (nodes::pose_replay(),) },
+        "pose_input".into(),
+        || -> (Option<PoseWithCovarianceStamped>,) { (nodes::pose_input(),) },
         vec![Cow::from("/localization/pose_estimator/pose_with_covariance")],
         SchedulerType::GEDF(5),
         POSE_PERIOD,
@@ -277,21 +287,16 @@ async fn control_dag() -> Arc<Dag> {
     .await;
 
     // The trigger is an event input upstream; here it is read inside the node (no extra source).
-    dag.register_reactor::<_, (Option<Control>,), Commands>(
+    dag.register_reactor::<_, (Option<Control>,), MaybeCommands>(
         "constant_jerk_deceleration_controller".into(),
-        |(control,): (Option<Control>,)| -> Commands {
+        |(control,): (Option<Control>,)| -> MaybeCommands {
             match control {
                 Some(control) => {
                     let out = nodes::constant_jerk_deceleration_controller(
                         &control,
                         &nodes::mrm_trigger(),
                     );
-                    (
-                        Some(out.control),
-                        Some(out.gear),
-                        Some(out.hazard_lights),
-                        Some(out.turn_indicators),
-                    )
+                    some_commands((out.control, out.gear, out.hazard_lights, out.turn_indicators))
                 }
                 None => (None, None, None, None),
             }
@@ -307,14 +312,17 @@ async fn control_dag() -> Arc<Dag> {
     )
     .await;
 
-    dag.register_reactor::<_, Commands, Commands>(
+    // Without a "main" command this period the gate outputs its builtin source, as upstream
+    // where the builtin source is selected until "main" is.
+    dag.register_reactor::<_, MaybeCommands, MaybeCommands>(
         "control_command_gate".into(),
-        |(control, gear, hazard_lights, turn_indicators): Commands| -> Commands {
-            let control = match (control, LATEST_KINEMATIC_STATE.get()) {
-                (Some(c), Some(ks)) => Some(nodes::control_command_gate(&c, &ks)),
-                (c, _) => c,
+        |(control, gear, hazard_lights, turn_indicators): MaybeCommands| -> MaybeCommands {
+            let main = match (control, gear, hazard_lights, turn_indicators) {
+                (Some(c), Some(g), Some(h), Some(t)) => Some((c, g, h, t)),
+                _ => None,
             };
-            (control, gear, hazard_lights, turn_indicators)
+            let ks = LATEST_KINEMATIC_STATE.get().unwrap_or_default();
+            some_commands(nodes::control_command_gate(main, &ks))
         },
         vec![
             Cow::from("/control/control_command_gate/inputs/in_lane_stop/control"),
@@ -332,9 +340,9 @@ async fn control_dag() -> Arc<Dag> {
     )
     .await;
 
-    dag.register_sink_reactor::<_, Commands>(
+    dag.register_sink_reactor::<_, MaybeCommands>(
         "vehicle_cmd_sink".into(),
-        |(control, gear, hazard_lights, turn_indicators): Commands| {
+        |(control, gear, hazard_lights, turn_indicators): MaybeCommands| {
             if let (Some(c), Some(g), Some(h), Some(t)) =
                 (control, gear, hazard_lights, turn_indicators)
             {

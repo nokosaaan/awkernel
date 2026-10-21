@@ -2,11 +2,22 @@
 #![allow(static_mut_refs)]
 extern crate alloc;
 
+#[cfg(awsim_input)]
+mod awsim_rows;
 mod bridge;
+#[cfg(feature = "live")]
+mod live;
 mod nodes;
 #[cfg(feature = "replay")]
 mod replay;
 mod shared;
+
+/// AWSIM inputs: recorded (`replay`, open loop) or received from the host (`live`, closed loop).
+/// Both modules provide the same API.
+#[cfg(feature = "live")]
+pub(crate) use live as input;
+#[cfg(feature = "replay")]
+pub(crate) use replay as input;
 #[cfg(not(feature = "dag_multi"))]
 mod wiring_single;
 #[cfg(feature = "dag_multi")]
@@ -64,8 +75,8 @@ pub async fn run() {
     if let Err(e) = initialize_csv_data() {
         log::warn!("Failed to initialize CSV data: {}", e);
     }
-    #[cfg(feature = "replay")]
-    if let Err(e) = replay::load() {
+    #[cfg(awsim_input)]
+    if let Err(e) = input::load() {
         log::error!("{}", e);
     }
 
@@ -87,6 +98,8 @@ pub async fn run() {
 
     log::info!("Starting periodic UDP sender task");
     start_periodic_udp_sender().await;
+    #[cfg(feature = "live")]
+    live::start_receiver().await;
 
     nodes::configure_nodes();
 
@@ -135,58 +148,59 @@ fn initialize_csv_data() -> Result<(), &'static str> {
 
 fn parse_imu_csv(csv: &str) -> Result<Vec<ImuCsvRow>, &'static str> {
     let mut rows = Vec::new();
-
     parse_csv_records(csv, |fields| {
-        if fields.len() < 12 {
-            return Err("IMU CSV has insufficient columns");
-        }
-
-        let timestamp = parse_timestamp(fields[0], fields[1])?;
-        let angular_velocity = common_types::Vector3::new(
-            parse_f64(fields[6])?,
-            parse_f64(fields[7])?,
-            parse_f64(fields[8])?,
-        );
-        let linear_acceleration = common_types::Vector3::new(
-            parse_f64(fields[9])?,
-            parse_f64(fields[10])?,
-            parse_f64(fields[11])?,
-        );
-
-        rows.push(ImuCsvRow {
-            timestamp,
-            angular_velocity,
-            linear_acceleration,
-        });
+        rows.push(imu_row(fields)?);
         Ok(())
     })?;
-
     Ok(rows)
+}
+
+/// One `imu_raw.csv` record (also the `imu` rows of `live`).
+pub(crate) fn imu_row(fields: &[&str]) -> Result<ImuCsvRow, &'static str> {
+    if fields.len() < 12 {
+        return Err("IMU CSV has insufficient columns");
+    }
+
+    let timestamp = parse_timestamp(fields[0], fields[1])?;
+    let angular_velocity = common_types::Vector3::new(
+        parse_f64(fields[6])?,
+        parse_f64(fields[7])?,
+        parse_f64(fields[8])?,
+    );
+    let linear_acceleration = common_types::Vector3::new(
+        parse_f64(fields[9])?,
+        parse_f64(fields[10])?,
+        parse_f64(fields[11])?,
+    );
+
+    Ok(ImuCsvRow {
+        timestamp,
+        angular_velocity,
+        linear_acceleration,
+    })
 }
 
 fn parse_velocity_csv(csv: &str) -> Result<Vec<VelocityCsvRow>, &'static str> {
     let mut rows = Vec::new();
-
     parse_csv_records(csv, |fields| {
-        if fields.len() < 5 {
-            return Err("Velocity CSV has insufficient columns");
-        }
-
-        let timestamp = parse_timestamp(fields[0], fields[1])?;
-        let longitudinal_velocity = parse_f64(fields[2])?;
-        let lateral_velocity = parse_f64(fields[3])?;
-        let heading_rate = parse_f64(fields[4])?;
-
-        rows.push(VelocityCsvRow {
-            timestamp,
-            longitudinal_velocity,
-            lateral_velocity,
-            heading_rate,
-        });
+        rows.push(velocity_row(fields)?);
         Ok(())
     })?;
-
     Ok(rows)
+}
+
+/// One `velocity_status.csv` record (also the `vel` rows of `live`).
+pub(crate) fn velocity_row(fields: &[&str]) -> Result<VelocityCsvRow, &'static str> {
+    if fields.len() < 5 {
+        return Err("Velocity CSV has insufficient columns");
+    }
+
+    Ok(VelocityCsvRow {
+        timestamp: parse_timestamp(fields[0], fields[1])?,
+        longitudinal_velocity: parse_f64(fields[2])?,
+        lateral_velocity: parse_f64(fields[3])?,
+        heading_rate: parse_f64(fields[4])?,
+    })
 }
 
 pub(crate) fn parse_csv_records<F>(csv: &str, mut on_record: F) -> Result<(), &'static str>

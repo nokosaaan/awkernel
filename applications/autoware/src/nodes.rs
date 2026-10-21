@@ -3,11 +3,11 @@
 //! compute.
 
 use alloc::{format, string::String, vec::Vec};
-#[cfg(not(feature = "replay"))]
+#[cfg(not(awsim_input))]
 use awkernel_lib::delay::wait_microsec;
 use awkernel_lib::sync::mutex::{MCSNode, Mutex};
 use awkernel_lib::time::Instant;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::time::Duration;
 
 use constant_jerk_deceleration_controller::ControllerOutput;
@@ -21,7 +21,7 @@ use localization_types::{
     AccelWithCovarianceStamped, ConstantJerkDecelerationTrigger, Control, GearCommand,
     HazardLightsCommand, KinematicState, TurnIndicatorsCommand,
 };
-#[cfg(not(feature = "replay"))]
+#[cfg(not(awsim_input))]
 use ndt_scan_matcher::{
     synthetic::World, NdtParams, NdtScanMatcher, PointCloud,
 };
@@ -32,10 +32,11 @@ use vehicle_velocity_converter::{
 };
 
 use crate::shared::Latest;
+#[cfg(not(awsim_input))]
+use crate::{IMU_CSV_DATA, VELOCITY_CSV_DATA};
 use crate::{
     bridge, get_awkernel_uptime_timestamp, publish_command_json, publish_odometry_json,
-    IMU_CSV_COUNT, IMU_CSV_DATA,
-    LOG_ENABLE, VELOCITY_CSV_COUNT, VELOCITY_CSV_DATA,
+    IMU_CSV_COUNT, LOG_ENABLE, VELOCITY_CSV_COUNT,
 };
 
 // ---------------------------------------------------------------------------
@@ -43,7 +44,7 @@ use crate::{
 // ---------------------------------------------------------------------------
 
 /// pose_initializer stand-in: the `/initialpose` NDT starts from before the EKF has a pose.
-#[cfg(not(feature = "replay"))]
+#[cfg(not(awsim_input))]
 pub const INITIAL_POSE: PlanarPose = PlanarPose {
     x: 0.0,
     y: 0.0,
@@ -52,7 +53,7 @@ pub const INITIAL_POSE: PlanarPose = PlanarPose {
 
 /// Where the (simulated) vehicle really starts. Offset from `INITIAL_POSE` on purpose, so the
 /// first NDT alignment has an initial-pose error to correct.
-#[cfg(not(feature = "replay"))]
+#[cfg(not(awsim_input))]
 const GROUND_TRUTH_START: PlanarPose = PlanarPose {
     x: 0.5,
     y: -0.3,
@@ -60,25 +61,32 @@ const GROUND_TRUTH_START: PlanarPose = PlanarPose {
 };
 
 /// Synthetic LiDAR range and the downsampled cloud size handed to NDT.
-#[cfg(not(feature = "replay"))]
+#[cfg(not(awsim_input))]
 const LIDAR_RANGE_M: f64 = 30.0;
-#[cfg(not(feature = "replay"))]
+#[cfg(not(awsim_input))]
 const LIDAR_MAX_POINTS: usize = 1_500;
 
-/// MRM trigger stand-in (no `replay`): switch the in-lane stop on this long after the DAGs start.
-#[cfg(not(feature = "replay"))]
+/// MRM trigger stand-in (no AWSIM input): switch the in-lane stop on this long after the DAGs start.
+#[cfg(not(awsim_input))]
 const MRM_TRIGGER_AFTER: Duration = Duration::from_secs(10);
 /// `in_lane_moderate_stop` defaults of autoware_mrm_in_lane_stop_operator (#13332). The TIER IV
 /// Pilot.Auto.x2 In Lane Moderate Stop is described as a 0.3G stop.
-#[cfg(not(feature = "replay"))]
+#[cfg(not(awsim_input))]
 const MRM_TARGET_ACCELERATION: f32 = -2.5;
-#[cfg(not(feature = "replay"))]
+#[cfg(not(awsim_input))]
 const MRM_TARGET_JERK: f32 = -1.5;
 
 /// autoware_launch `stop_filter.param.yaml` (`vx_threshold`, `wz_threshold`); the crate defaults
 /// are 0.0 (the node's declare_parameter fallbacks), which never report a stop.
 const STOP_FILTER_VX_THRESHOLD: f64 = 0.1;
 const STOP_FILTER_WZ_THRESHOLD: f64 = 0.02;
+
+/// autoware_launch `control_command_gate.param.yaml`: `builtin_emergency_acceleration` and the
+/// ADAPI pause's `stop_hold_acceleration`.
+const BUILTIN_EMERGENCY_ACCELERATION: f64 = -2.4;
+const STOP_HOLD_ACCELERATION: f64 = -1.5;
+/// `AdapiPauseInterface::update`: a start is requested when the command moves the vehicle.
+const START_REQUEST_VELOCITY: f64 = 1e-3;
 
 /// One pipeline summary line per this interval.
 const PIPELINE_LOG_INTERVAL: Duration = Duration::from_secs(1);
@@ -90,7 +98,7 @@ const PIPELINE_LOG_INTERVAL: Duration = Duration::from_secs(1);
 /// Simulated ground truth, dead-reckoned from the same wheel-speed / yaw-rate data the twist
 /// estimator sees; the synthetic LiDAR observes the world from here.
 static GROUND_TRUTH: Mutex<Option<PlanarPose>> = Mutex::new(None);
-#[cfg(not(feature = "replay"))]
+#[cfg(not(awsim_input))]
 static SYNTHETIC_WORLD: Mutex<Option<World>> = Mutex::new(None);
 
 /// `/localization/pose_twist_fusion_filter/biased_pose_with_covariance`. NDT reads it as the
@@ -146,7 +154,7 @@ fn ekf_step(mode: EkfDt, now_ns: u64) -> (f64, bool) {
     }
 }
 
-#[cfg(not(feature = "replay"))]
+#[cfg(not(awsim_input))]
 static NDT: Mutex<Option<NdtScanMatcher>> = Mutex::new(None);
 static NDT_LAST_REPORT: Latest<AlignReport> = Latest::new();
 static NDT_PUBLISHED: AtomicU32 = AtomicU32::new(0);
@@ -172,9 +180,16 @@ static MRM_STARTED_AT: Mutex<Option<Instant>> = Mutex::new(None);
 static LAST_FUSED_TWIST_NS: AtomicU64 = AtomicU64::new(0);
 static LAST_FUSED_POSE_NS: AtomicU64 = AtomicU64::new(0);
 static COMMAND_SEQ: AtomicU32 = AtomicU32::new(0);
+/// control_command_gate state reported with each command: source "main" selected, ADAPI pause,
+/// and the start request derived from the selected command.
+static GATE_ENGAGED: AtomicBool = AtomicBool::new(false);
+static GATE_PAUSED: AtomicBool = AtomicBool::new(false);
+static GATE_START_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Steering of the previous gate output (the builtin source holds it).
+static GATE_PREV_STEER: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
 static LAST_PIPELINE_LOG: Mutex<Option<Instant>> = Mutex::new(None);
 
-#[cfg(not(feature = "replay"))]
+#[cfg(not(awsim_input))]
 fn elapsed_us(started: Instant) -> u32 {
     u32::try_from(started.elapsed().as_micros()).unwrap_or(u32::MAX)
 }
@@ -197,7 +212,7 @@ pub fn configure_nodes() {
     // Map loading happens before the pose estimator is activated upstream (pose_initializer
     // triggers NDT only once the map is in); doing it here keeps the first scan off the map
     // build, which would otherwise back up the whole DAG for several periods.
-    #[cfg(not(feature = "replay"))]
+    #[cfg(not(awsim_input))]
     {
     match NdtScanMatcher::new(NdtParams::default()) {
         Ok(mut ndt) => {
@@ -241,8 +256,8 @@ fn nominal_filter_params() -> Option<command_gate::FilterParams> {
 pub fn mark_dag_start() {
     let mut node = MCSNode::new();
     *DAG_START.lock(&mut node) = Some(Instant::now());
-    #[cfg(feature = "replay")]
-    crate::replay::start();
+    #[cfg(awsim_input)]
+    crate::input::start();
 }
 
 // ---------------------------------------------------------------------------
@@ -253,23 +268,19 @@ pub fn imu_driver() -> ImuMsg {
     let mut node = MCSNode::new();
     let mut count_guard = IMU_CSV_COUNT.lock(&mut node);
     let count = *count_guard;
-    let data = unsafe { IMU_CSV_DATA.as_ref() };
     let awkernel_timestamp = get_awkernel_uptime_timestamp();
 
-    // Replay: the newest due row, stamped on the replay timeline. Otherwise the next row.
-    #[cfg(feature = "replay")]
-    let picked = data.and_then(|csv| {
-        let (idx, _) = crate::replay::latest_due(csv, &crate::replay::IMU_CURSOR, |r| r.timestamp)
-            .unwrap_or((0, false));
-        csv.get(idx).map(|row| (row, crate::replay::to_uptime(row.timestamp)))
-    });
-    #[cfg(not(feature = "replay"))]
-    let picked = data
+    // AWSIM: the newest recorded (due) or received row, stamped on the Awkernel clock.
+    // Otherwise the next synthetic row.
+    #[cfg(awsim_input)]
+    let picked = crate::input::imu();
+    #[cfg(not(awsim_input))]
+    let picked = unsafe { IMU_CSV_DATA.as_ref() }
         .and_then(|csv| csv.get(count % csv.len().max(1)))
-        .map(|row| (row, awkernel_timestamp));
+        .map(|row| (row.clone(), awkernel_timestamp));
 
     let imu_msg = match picked {
-        Some((row, stamp)) => build_imu_msg_from_csv_row(row, "imu_link", stamp),
+        Some((row, stamp)) => build_imu_msg_from_csv_row(&row, "imu_link", stamp),
         None => {
             // Fallback: generate dummy IMU data when no CSV is embedded.
             let mut parser = TamagawaImuParser::new("imu_link");
@@ -280,8 +291,9 @@ pub fn imu_driver() -> ImuMsg {
         }
     };
 
-    *count_guard += 1;
-    #[cfg(not(feature = "replay"))]
+    // Saturating: the replay branch below parks the counter at usize::MAX to log the end once.
+    *count_guard = count_guard.saturating_add(1);
+    #[cfg(not(awsim_input))]
     if *count_guard >= 5700 {
         *count_guard = 0;
         log::info!("rust_e2e_app: finish csv for IMU");
@@ -289,8 +301,8 @@ pub fn imu_driver() -> ImuMsg {
             wait_microsec(1000);
         }
     }
-    #[cfg(feature = "replay")]
-    if crate::replay::finished() && *count_guard != usize::MAX {
+    #[cfg(awsim_input)]
+    if crate::input::finished() && *count_guard != usize::MAX {
         // Holds the last sample from here on; log the end once.
         *count_guard = usize::MAX;
         log::info!("replay: IMU data finished");
@@ -313,26 +325,20 @@ pub fn vehicle_velocity_converter(period_sec: f64) -> TwistWithCovarianceStamped
 
     let mut node = MCSNode::new();
     let mut count_guard = VELOCITY_CSV_COUNT.lock(&mut node);
-    #[cfg(not(feature = "replay"))]
+    #[cfg(not(awsim_input))]
     let count = *count_guard;
-    let data = unsafe { VELOCITY_CSV_DATA.as_ref() };
     let awkernel_timestamp = get_awkernel_uptime_timestamp();
 
-    #[cfg(feature = "replay")]
-    let picked = data.and_then(|csv| {
-        let (idx, _) =
-            crate::replay::latest_due(csv, &crate::replay::VELOCITY_CURSOR, |r| r.timestamp)
-                .unwrap_or((0, false));
-        csv.get(idx).map(|row| (row, crate::replay::to_uptime(row.timestamp)))
-    });
-    #[cfg(not(feature = "replay"))]
-    let picked = data
+    #[cfg(awsim_input)]
+    let picked = crate::input::velocity();
+    #[cfg(not(awsim_input))]
+    let picked = unsafe { VELOCITY_CSV_DATA.as_ref() }
         .and_then(|csv| csv.get(count % csv.len().max(1)))
-        .map(|row| (row, awkernel_timestamp));
+        .map(|row| (row.clone(), awkernel_timestamp));
 
     let twist_msg = match picked {
         Some((row, stamp)) => {
-            let report = build_velocity_report_from_csv_row(row, "base_link", stamp);
+            let report = build_velocity_report_from_csv_row(&row, "base_link", stamp);
             converter.convert_velocity_report(&report)
         }
         None => {
@@ -351,17 +357,17 @@ pub fn vehicle_velocity_converter(period_sec: f64) -> TwistWithCovarianceStamped
     };
 
     // Replay has no simulated truth (AWSIM's ground truth is recorded on the host side instead).
-    #[cfg(not(feature = "replay"))]
+    #[cfg(not(awsim_input))]
     advance_ground_truth(
         twist_msg.twist.twist.linear.x,
         twist_msg.twist.twist.angular.z,
         period_sec,
     );
-    #[cfg(feature = "replay")]
+    #[cfg(awsim_input)]
     let _ = period_sec; // only the synthetic truth integrates by the period
 
     *count_guard += 1;
-    #[cfg(not(feature = "replay"))]
+    #[cfg(not(awsim_input))]
     if *count_guard >= 5700 {
         *count_guard = 0;
         log::info!("rust_e2e_app: finish csv for Velocity");
@@ -380,7 +386,7 @@ pub fn vehicle_velocity_converter(period_sec: f64) -> TwistWithCovarianceStamped
     twist_msg
 }
 
-#[cfg(not(feature = "replay"))]
+#[cfg(not(awsim_input))]
 fn advance_ground_truth(vx: f64, wz: f64, dt: f64) {
     let mut node = MCSNode::new();
     let mut gt = GROUND_TRUTH.lock(&mut node);
@@ -394,8 +400,32 @@ fn advance_ground_truth(vx: f64, wz: f64, dt: f64) {
     });
 }
 
+/// Static TF base_link <- tamagawa/imu_link of AWSIM's sensor kit (what Autoware's imu_corrector
+/// looks up), composed from autoware_launch `awsim_sensor_kit_description/config/
+/// sensor_kit_calibration.yaml`: base_link -> sensor_kit_base_link rpy (-0.001, 0.015, -0.0364)
+/// and sensor_kit_base_link -> tamagawa/imu_link rpy (pi, 0, pi). The IMU's z axis points down,
+/// so without this the yaw rate has the wrong sign (dead reckoning turns the other way).
+#[cfg(awsim_input)]
+fn awsim_imu_to_base_link() -> Transform {
+    Transform {
+        translation: imu_driver::Vector3::new(0.0, 0.0, 0.0),
+        rotation: imu_driver::Quaternion {
+            x: 0.018_194_732,
+            y: 0.999_806_208,
+            z: -0.000_363_412,
+            w: -0.007_507_786,
+        },
+    }
+}
+
 pub fn imu_corrector(imu_msg: &ImuMsg) -> ImuWithCovariance {
-    ImuCorrector::new().correct_imu_with_covariance(imu_msg, None)
+    // Replay data is recorded from AWSIM in tamagawa/imu_link; the synthetic IMU is already
+    // generated in base_link.
+    #[cfg(awsim_input)]
+    let tf = Some(awsim_imu_to_base_link());
+    #[cfg(not(awsim_input))]
+    let tf = None;
+    ImuCorrector::new().correct_imu_with_covariance(imu_msg, tf.as_ref())
 }
 
 pub fn gyro_odometer(
@@ -435,7 +465,7 @@ pub fn twist2accel(ks: &KinematicState) -> AccelWithCovarianceStamped {
 // ---------------------------------------------------------------------------
 
 /// Synthetic downsampled LiDAR scan taken at the current ground truth.
-#[cfg(not(feature = "replay"))]
+#[cfg(not(awsim_input))]
 pub fn pointcloud_dummy_generator() -> PointCloud {
     let truth = {
         let mut node = MCSNode::new();
@@ -466,13 +496,13 @@ pub fn pointcloud_dummy_generator() -> PointCloud {
 /// Newest NDT result and the EKF pose of the same scan. The NDT plays the Main ECU, whose own
 /// EKF keeps fusing NDT during the MRM; the Sub ECU EKF here is dead reckoning by then and must
 /// not steer the reference.
-#[cfg(not(feature = "replay"))]
+#[cfg(not(awsim_input))]
 static NDT_GUESS_ANCHOR: Latest<(Pose, Pose)> = Latest::new();
 
 /// NDT initial guess. Normally the EKF biased pose, as upstream. While the relay is cut, the last
 /// NDT result moved by the EKF displacement since that scan (about one LiDAR period of odometry),
 /// which stands in for the Main ECU EKF that keeps fusing NDT.
-#[cfg(not(feature = "replay"))]
+#[cfg(not(awsim_input))]
 fn ndt_initial_guess(ekf_pose: Option<Pose>) -> Option<Pose> {
     let ekf_now = ekf_pose?;
     if !mrm_active() {
@@ -490,7 +520,7 @@ fn ndt_initial_guess(ekf_pose: Option<Pose>) -> Option<Pose> {
 
 /// One `callback_sensor_points`. `None` when the scan produced no pose (not converged / gated),
 /// which is "no message on the topic" upstream.
-#[cfg(not(feature = "replay"))]
+#[cfg(not(awsim_input))]
 pub fn ndt_scan_matcher(cloud: &PointCloud) -> Option<PoseWithCovarianceStamped> {
     let ekf_pose = EKF_BIASED_POSE.get();
     let initial_pose = ndt_initial_guess(ekf_pose).unwrap_or_else(|| {
@@ -679,13 +709,14 @@ pub fn trajectory_follower(ks: &KinematicState) -> Control {
     trajectory_follower::follow(ks, &AccelWithCovarianceStamped::default())
 }
 
-/// MRM trigger source: the recorded trigger with `replay`, otherwise a dummy that fires
+/// MRM trigger source: the recorded (`replay`) or received (`live`) trigger, otherwise a dummy
+/// that fires
 /// `MRM_TRIGGER_AFTER` after start (stands in for SubEcuInLaneModerateStopSwitcher /
 /// mrm_in_lane_stop_operator).
 pub fn mrm_trigger() -> ConstantJerkDecelerationTrigger {
-    #[cfg(feature = "replay")]
-    let trigger = crate::replay::trigger_state();
-    #[cfg(not(feature = "replay"))]
+    #[cfg(awsim_input)]
+    let trigger = crate::input::trigger_state();
+    #[cfg(not(awsim_input))]
     let trigger = {
         let started = {
             let mut node = MCSNode::new();
@@ -731,10 +762,11 @@ pub fn pose_relay(pose: Option<PoseWithCovarianceStamped>) -> Option<PoseWithCov
     pose
 }
 
-/// Replay pose source: the recorded Main ECU NDT output, in place of the synthetic LiDAR + NDT.
-#[cfg(feature = "replay")]
-pub fn pose_replay() -> Option<PoseWithCovarianceStamped> {
-    crate::replay::next_pose()
+/// AWSIM pose source: the Main ECU NDT output (recorded or received), in place of the synthetic
+/// LiDAR + NDT.
+#[cfg(awsim_input)]
+pub fn pose_input() -> Option<PoseWithCovarianceStamped> {
+    crate::input::next_pose()
 }
 
 /// Upstream has two independent callbacks; here both inputs arrive per period, and the trigger
@@ -747,10 +779,96 @@ pub fn constant_jerk_deceleration_controller(
     constant_jerk_deceleration_controller::on_control(control)
 }
 
-/// With a single command source the CommandSelector is a pass-through, so only the Control
-/// goes through the limit filter; gear / lights are forwarded as selected.
-pub fn control_command_gate(control: &Control, ks: &KinematicState) -> Control {
-    command_gate::filter(control, ks)
+/// The four `/control/command/*` messages of one period.
+pub type Commands = (Control, GearCommand, HazardLightsCommand, TurnIndicatorsCommand);
+
+/// External state of control_command_gate that is not a DAG input: whether the source "main"
+/// (the follower -> constant_jerk_deceleration_controller chain) is selected, and the ADAPI pause
+/// (`/control/vehicle_cmd_gate/set_pause`, driven by the ADAPI motion node).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GateInput {
+    pub engaged: bool,
+    pub paused: bool,
+}
+
+/// The gate state: recorded (`replay`) or received from the host (`live`). Without AWSIM input
+/// the synthetic scenario runs with "main" selected and no pause.
+fn gate_input() -> GateInput {
+    #[cfg(awsim_input)]
+    let input = crate::input::gate_state();
+    #[cfg(not(awsim_input))]
+    let input = GateInput {
+        engaged: true,
+        paused: false,
+    };
+    input
+}
+
+/// control_command_gate, in its upstream order: CommandSelector (the source "main" when it is
+/// selected and has a command, otherwise the builtin emergency source) -> Compatibility (ADAPI
+/// pause: stop hold) -> nominal filter. Upstream the builtin source runs on its own 10 Hz timer
+/// and resends gear / lights only on a source change; here it is evaluated every period.
+pub fn control_command_gate(main: Option<Commands>, ks: &KinematicState) -> Commands {
+    let gate = gate_input();
+    let (mut control, gear, hazard_lights, turn_indicators) = match main {
+        Some(commands) if gate.engaged => commands,
+        _ => builtin_emergency(),
+    };
+
+    // AdapiPauseInterface::update sees the selected command before the stop hold.
+    let start_requested = libm::fabs(control.longitudinal.velocity) > START_REQUEST_VELOCITY;
+    if gate.paused {
+        control.longitudinal.velocity = control.longitudinal.velocity.min(0.0);
+        control.longitudinal.acceleration =
+            control.longitudinal.acceleration.min(STOP_HOLD_ACCELERATION);
+    }
+    let control = command_gate::filter(&control, ks);
+
+    GATE_ENGAGED.store(gate.engaged, Ordering::Relaxed);
+    GATE_PAUSED.store(gate.paused, Ordering::Relaxed);
+    GATE_START_REQUESTED.store(start_requested, Ordering::Relaxed);
+    {
+        let mut node = MCSNode::new();
+        *GATE_PREV_STEER.lock(&mut node) = (
+            control.lateral.steering_tire_angle,
+            control.lateral.steering_tire_rotation_rate,
+        );
+    }
+    (control, gear, hazard_lights, turn_indicators)
+}
+
+/// `BuiltinEmergency::on_timer` / `resend_last_command`: stop at the builtin emergency
+/// deceleration holding the previous steering, keep the gear, hazard lights on.
+fn builtin_emergency() -> Commands {
+    let (steer, steer_rate) = {
+        let mut node = MCSNode::new();
+        let prev = *GATE_PREV_STEER.lock(&mut node);
+        prev
+    };
+    let now = Instant::now();
+    let mut control = Control::default();
+    control.stamp = now;
+    control.longitudinal.stamp = now;
+    control.lateral.stamp = now;
+    control.longitudinal.velocity = 0.0;
+    control.longitudinal.acceleration = BUILTIN_EMERGENCY_ACCELERATION;
+    control.lateral.steering_tire_angle = steer;
+    control.lateral.steering_tire_rotation_rate = steer_rate;
+    (
+        control,
+        GearCommand {
+            stamp: now,
+            command: GearCommand::NONE,
+        },
+        HazardLightsCommand {
+            stamp: now,
+            command: HazardLightsCommand::ENABLE,
+        },
+        TurnIndicatorsCommand {
+            stamp: now,
+            command: TurnIndicatorsCommand::DISABLE,
+        },
+    )
 }
 
 /// Vehicle interface stand-in: periodic summary log plus the EKF odometry JSON for UDP export.
@@ -791,10 +909,13 @@ fn command_json(
 ) -> String {
     let stamp_ns = |t: Instant| u64::try_from(t.uptime().as_nanos()).unwrap_or(u64::MAX);
     format!(
-        r#"{{"type":"command","seq":{},"stamp_ns":{},"mrm":{},"control":{{"velocity":{:.6},"acceleration":{:.6},"jerk":{:.6},"is_defined_acceleration":{},"is_defined_jerk":{},"steering_tire_angle":{:.6},"steering_tire_rotation_rate":{:.6},"is_defined_steering_tire_rotation_rate":{}}},"gear":{},"hazard_lights":{},"turn_indicators":{}}}"#,
+        r#"{{"type":"command","seq":{},"stamp_ns":{},"mrm":{},"engaged":{},"paused":{},"start_requested":{},"control":{{"velocity":{:.6},"acceleration":{:.6},"jerk":{:.6},"is_defined_acceleration":{},"is_defined_jerk":{},"steering_tire_angle":{:.6},"steering_tire_rotation_rate":{:.6},"is_defined_steering_tire_rotation_rate":{}}},"gear":{},"hazard_lights":{},"turn_indicators":{}}}"#,
         COMMAND_SEQ.fetch_add(1, Ordering::Relaxed),
         stamp_ns(control.stamp),
         mrm_active(),
+        GATE_ENGAGED.load(Ordering::Relaxed),
+        GATE_PAUSED.load(Ordering::Relaxed),
+        GATE_START_REQUESTED.load(Ordering::Relaxed),
         control.longitudinal.velocity,
         control.longitudinal.acceleration,
         control.longitudinal.jerk,
@@ -880,7 +1001,7 @@ fn log_pipeline(
         )
     });
     log::info!(
-        "[pipeline:{}] t={}ms truth=({:.3},{:.3},{:.4}) scan_us={} ndt(iter={},nvtl={:.3},conv={},pub={},skip={},us={}) ekf=({:.3},{:.3},{:.4}) err=({:.3},{:.3}) age_us(twist->ekf={},sensor->ctrl={}) cmd(v={:.3},a={:.3},j={:.3},steer={:.4}) gear={} hazard={} turn={} mrm={} mrm_s={:.2} relay_cut={} ref_err={:.3} drops(twist,pose)={:?}",
+        "[pipeline:{}] t={}ms truth=({:.3},{:.3},{:.4}) scan_us={} ndt(iter={},nvtl={:.3},conv={},pub={},skip={},us={}) ekf=({:.3},{:.3},{:.4}) err=({:.3},{:.3}) age_us(twist->ekf={},sensor->ctrl={}) cmd(v={:.3},a={:.3},j={:.3},steer={:.4}) gear={} hazard={} turn={} engaged={} paused={} mrm={} mrm_s={:.2} relay_cut={} ref_err={:.3} drops(twist,pose)={:?}",
         mode,
         get_awkernel_uptime_timestamp() / 1_000_000,
         tx,
@@ -907,6 +1028,8 @@ fn log_pipeline(
         gear.command,
         hazard_lights.command,
         turn_indicators.command,
+        GATE_ENGAGED.load(Ordering::Relaxed),
+        GATE_PAUSED.load(Ordering::Relaxed),
         mrm_active(),
         mrm_s,
         RELAY_CUT_POSES.load(Ordering::Relaxed),
