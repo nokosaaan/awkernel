@@ -5,9 +5,7 @@
 //! anchor every segment of job `k` at that job's own release `r_k`:
 //! segment `j` runs over `[r_k + offset_j, r_k + offset_j + d_j)`. This
 //! module records those `r_k` as they actually happen, so the planner
-//! (Step 4) can lay out the DP-Wrap plan for every job that is still alive,
-//! instead of [`super::dp_partition`]'s one-shot registration of the first
-//! job only.
+//! (Step 4) can lay out the DP-Wrap plan for every job that is still alive.
 //!
 //! # What a DAG registers
 //! At admission (boot, non-RT) the caller registers a [`DagTemplate`]: the

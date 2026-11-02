@@ -11,7 +11,7 @@
 //!   another DAG is running, marks the CPU dirty and sends IPI 255 to
 //!   itself. Only atomics and the timer multiplexer's own lock are touched:
 //!   taking DAG or task locks from the timer interrupt stopped later timers
-//!   from firing before (see `dag_sched::dp_partition`'s "Split design").
+//!   from firing before (the earlier DP-boundary tracker hit this, 09-17).
 //! - [`prepare_preemption_on_cpu`] (start of `do_preemption`, the IPI 255
 //!   path): if the CPU is dirty, picks the successor from the entitled DAG's
 //!   ready queue and queues it as a preemption-pending task.
@@ -76,23 +76,22 @@ fn switch_action(old: Option<u32>, new: Option<u32>, running: bool) -> SwitchAct
     }
 }
 
-/// Store `new` as `cpu_id`'s entitlement. Returns true if a running task
-/// now has to be preempted (the CPU has been marked dirty).
-fn apply_due(cpu_id: usize, new: Option<u32>) -> bool {
+/// Store `new` as `cpu_id`'s entitlement and return the previous one and
+/// what the change means. For [`SwitchAction::Preempt`] the CPU has been
+/// marked dirty.
+fn apply_due(cpu_id: usize, new: Option<u32>) -> (Option<u32>, SwitchAction) {
     let Some(slot) = ENTITLEMENT.get(cpu_id) else {
-        return false;
+        return (None, SwitchAction::Nothing);
     };
     let old = slot.swap(new.unwrap_or(NO_DAG), Ordering::AcqRel);
     let old = (old != NO_DAG).then_some(old);
-    match switch_action(old, new, get_current_task(cpu_id).is_some()) {
-        SwitchAction::Preempt => {
-            if let Some(dirty) = ENTITLEMENT_DIRTY.get(cpu_id) {
-                dirty.store(true, Ordering::Release);
-            }
-            true
+    let action = switch_action(old, new, get_current_task(cpu_id).is_some());
+    if action == SwitchAction::Preempt {
+        if let Some(dirty) = ENTITLEMENT_DIRTY.get(cpu_id) {
+            dirty.store(true, Ordering::Release);
         }
-        SwitchAction::Nothing | SwitchAction::PickUpWhenIdle => false,
     }
+    (old, action)
 }
 
 /// Apply every entry of `cpu_id`'s switch table due at `now`, then arm the
@@ -104,7 +103,17 @@ fn service_switch_table(cpu_id: usize, now: Instant) -> bool {
     };
     // Apply before arming: arming a time that has already passed fires the
     // callback again right here, and that later entry must win.
-    let need_preemption = result.due.is_some_and(|due| apply_due(cpu_id, due.dag_id));
+    let need_preemption = result.due.is_some_and(|due| {
+        let (old, action) = apply_due(cpu_id, due.dag_id);
+        let path = match action {
+            SwitchAction::Preempt => measure::PREEMPT,
+            SwitchAction::PickUpWhenIdle => measure::IDLE,
+            SwitchAction::Nothing if due.dag_id.is_none() && old.is_some() => measure::TO_NONE,
+            SwitchAction::Nothing => measure::SAME,
+        };
+        measure::begin(cpu_id, due.at, now, old, due.dag_id, path, result.skipped);
+        action == SwitchAction::Preempt
+    });
     if let Some(next) = result.next_at {
         timer::request_at(TimerRequestId::DpSwitch, next);
     }
@@ -138,6 +147,194 @@ pub fn kick_cpu(cpu_id: usize) {
     kick.store(true, Ordering::Release);
     let preempt_irq = awkernel_lib::interrupt::get_preempt_irq();
     awkernel_lib::interrupt::send_ipi(preempt_irq, cpu_id as u32);
+}
+
+/// Four timestamps for every applied switch point (方式B, Step 5): the
+/// scheduled time, the handler entry, the successor being decided, and the
+/// successor's first execution slice starting. Recorded only while the
+/// trace (`task::trace`) is recording, and dumped with it as `TRACE_DPSW`
+/// lines.
+///
+/// Each CPU keeps one in-progress record. The `DpSwitch` handler opens it
+/// ([`begin`]); the IPI 255 path or the idle run loop fills in the decided
+/// successor ([`decided`]); the successor's first `TRACE_EV` start closes it
+/// ([`note_task_start`]). A record still open when the next switch arrives
+/// is closed without a start time. All of this runs on the CPU itself.
+pub(crate) mod measure {
+    pub(crate) use imp::*;
+
+    #[cfg(feature = "perf")]
+    mod imp {
+        use crate::task::trace::{self, DpSwitchEvent};
+        pub(crate) use crate::task::trace::{
+            DPSW_IDLE as IDLE, DPSW_NO_SUCCESSOR as NO_SUCCESSOR, DPSW_PREEMPT as PREEMPT,
+            DPSW_SAME as SAME, DPSW_TO_NONE as TO_NONE,
+        };
+        use array_macro::array;
+        use awkernel_lib::{cpu::NUM_MAX_CPU, interrupt::InterruptGuard, time::Instant};
+        use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+
+        /// `u32::MAX`: no DAG (same encoding as `DpSwitchEvent`).
+        const NONE: u32 = u32::MAX;
+
+        struct Pending {
+            open: AtomicBool,
+            scheduled: AtomicU64,
+            handler: AtomicU64,
+            decided: AtomicU64,
+            from: AtomicU32,
+            to: AtomicU32,
+            path: AtomicU8,
+            skipped: AtomicU32,
+            /// The successor task whose start closes the record (0: none yet).
+            task: AtomicU32,
+        }
+
+        impl Pending {
+            const fn new() -> Self {
+                Self {
+                    open: AtomicBool::new(false),
+                    scheduled: AtomicU64::new(0),
+                    handler: AtomicU64::new(0),
+                    decided: AtomicU64::new(0),
+                    from: AtomicU32::new(NONE),
+                    to: AtomicU32::new(NONE),
+                    path: AtomicU8::new(0),
+                    skipped: AtomicU32::new(0),
+                    task: AtomicU32::new(0),
+                }
+            }
+        }
+
+        static PENDING: [Pending; NUM_MAX_CPU] = array![_ => Pending::new(); NUM_MAX_CPU];
+
+        fn ns(t: Instant) -> u64 {
+            u64::try_from(t.uptime().as_nanos()).unwrap_or(u64::MAX)
+        }
+
+        fn close(p: &Pending, started_ns: u64) {
+            if !p.open.swap(false, Ordering::Relaxed) {
+                return;
+            }
+            trace::record_dp_switch(DpSwitchEvent {
+                scheduled_ns: p.scheduled.load(Ordering::Relaxed),
+                handler_ns: p.handler.load(Ordering::Relaxed),
+                decided_ns: p.decided.load(Ordering::Relaxed),
+                started_ns,
+                from_dag: p.from.load(Ordering::Relaxed),
+                to_dag: p.to.load(Ordering::Relaxed),
+                path: p.path.load(Ordering::Relaxed),
+                skipped: p.skipped.load(Ordering::Relaxed),
+            });
+        }
+
+        /// Open a record for a switch applied by the handler at `handler`.
+        /// Paths other than [`PREEMPT`]/[`IDLE`] are complete right away.
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn begin(
+            cpu_id: usize,
+            scheduled: Instant,
+            handler: Instant,
+            from: Option<u32>,
+            to: Option<u32>,
+            path: u8,
+            skipped: u32,
+        ) {
+            if !trace::is_enabled() {
+                return;
+            }
+            let Some(p) = PENDING.get(cpu_id) else {
+                return;
+            };
+            close(p, 0);
+            p.scheduled.store(ns(scheduled), Ordering::Relaxed);
+            p.handler.store(ns(handler), Ordering::Relaxed);
+            p.decided.store(0, Ordering::Relaxed);
+            p.from.store(from.unwrap_or(NONE), Ordering::Relaxed);
+            p.to.store(to.unwrap_or(NONE), Ordering::Relaxed);
+            p.path.store(path, Ordering::Relaxed);
+            p.skipped.store(skipped, Ordering::Relaxed);
+            p.task.store(0, Ordering::Relaxed);
+            p.open.store(true, Ordering::Relaxed);
+            if path != PREEMPT && path != IDLE {
+                close(p, 0);
+            }
+        }
+
+        /// The successor `task_id` was decided now (first decision only).
+        pub(crate) fn decided(cpu_id: usize, task_id: u32) {
+            let Some(p) = PENDING.get(cpu_id) else {
+                return;
+            };
+            if p.open.load(Ordering::Relaxed) && p.task.load(Ordering::Relaxed) == 0 {
+                p.decided.store(ns(Instant::now()), Ordering::Relaxed);
+                p.task.store(task_id, Ordering::Relaxed);
+            }
+        }
+
+        /// Change the open record's path (it stays open).
+        pub(crate) fn set_path(cpu_id: usize, path: u8) {
+            if let Some(p) = PENDING.get(cpu_id) {
+                if p.open.load(Ordering::Relaxed) {
+                    p.path.store(path, Ordering::Relaxed);
+                }
+            }
+        }
+
+        /// Close the open record with `path`, without a start time.
+        pub(crate) fn finish(cpu_id: usize, path: u8) {
+            if let Some(p) = PENDING.get(cpu_id) {
+                if p.open.load(Ordering::Relaxed) {
+                    p.path.store(path, Ordering::Relaxed);
+                    close(p, 0);
+                }
+            }
+        }
+
+        /// Called when `task_id` starts an execution slice on `cpu_id`
+        /// (`task::trace::record`): closes the record if it is the decided
+        /// successor.
+        pub(crate) fn note_task_start(cpu_id: usize, task_id: u32) {
+            // The handler may open a new record on this CPU at any moment.
+            let _guard = InterruptGuard::new();
+            let Some(p) = PENDING.get(cpu_id) else {
+                return;
+            };
+            if p.open.load(Ordering::Relaxed) && p.task.load(Ordering::Relaxed) == task_id {
+                close(p, ns(Instant::now()));
+            }
+        }
+    }
+
+    /// Without `perf` there is no trace to record into.
+    #[cfg(not(feature = "perf"))]
+    mod imp {
+        use awkernel_lib::time::Instant;
+
+        pub(crate) const PREEMPT: u8 = 0;
+        pub(crate) const IDLE: u8 = 1;
+        pub(crate) const SAME: u8 = 2;
+        pub(crate) const TO_NONE: u8 = 3;
+        #[cfg_attr(feature = "no_preempt", allow(dead_code))]
+        pub(crate) const NO_SUCCESSOR: u8 = 4;
+
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn begin(
+            _cpu_id: usize,
+            _scheduled: Instant,
+            _handler: Instant,
+            _from: Option<u32>,
+            _to: Option<u32>,
+            _path: u8,
+            _skipped: u32,
+        ) {
+        }
+        pub(crate) fn decided(_cpu_id: usize, _task_id: u32) {}
+        #[cfg_attr(feature = "no_preempt", allow(dead_code))]
+        pub(crate) fn set_path(_cpu_id: usize, _path: u8) {}
+        #[cfg_attr(feature = "no_preempt", allow(dead_code))]
+        pub(crate) fn finish(_cpu_id: usize, _path: u8) {}
+    }
 }
 
 /// The parts that only exist with preemption (`do_preemption` is compiled
@@ -208,20 +405,25 @@ mod preemption_side {
             return;
         }
         let Some(dag_id) = entitlement_of(cpu_id) else {
+            measure::finish(cpu_id, measure::TO_NONE);
             return;
         };
         let Some(current) = get_current_task(cpu_id).and_then(get_task) else {
             // Went idle meanwhile: the run loop picks the DAG up by itself.
+            measure::set_path(cpu_id, measure::IDLE);
             return;
         };
         if dpwrap_dag_of(&current) == Some(dag_id) {
+            measure::finish(cpu_id, measure::SAME);
             return;
         }
         // No ready node of the entitled DAG: the running task keeps the CPU
         // until one wakes up (`DpWrapScheduler::invoke_preemption`).
         let Some(successor) = pop_successor(dag_id) else {
+            measure::finish(cpu_id, measure::NO_SUCCESSOR);
             return;
         };
+        measure::decided(cpu_id, successor.id);
         if let Some(rotation) = ROTATION_TASK.get(cpu_id) {
             rotation.store(successor.id, Ordering::Release);
         }
@@ -313,13 +515,17 @@ mod tests {
         // CPU ids far from the ones other tests could touch; no task runs
         // on them in unit tests, so this exercises the idle side.
         let cpu = NUM_MAX_CPU - 1;
-        assert!(!apply_due(cpu, Some(7)));
+        assert_eq!(
+            apply_due(cpu, Some(7)),
+            (None, SwitchAction::PickUpWhenIdle)
+        );
         assert_eq!(entitlement_of(cpu), Some(7));
         assert!(!ENTITLEMENT_DIRTY[cpu].load(Ordering::Acquire));
-        assert!(!apply_due(cpu, None));
+        assert_eq!(apply_due(cpu, None), (Some(7), SwitchAction::Nothing));
         assert_eq!(entitlement_of(cpu), None);
-        assert!(
-            !apply_due(NUM_MAX_CPU, Some(1)),
+        assert_eq!(
+            apply_due(NUM_MAX_CPU, Some(1)),
+            (None, SwitchAction::Nothing),
             "out-of-range CPU is ignored"
         );
     }

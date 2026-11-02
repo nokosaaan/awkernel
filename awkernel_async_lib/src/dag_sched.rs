@@ -22,15 +22,11 @@
 //!   SFS, DAG-Fluid), each combining `metrics`/`graph`/`resource` into that
 //!   algorithm's own admission test and turning its decision into a
 //!   [`crate::scheduler::SchedulerType`].
-//! - [`dp_partition`]: system-wide Deadline-Partition boundary tracking for
-//!   DAG-Fluid's dynamic-dispatch measurement work (Phase 2) — a
-//!   measurement probe, not a scheduling mechanism; see its own module doc.
 //! - [`planner`]: DAG-Fluid's per-core dispatch planner (publishes each
 //!   DAG-pool CPU's switch table window by window); see its own module doc.
 //! - [`job_table`]: per-DAG ring of periodic job releases, the input of
 //!   DAG-Fluid's per-core dispatch planner; see its own module doc.
 pub mod admission;
-pub mod dp_partition;
 pub mod graph;
 pub mod job_table;
 pub mod metrics;

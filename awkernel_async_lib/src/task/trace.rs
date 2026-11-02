@@ -45,6 +45,75 @@ pub struct TraceEvent {
     pub period_index: Option<u32>,
 }
 
+/// One applied DAG-Fluid switch point (方式B), with its four timestamps
+/// (uptime nanoseconds, the unit switch tables use; 0 = did not happen):
+/// scheduled time, `DpSwitch` handler entry, successor decided (the
+/// preemption path picked it, or the idle run loop dequeued it), and that
+/// successor's first execution slice starting. See
+/// `scheduler::dp_wrap::dp_switch::measure`.
+#[derive(Clone, Copy, Default)]
+pub struct DpSwitchEvent {
+    pub scheduled_ns: u64,
+    pub handler_ns: u64,
+    pub decided_ns: u64,
+    pub started_ns: u64,
+    /// `u32::MAX` for "no DAG".
+    pub from_dag: u32,
+    /// `u32::MAX` for "no DAG".
+    pub to_dag: u32,
+    /// One of the `DPSW_*` paths.
+    pub path: u8,
+    /// Due entries passed over because the handler ran late.
+    pub skipped: u32,
+}
+
+pub const DPSW_CAP: usize = 4096;
+
+/// A task of another DAG was running: preempted through IPI 255.
+pub const DPSW_PREEMPT: u8 = 0;
+/// The CPU was idle: its run loop picks the new DAG up.
+pub const DPSW_IDLE: u8 = 1;
+/// Nothing to switch: same DAG, or the running task already belongs to
+/// the entitled DAG.
+pub const DPSW_SAME: u8 = 2;
+/// Switched to no DAG.
+pub const DPSW_TO_NONE: u8 = 3;
+/// The entitled DAG had no ready node, so the running task kept the CPU.
+pub const DPSW_NO_SUCCESSOR: u8 = 4;
+
+fn dpsw_path_name(path: u8) -> &'static str {
+    match path {
+        DPSW_PREEMPT => "preempt",
+        DPSW_IDLE => "idle",
+        DPSW_SAME => "same",
+        DPSW_TO_NONE => "none",
+        DPSW_NO_SUCCESSOR => "nosucc",
+        _ => "?",
+    }
+}
+
+static DPSW_IDX: [AtomicUsize; NUM_MAX_CPU] = array![_ => AtomicUsize::new(0); NUM_MAX_CPU];
+
+static mut DPSW_BUFS: [Option<Vec<DpSwitchEvent>>; NUM_MAX_CPU] = [const { None }; NUM_MAX_CPU];
+
+/// Record one switch on the current CPU. Lock-free, like [`record`].
+pub(crate) fn record_dp_switch(event: DpSwitchEvent) {
+    if !ENABLED.load(Ordering::Acquire) {
+        return;
+    }
+    let cpu_id = awkernel_lib::cpu::cpu_id();
+    let i = DPSW_IDX[cpu_id].fetch_add(1, Ordering::Relaxed);
+    if i >= DPSW_CAP {
+        return;
+    }
+    unsafe {
+        let bufs = &mut *core::ptr::addr_of_mut!(DPSW_BUFS);
+        if let Some(slot) = bufs[cpu_id].as_mut().and_then(|buf| buf.get_mut(i)) {
+            *slot = event;
+        }
+    }
+}
+
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
 static IDX: [AtomicUsize; NUM_MAX_CPU] = array![_ => AtomicUsize::new(0); NUM_MAX_CPU];
@@ -78,6 +147,10 @@ pub(crate) fn record(task_id: u32, kind: u8, period_index: Option<u32>) {
     }
 
     let tsc = awkernel_lib::delay::cpu_counter();
+
+    if kind == KIND_START {
+        crate::scheduler::dp_wrap::dp_switch::measure::note_task_start(cpu_id, task_id);
+    }
 
     unsafe {
         let bufs = &mut *core::ptr::addr_of_mut!(BUFS);
@@ -119,6 +192,18 @@ pub fn start() {
     }
 
     for idx in IDX.iter().take(n) {
+        idx.store(0, Ordering::Relaxed);
+    }
+
+    unsafe {
+        let bufs = &mut *core::ptr::addr_of_mut!(DPSW_BUFS);
+        for buf in bufs.iter_mut().take(n) {
+            if buf.is_none() {
+                *buf = Some(alloc::vec![DpSwitchEvent::default(); DPSW_CAP]);
+            }
+        }
+    }
+    for idx in DPSW_IDX.iter().take(n) {
         idx.store(0, Ordering::Relaxed);
     }
 
@@ -307,6 +392,48 @@ pub fn dump_to_console() {
         let dropped = num_dropped(cpu_id);
         if dropped > 0 {
             console::print(&format!("TRACE_DROPPED,{cpu_id},{dropped}\r\n"));
+        }
+    }
+
+    // TRACE_DPSW,<cpu>,<scheduled_ns>,<handler_ns>,<decided_ns|->,
+    //   <started_ns|->,<from_dag|->,<to_dag|->,<path>,<skipped>
+    // One applied DAG-Fluid switch point (see `DpSwitchEvent`).
+    let ns_or_dash = |v: u64| if v == 0 { "-".into() } else { format!("{v}") };
+    let dag_or_dash = |v: u32| {
+        if v == u32::MAX {
+            "-".into()
+        } else {
+            format!("{v}")
+        }
+    };
+    for cpu_id in 0..awkernel_lib::cpu::num_cpu() {
+        let n = DPSW_IDX[cpu_id].load(Ordering::Relaxed);
+        let mut out = String::new();
+        unsafe {
+            let bufs = &*core::ptr::addr_of!(DPSW_BUFS);
+            if let Some(buf) = bufs[cpu_id].as_ref() {
+                for e in buf.iter().take(n.min(DPSW_CAP)) {
+                    out.push_str(&format!(
+                        "TRACE_DPSW,{cpu_id},{},{},{},{},{},{},{},{}\r\n",
+                        e.scheduled_ns,
+                        e.handler_ns,
+                        ns_or_dash(e.decided_ns),
+                        ns_or_dash(e.started_ns),
+                        dag_or_dash(e.from_dag),
+                        dag_or_dash(e.to_dag),
+                        dpsw_path_name(e.path),
+                        e.skipped,
+                    ));
+                    if out.len() > 4096 {
+                        console::print(&out);
+                        out.clear();
+                    }
+                }
+            }
+        }
+        console::print(&out);
+        if n > DPSW_CAP {
+            console::print(&format!("TRACE_DPSW_DROPPED,{cpu_id},{}\r\n", n - DPSW_CAP));
         }
     }
 

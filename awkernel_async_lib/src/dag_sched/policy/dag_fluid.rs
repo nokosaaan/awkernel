@@ -3,7 +3,7 @@
 //! offline schedulability test (`rd_gen_to_dags`'s
 //! `examples/paper_setting_comparison.rs` / `theory_vs_reality.rs`) and,
 //! via [`assign_segment_deadlines`], to feed the real-machine dynamic
-//! runtime layer ([`crate::dag_sched::dp_partition`] /
+//! runtime layer ([`crate::dag_sched::planner`] /
 //! [`crate::scheduler::dp_wrap`]). See those modules' own docs for the
 //! DP-Fair/DP-Wrap dispatch mechanism and its documented simplifications
 //! relative to the papers' idealized fluid model.
@@ -209,12 +209,11 @@ pub fn decompose_segments(graph: &DagGraph) -> Vec<Segment> {
 /// -- the nodes the idealized timeline expects to have completed by the
 /// segment's theoretical deadline. Ascending index order.
 ///
-/// Used by [`crate::dag_sched::dp_partition`] (real-machine dispatch) as a
-/// completion gate: a segment's boundary is only acted on once every node
-/// in its gate has really terminated, not merely once the theoretical
-/// deadline has elapsed -- seeing the real gap between the two *is* the
-/// point (see that module's doc), but abandoning still-running work the
-/// instant the clock says "done" would starve it with no rescue mechanism.
+/// Kept in each DAG's job template (`dag_sched::job_table`) for the
+/// event-driven variant (③), where a segment starts when the nodes of the
+/// previous segment's gate have completed. The time-driven dispatch (①,
+/// `dag_sched::planner`) does not wait on gates: like the papers, it
+/// replaces the dependencies with the segments' release times.
 ///
 /// A node appears in no gate if its finish falls strictly inside a window;
 /// that cannot happen here (every finish is one of the timeline's own
@@ -572,7 +571,7 @@ mod tests {
 
     /// node1 ([10,40)) spans *two* segments -- the case that rules out
     /// per-node segment membership as a dispatch-time concept (see
-    /// `dag_sched::dp_partition`'s doc). The gate only needs "which nodes
+    /// `scheduler::dp_wrap`'s `ENTITLEMENT` doc). The gate only needs "which nodes
     /// finish at this segment's end": node1 gates segment[2], where it
     /// finishes, not segment[1], where it starts.
     #[test]

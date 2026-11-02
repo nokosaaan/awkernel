@@ -117,12 +117,6 @@ pub fn is_timer_enabled() -> bool {
 pub enum TimerRequestId {
     /// `awkernel_lib::cpu::sleep_cpu_no_std`'s own idle-CPU wakeup deadman.
     IdleWakeup,
-    /// Reserved for DAG-Fluid's own system-wide Deadline-Partition boundary
-    /// detection. Unused until that work registers a callback for it via
-    /// [`register_timer_callback`] and starts calling [`request_at`] --
-    /// firing this request today is a silent no-op (see
-    /// [`invoke_callback`]).
-    DpBoundary,
     /// DAG-Fluid's per-core switch points (方式B): each DAG-pool CPU arms
     /// this for the next entry of its own switch table
     /// (`awkernel_async_lib::scheduler::dp_wrap::switch_table`) and
@@ -130,20 +124,16 @@ pub enum TimerRequestId {
     DpSwitch,
 }
 
-const NUM_TIMER_REQUESTS: usize = 3;
+const NUM_TIMER_REQUESTS: usize = 2;
 
 impl TimerRequestId {
-    const ALL: [TimerRequestId; NUM_TIMER_REQUESTS] = [
-        TimerRequestId::IdleWakeup,
-        TimerRequestId::DpBoundary,
-        TimerRequestId::DpSwitch,
-    ];
+    const ALL: [TimerRequestId; NUM_TIMER_REQUESTS] =
+        [TimerRequestId::IdleWakeup, TimerRequestId::DpSwitch];
 
     const fn index(self) -> usize {
         match self {
             TimerRequestId::IdleWakeup => 0,
-            TimerRequestId::DpBoundary => 1,
-            TimerRequestId::DpSwitch => 2,
+            TimerRequestId::DpSwitch => 1,
         }
     }
 }
@@ -184,7 +174,7 @@ static TIMER_REQUESTS: [Mutex<PerCpuTimerState>; NUM_MAX_CPU] =
 // so leaking them in `register_timer_callback` below is intentional and
 // permanent, not a growing leak.
 static TIMER_CALLBACKS: [Mutex<Option<&'static (dyn Fn() + Send + Sync)>>; NUM_TIMER_REQUESTS] =
-    [Mutex::new(None), Mutex::new(None), Mutex::new(None)];
+    [Mutex::new(None), Mutex::new(None)];
 
 /// Register the callback invoked (on whichever CPU it happens to fire on)
 /// when `id`'s deadline is reached. Overwrites any previously registered
@@ -344,7 +334,7 @@ mod tests {
         let t10 = Instant::zero() + Duration::from_millis(10);
         let t5 = Instant::zero() + Duration::from_millis(5);
         state.set(TimerRequestId::IdleWakeup, t10);
-        state.set(TimerRequestId::DpBoundary, t5);
+        state.set(TimerRequestId::DpSwitch, t5);
         assert_eq!(state.soonest(), Some(t5));
     }
 
@@ -354,8 +344,8 @@ mod tests {
         let t10 = Instant::zero() + Duration::from_millis(10);
         let t5 = Instant::zero() + Duration::from_millis(5);
         state.set(TimerRequestId::IdleWakeup, t10);
-        state.set(TimerRequestId::DpBoundary, t5);
-        state.clear(TimerRequestId::DpBoundary);
+        state.set(TimerRequestId::DpSwitch, t5);
+        state.clear(TimerRequestId::DpSwitch);
         assert_eq!(state.soonest(), Some(t10));
     }
 

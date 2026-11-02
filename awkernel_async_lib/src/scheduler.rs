@@ -115,12 +115,12 @@ pub enum SchedulerType {
     /// executing there (`passive_vp::active_vp_is_busy`).
     PassiveVp(CpuSet),
     GEDF(u64), // relative deadline
-    /// DAG-Fluid's real dispatch (`dag_sched::dp_partition` /
+    /// DAG-Fluid's real dispatch (`dag_sched::planner` /
     /// `scheduler::dp_wrap`): `dag_id`, the DAG this node belongs to. Unlike
     /// `ClusteredEDF`/`ActiveVp`, the CPU set a `DpWrap` task may run on is
     /// **not** carried here — it is looked up dynamically at dispatch time
     /// from `scheduler::dp_wrap`'s own per-CPU entitlement table, which
-    /// changes over time as Deadline Partitions advance (see that module's
+    /// changes at every DP-Wrap switch point (see that module's
     /// own doc). `cpu_set()`/`is_clustered()` therefore both treat this
     /// variant like any non-clustered scheduler.
     DpWrap(u32),
@@ -651,17 +651,6 @@ pub fn wake_task() -> Option<Duration> {
         } else {
             active_vp::mark_idle(cpu_id);
         }
-
-        // DAG-Fluid's own intra-DP migration switch points (see
-        // `dp_wrap::tick_switch_plan`'s own doc): independent of whichever
-        // scheduler is currently running on `cpu_id` above -- entitlement
-        // can legitimately change out from under a task belonging to some
-        // *other* scheduler entirely (e.g. a regular-pool task happening
-        // to occupy what is, from DAG-Fluid's perspective, a DAG-pool
-        // core mid-switch), and `apply_entitlement`'s own forced-preemption
-        // path already only acts when a concrete DpWrap successor is ready
-        // and preemption is enabled.
-        dp_wrap::tick_switch_plan(cpu_id);
     }
 
     let mut node = MCSNode::new();

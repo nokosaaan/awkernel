@@ -1375,12 +1375,12 @@ async fn build_dag_impl(
         .ok_or(AdmissionError::NoFeasibleAllocation)?;
         resource::reserve_dagfluid_capacity(required)?;
 
-        // Real dispatch (`scheduler::dp_wrap` / `dag_sched::dp_partition`):
+        // Real dispatch (`scheduler::dp_wrap` / `dag_sched::planner`):
         // compute the Section 8 Step 1 thread-list conversion (Algorithm 1
         // lines 16-21, see `dag_fluid::assign_segment_deadlines`'s own
         // doc) and this task's own completion gates
         // (`dag_fluid::segment_completion_gates`), and register each
-        // segment with the system-wide DP-boundary tracker. Only
+        // segment as this DAG's job template (`dag_sched::job_table`). Only
         // meaningful for a task actually decomposed into segments
         // (`stats.volume > d_star`, i.e. the `τ_paral` case, Section 4.1)
         // -- a `τ_seq` task (whole DAG stretched into one sequential unit)
@@ -1407,7 +1407,7 @@ async fn build_dag_impl(
 
         if let Some(schedule) = schedule {
             let offsets = awkernel_async_lib::dag_sched::policy::dag_fluid::segment_release_offsets(&schedule);
-            // Gates come back as graph indices; `dp_partition` watches node ids.
+            // Gates come back as graph indices; templates keep node ids.
             let node_ids = crate::sorted_node_ids(&dag_data);
             let gates: Vec<Vec<u32>> =
                 awkernel_async_lib::dag_sched::policy::dag_fluid::segment_completion_gates(&graph)
@@ -1415,7 +1415,7 @@ async fn build_dag_impl(
                     .map(|gate| gate.iter().filter_map(|&v| node_ids.get(v).copied()).collect())
                     .collect();
             // Convert every value from this build's time unit once, here, so
-            // `dp_partition` and `job_table` only ever see `Duration`s.
+            // `job_table` and the planner only ever see `Duration`s.
             let mut templates = Vec::with_capacity(schedule.len());
             for (j, (seg, offset)) in schedule.iter().zip(offsets.iter()).enumerate() {
                 log::info!(
@@ -1448,7 +1448,7 @@ async fn build_dag_impl(
             // source node records each real release into this DAG's ring.
             let registered = awkernel_async_lib::dag_sched::job_table::DagTemplate::new(
                 convert_duration(period),
-                templates.clone(),
+                templates,
             )
             .and_then(|template| {
                 awkernel_async_lib::dag_sched::job_table::register_dag_template(dag_id, template)
@@ -1456,23 +1456,6 @@ async fn build_dag_impl(
             if let Err(e) = registered {
                 log::warn!("DAG#{dag_id}: cannot register its DAG-Fluid job template: {e:?}");
                 return Err(AdmissionError::NoFeasibleAllocation.into());
-            }
-
-            // The existing DP-boundary tracker still covers the first job
-            // only, anchored at admission (see `dp_partition`'s own doc on
-            // why `Instant::now()` stands in for the papers' `r_i,j` there).
-            let release = awkernel_lib::time::Instant::now();
-            for (j, seg) in templates.into_iter().enumerate() {
-                awkernel_async_lib::dag_sched::dp_partition::register_segment(
-                    dag_id,
-                    j,
-                    release,
-                    seg.offset,
-                    seg.relative_deadline,
-                    seg.concurrency,
-                    seg.rate,
-                    seg.gate_nodes,
-                );
             }
         }
         sched_type

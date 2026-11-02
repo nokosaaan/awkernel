@@ -160,18 +160,12 @@ fn federated_admit_batch(
 pub async fn run() {
     wait_millisec(1000);
 
-    // DAG-Fluid Phase 2 (see `awkernel_async_lib::dag_sched::dp_partition`'s
-    // own module doc): install the DP-boundary callback before any DAG is
-    // admitted, so every segment `build_dag`'s `dagfluid` arm registers
-    // below has somewhere to land. A no-op for federated/laxity.
+    // DAG-Fluid's per-core switch timer (方式B): each DAG-pool CPU switches
+    // at the times of its own switch table, which the planner started below
+    // fills. Installed before any DAG is admitted. A no-op for
+    // federated/laxity.
     #[cfg(feature = "dagfluid")]
-    {
-        awkernel_async_lib::dag_sched::dp_partition::install();
-        // Per-core switch timer (方式B): each DAG-pool CPU switches at the
-        // times of its own switch table, which the planner fills below.
-        // The old path's advancer is no longer started (removed in Step 5).
-        awkernel_async_lib::scheduler::dp_wrap::dp_switch::install();
-    }
+    awkernel_async_lib::scheduler::dp_wrap::dp_switch::install();
 
     let dags_data = match parse_yaml::parse_dags(DAG_FILES) {
         Ok(data) => data,
