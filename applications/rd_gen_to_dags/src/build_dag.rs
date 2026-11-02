@@ -1414,11 +1414,9 @@ async fn build_dag_impl(
                     .into_iter()
                     .map(|gate| gate.iter().filter_map(|&v| node_ids.get(v).copied()).collect())
                     .collect();
-            // All of this DAG's own segments share one release-time
-            // baseline (see `dp_partition`'s own doc on why
-            // `Instant::now()` at admission stands in for the papers'
-            // `r_i,j` anchor here).
-            let release = awkernel_lib::time::Instant::now();
+            // Convert every value from this build's time unit once, here, so
+            // `dp_partition` and `job_table` only ever see `Duration`s.
+            let mut templates = Vec::with_capacity(schedule.len());
             for (j, (seg, offset)) in schedule.iter().zip(offsets.iter()).enumerate() {
                 log::info!(
                     "DAG#{dag_id}: segment[{j}] l={} m={} r={offset:.3} d={:.3} theta={:.3}",
@@ -1427,16 +1425,53 @@ async fn build_dag_impl(
                     seg.relative_deadline,
                     seg.rate
                 );
-                let gate = gates.get(j).cloned().unwrap_or_default();
+                let (Some(offset), Some(relative_deadline)) = (
+                    crate::time_unit::convert_duration_f64(*offset),
+                    crate::time_unit::convert_duration_f64(seg.relative_deadline),
+                ) else {
+                    log::warn!(
+                        "DAG#{dag_id}: segment[{j}] offset {offset} or deadline {} is not a valid duration",
+                        seg.relative_deadline
+                    );
+                    return Err(AdmissionError::NoFeasibleAllocation.into());
+                };
+                templates.push(awkernel_async_lib::dag_sched::job_table::SegmentTemplate {
+                    offset,
+                    relative_deadline,
+                    concurrency: seg.concurrency,
+                    rate: seg.rate,
+                    gate_nodes: gates.get(j).cloned().unwrap_or_default(),
+                });
+            }
+
+            // Per-job releases for the per-core dispatch (方式B): the
+            // source node records each real release into this DAG's ring.
+            let registered = awkernel_async_lib::dag_sched::job_table::DagTemplate::new(
+                convert_duration(period),
+                templates.clone(),
+            )
+            .and_then(|template| {
+                awkernel_async_lib::dag_sched::job_table::register_dag_template(dag_id, template)
+            });
+            if let Err(e) = registered {
+                log::warn!("DAG#{dag_id}: cannot register its DAG-Fluid job template: {e:?}");
+                return Err(AdmissionError::NoFeasibleAllocation.into());
+            }
+
+            // The existing DP-boundary tracker still covers the first job
+            // only, anchored at admission (see `dp_partition`'s own doc on
+            // why `Instant::now()` stands in for the papers' `r_i,j` there).
+            let release = awkernel_lib::time::Instant::now();
+            for (j, seg) in templates.into_iter().enumerate() {
                 awkernel_async_lib::dag_sched::dp_partition::register_segment(
                     dag_id,
                     j,
                     release,
-                    *offset,
+                    seg.offset,
                     seg.relative_deadline,
                     seg.concurrency,
                     seg.rate,
-                    gate,
+                    seg.gate_nodes,
                 );
             }
         }

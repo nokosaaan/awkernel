@@ -1407,9 +1407,19 @@ where
             Attribute::default(),
         );
 
+        // DAG-Fluid DAGs record each job's release (the tick target, not the
+        // wake-up time) for the per-core dispatch planner; `None` otherwise.
+        // Looked up once here so the per-release path takes no lock.
+        let job_ring = crate::dag_sched::job_table::job_ring(dag_info.dag_id);
+
         let mut interval = interval(period, dag_info.dag_id);
         // Consume the first tick here to start the loop's main body without an initial delay.
-        interval.tick().await;
+        let release = interval.tick().await;
+        crate::dag_sched::job_table::notify_job_release(
+            job_ring.as_deref(),
+            dag_info.dag_id,
+            release,
+        );
 
         loop {
             #[cfg(feature = "period-index-propagation")]
@@ -1446,7 +1456,12 @@ where
             #[cfg(feature = "perf")]
             periodic_measure();
 
-            interval.tick().await;
+            let release = interval.tick().await;
+            crate::dag_sched::job_table::notify_job_release(
+                job_ring.as_deref(),
+                dag_info.dag_id,
+                release,
+            );
         }
     };
 

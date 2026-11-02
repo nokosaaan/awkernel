@@ -180,23 +180,11 @@ static PENDING: Mutex<Vec<BoundaryEntry>> = Mutex::new(Vec::new());
 /// once a DAG's last segment clears (nothing left to entitle).
 static CURRENT: Mutex<BTreeMap<u32, (u32, f64)>> = Mutex::new(BTreeMap::new());
 
-/// Convert a segment's relative-deadline/release-offset value (`f64`,
-/// milliseconds — the unit `rd_gen_to_dags`'s own `time_unit` default
-/// feature uses) into a `Duration`. Truncates towards zero rather than
-/// rounding: `f64::round`/`ceil` need `std`/`libm`, unavailable in this
-/// crate's `no_std` build — the same constraint
-/// `crate::dag_sched::policy::dag_fluid` documents for its own float-to-integer
-/// conversions (`ceil_capacity_to_cores`). Negative input (should not
-/// occur for a real offset/deadline) clamps to zero rather than
-/// wrapping.
-fn millis_f64_to_duration(ms: f64) -> Duration {
-    Duration::from_millis(ms.max(0.0) as u64)
-}
-
-/// Register one segment's own absolute deadline (`release +
-/// offset_ms + duration_ms`, both in milliseconds — `offset_ms` from
-/// `crate::dag_sched::policy::dag_fluid::segment_release_offsets`, `duration_ms`
-/// from that same segment's own `SegmentSchedule::relative_deadline`)
+/// Register one segment's own absolute deadline (`release + offset +
+/// duration` — `offset` from
+/// `crate::dag_sched::policy::dag_fluid::segment_release_offsets`, `duration`
+/// from that same segment's own `SegmentSchedule::relative_deadline`, both
+/// already converted from the caller's own time unit to a `Duration`)
 /// for `dag_id`, along with the `(concurrency, rate)` DP-Wrap density this
 /// segment contributes (see `scheduler::dp_wrap::recompute_and_apply`'s
 /// own doc) and its own completion gate (`gate_nodes` — see
@@ -213,13 +201,13 @@ pub fn register_segment(
     dag_id: u32,
     segment_index: usize,
     release: Instant,
-    offset_ms: f64,
-    duration_ms: f64,
+    offset: Duration,
+    duration: Duration,
     concurrency: u32,
     rate: f64,
     gate_nodes: Vec<u32>,
 ) {
-    let scheduled = release + millis_f64_to_duration(offset_ms + duration_ms);
+    let scheduled = release + offset + duration;
     let gate_period_indices = alloc::vec![None; gate_nodes.len()];
     let mut node = MCSNode::new();
     let mut pending = PENDING.lock(&mut node);
