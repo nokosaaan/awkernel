@@ -46,6 +46,8 @@
 //! posture `dag_fluid::heavy_capacity_and_deadline` documents for its own
 //! analogous precondition).
 
+pub mod switch_table;
+
 use super::{
     get_priority, peek_preemption_pending, push_preemption_pending, Scheduler, SchedulerType, Task,
     GLOBAL_WAKE_GET_MUTEX, PREEMPTION_ENABLED,
