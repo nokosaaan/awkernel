@@ -167,14 +167,10 @@ pub async fn run() {
     #[cfg(feature = "dagfluid")]
     {
         awkernel_async_lib::dag_sched::dp_partition::install();
-        // Per-core switch timer (方式B). Idle until a planner publishes a
-        // switch table, so it does not interfere with the path above.
+        // Per-core switch timer (方式B): each DAG-pool CPU switches at the
+        // times of its own switch table, which the planner fills below.
+        // The old path's advancer is no longer started (removed in Step 5).
         awkernel_async_lib::scheduler::dp_wrap::dp_switch::install();
-        // The background task that actually checks completion gates and
-        // advances segments (see that module's own "Split design" doc --
-        // this must run from ordinary task context, never from the
-        // DpBoundary timer callback `install()` just registered).
-        awkernel_async_lib::dag_sched::dp_partition::spawn_advancer();
     }
 
     let dags_data = match parse_yaml::parse_dags(DAG_FILES) {
@@ -217,15 +213,13 @@ pub async fn run() {
         return;
     }
 
-    // Every DAG-Fluid segment across every admitted DAG is registered by
-    // now (admission is sequential and complete at this point): grant each
-    // DAG's own segment-0 entitlement before dispatch starts, then arm the
-    // timer for the earliest boundary.
+    // Every DAG-Fluid DAG is admitted and its job template registered by
+    // now (admission is sequential and complete at this point): start the
+    // planner before dispatch starts. Until a DAG's first release it plans
+    // as if the DAG were released now, so the source node gets a CPU (see
+    // `dag_sched::planner`'s "bootstrap").
     #[cfg(feature = "dagfluid")]
-    {
-        awkernel_async_lib::dag_sched::dp_partition::apply_initial_entitlement();
-        awkernel_async_lib::dag_sched::dp_partition::arm_next();
-    }
+    awkernel_async_lib::dag_sched::planner::spawn_planner();
 
     match finish_create_dags(&success_build_dags).await {
         Ok(_) => {

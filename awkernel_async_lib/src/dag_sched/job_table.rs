@@ -281,6 +281,25 @@ impl JobRing {
         Ok(written)
     }
 
+    /// The newest recorded release, or `None` before the first one.
+    pub fn latest(&self) -> Result<Option<ActiveJob>, JobTableError> {
+        let head = self.next_job.load(Ordering::Acquire);
+        let Some(newest) = head.checked_sub(1) else {
+            return Ok(None);
+        };
+        let Some((stored_job, release_ns)) = self.slot_of(newest)?.read()? else {
+            return Ok(None);
+        };
+        if stored_job != newest {
+            // A newer release landed after `head` was read; ask again.
+            return Err(JobTableError::ReadContended);
+        }
+        Ok(Some(ActiveJob {
+            job: newest,
+            release: Instant::zero() + Duration::from_nanos(release_ns),
+        }))
+    }
+
     /// The release the next job will have if the source keeps its period:
     /// the newest release plus `T`. `None` before the first release.
     pub fn next_expected_release(&self) -> Result<Option<Instant>, JobTableError> {
@@ -321,6 +340,17 @@ pub fn job_ring(dag_id: u32) -> Option<Arc<JobRing>> {
     let mut node = MCSNode::new();
     let rings = JOB_RINGS.lock(&mut node);
     rings.get(&dag_id).cloned()
+}
+
+/// Every registered DAG and its ring, in `dag_id` order. Takes a lock:
+/// for the planner's setup, not for a per-release path.
+pub fn registered_rings() -> Vec<(u32, Arc<JobRing>)> {
+    let mut node = MCSNode::new();
+    let rings = JOB_RINGS.lock(&mut node);
+    rings
+        .iter()
+        .map(|(dag_id, ring)| (*dag_id, Arc::clone(ring)))
+        .collect()
 }
 
 /// Publish a release from a source node's loop. `ring` is `None` for DAGs
@@ -412,6 +442,22 @@ mod tests {
         assert_eq!(r.publish_release(at_us(1_100)), Ok(1));
         assert_eq!(r.publish_release(at_us(1_200)), Ok(2));
         assert_eq!(r.next_expected_release(), Ok(Some(at_us(1_300))));
+    }
+
+    #[test]
+    fn latest_is_the_newest_release() {
+        let r = ring(100, vec![segment(0, 100)]);
+        assert_eq!(r.latest(), Ok(None));
+        r.publish_release(at_us(1_000)).unwrap();
+        r.publish_release(at_us(1_100)).unwrap();
+        r.publish_release(at_us(1_200)).unwrap();
+        assert_eq!(
+            r.latest(),
+            Ok(Some(ActiveJob {
+                job: 2,
+                release: at_us(1_200)
+            }))
+        );
     }
 
     #[test]

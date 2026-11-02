@@ -45,7 +45,7 @@
 use array_macro::array;
 use awkernel_lib::{cpu::NUM_MAX_CPU, time::Instant};
 use core::{
-    sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     time::Duration,
 };
 
@@ -143,6 +143,9 @@ pub struct PerCpuSwitchTable {
     /// Next entry to look at in the reader's current plane. Only the
     /// reader touches it; atomic only so the table can be a `static`.
     reader_idx: AtomicUsize,
+    /// Set by the CPU when its plan ran out (and initially: no plan yet);
+    /// taken by the planner, which then republishes and kicks the CPU.
+    starved: AtomicBool,
 }
 
 impl Default for PerCpuSwitchTable {
@@ -158,6 +161,7 @@ impl PerCpuSwitchTable {
             published_gen: AtomicU64::new(0),
             reader_gen: AtomicU64::new(0),
             reader_idx: AtomicUsize::new(0),
+            starved: AtomicBool::new(true),
         }
     }
 
@@ -269,9 +273,18 @@ impl PerCpuSwitchTable {
                     self.reader_gen
                         .store(reader.wrapping_add(1), Ordering::Release);
                 }
-                None => return result,
+                None => {
+                    self.starved.store(true, Ordering::Release);
+                    return result;
+                }
             }
         }
+    }
+
+    /// Planner side: whether the CPU's plan ran out since the last call
+    /// (true before its first plan too). Clears the flag.
+    pub fn take_starved(&self) -> bool {
+        self.starved.swap(false, Ordering::AcqRel)
     }
 
     /// The generation the CPU is reading (0: none yet).
@@ -294,6 +307,15 @@ pub fn publish_cpu_plan(cpu_id: usize, entries: &[SwitchEntry]) -> Result<u64, S
         .get(cpu_id)
         .ok_or(SwitchTableError::NoSuchCpu(cpu_id))?
         .publish(entries)
+}
+
+/// Planner side: whether `cpu_id`'s plan ran out (see
+/// [`PerCpuSwitchTable::take_starved`]).
+pub fn take_cpu_starved(cpu_id: usize) -> Result<bool, SwitchTableError> {
+    Ok(SWITCH_TABLES
+        .get(cpu_id)
+        .ok_or(SwitchTableError::NoSuchCpu(cpu_id))?
+        .take_starved())
 }
 
 /// CPU side: poll `cpu_id`'s own table. Must only be called on `cpu_id`.
@@ -359,6 +381,18 @@ mod tests {
         let r = t.poll(at_us(300));
         assert_eq!(r.due, Some(e(300, None)));
         assert_eq!(r.next_at, None, "plan runs out after the last entry");
+    }
+
+    #[test]
+    fn starved_flag_marks_a_cpu_whose_plan_ran_out() {
+        let t = PerCpuSwitchTable::new();
+        assert!(t.take_starved(), "no plan yet counts as starved");
+        assert!(!t.take_starved(), "taking clears it");
+        t.publish(&[e(100, Some(1))]).unwrap();
+        t.poll(at_us(50));
+        assert!(!t.take_starved(), "an entry is still pending");
+        t.poll(at_us(100));
+        assert!(t.take_starved(), "the last entry was consumed");
     }
 
     #[test]
