@@ -167,6 +167,9 @@ pub async fn run() {
     #[cfg(feature = "dagfluid")]
     {
         awkernel_async_lib::dag_sched::dp_partition::install();
+        // Per-core switch timer (方式B). Idle until a planner publishes a
+        // switch table, so it does not interfere with the path above.
+        awkernel_async_lib::scheduler::dp_wrap::dp_switch::install();
         // The background task that actually checks completion gates and
         // advances segments (see that module's own "Split design" doc --
         // this must run from ordinary task context, never from the

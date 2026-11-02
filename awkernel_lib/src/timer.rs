@@ -123,18 +123,27 @@ pub enum TimerRequestId {
     /// firing this request today is a silent no-op (see
     /// [`invoke_callback`]).
     DpBoundary,
+    /// DAG-Fluid's per-core switch points (方式B): each DAG-pool CPU arms
+    /// this for the next entry of its own switch table
+    /// (`awkernel_async_lib::scheduler::dp_wrap::switch_table`) and
+    /// re-arms it from the callback.
+    DpSwitch,
 }
 
-const NUM_TIMER_REQUESTS: usize = 2;
+const NUM_TIMER_REQUESTS: usize = 3;
 
 impl TimerRequestId {
-    const ALL: [TimerRequestId; NUM_TIMER_REQUESTS] =
-        [TimerRequestId::IdleWakeup, TimerRequestId::DpBoundary];
+    const ALL: [TimerRequestId; NUM_TIMER_REQUESTS] = [
+        TimerRequestId::IdleWakeup,
+        TimerRequestId::DpBoundary,
+        TimerRequestId::DpSwitch,
+    ];
 
     const fn index(self) -> usize {
         match self {
             TimerRequestId::IdleWakeup => 0,
             TimerRequestId::DpBoundary => 1,
+            TimerRequestId::DpSwitch => 2,
         }
     }
 }
@@ -175,7 +184,7 @@ static TIMER_REQUESTS: [Mutex<PerCpuTimerState>; NUM_MAX_CPU] =
 // so leaking them in `register_timer_callback` below is intentional and
 // permanent, not a growing leak.
 static TIMER_CALLBACKS: [Mutex<Option<&'static (dyn Fn() + Send + Sync)>>; NUM_TIMER_REQUESTS] =
-    [Mutex::new(None), Mutex::new(None)];
+    [Mutex::new(None), Mutex::new(None), Mutex::new(None)];
 
 /// Register the callback invoked (on whichever CPU it happens to fire on)
 /// when `id`'s deadline is reached. Overwrites any previously registered

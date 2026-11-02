@@ -1899,6 +1899,16 @@ pub fn set_need_preemption(task_id: u32, cpu_id: usize) {
     PREEMPTION_REQUEST[cpu_id].store(true, Ordering::Release);
 }
 
+/// Ask `cpu_id` to preempt at its next voluntary preemption point, without
+/// taking any lock (unlike [`set_need_preemption`]), so it is usable from
+/// interrupt context. A fallback for a preemption IPI that might not be
+/// delivered (see `dp_wrap::dp_switch`).
+pub(crate) fn request_preemption(cpu_id: usize) {
+    if let Some(request) = PREEMPTION_REQUEST.get(cpu_id) {
+        request.store(true, Ordering::Release);
+    }
+}
+
 pub fn panicking() {
     let Some(task_id) = get_current_task(awkernel_lib::cpu::cpu_id()) else {
         return;

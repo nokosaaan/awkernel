@@ -46,6 +46,7 @@
 //! posture `dag_fluid::heavy_capacity_and_deadline` documents for its own
 //! analogous precondition).
 
+pub mod dp_switch;
 pub mod switch_table;
 
 use super::{

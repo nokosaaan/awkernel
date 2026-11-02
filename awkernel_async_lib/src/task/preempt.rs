@@ -190,6 +190,10 @@ fn push_to_thread_pool(ctx: PtrWorkerThreadContext) {
 
 unsafe fn do_preemption() {
     let cpu_id = awkernel_lib::cpu::cpu_id();
+
+    // DAG-Fluid per-core switching: queue the newly entitled DAG's task
+    // before looking at the pending ones (see `dp_wrap::dp_switch`).
+    crate::scheduler::dp_wrap::dp_switch::prepare_preemption_on_cpu(cpu_id);
     let Some(mut next) = peek_preemption_pending(cpu_id) else {
         return;
     };
@@ -225,7 +229,13 @@ unsafe fn do_preemption() {
                 SchedulerType::PrioritizedRR(_)
             );
 
-        if !next.preempts(&current_task) && !quantum_rotation {
+        // Likewise, a DAG-Fluid entitlement change hands the CPU to the
+        // newly entitled DAG regardless of priority: DP-Wrap allocates CPU
+        // time by rate (see `dp_wrap::dp_switch`).
+        let entitlement_rotation =
+            crate::scheduler::dp_wrap::dp_switch::take_rotation(cpu_id, &current_task, &next);
+
+        if !next.preempts(&current_task) && !quantum_rotation && !entitlement_rotation {
             remove_preemption_pending(cpu_id, next.id);
             next.scheduler.wake_task(next);
             return;
