@@ -114,9 +114,61 @@ pub(crate) fn record_dp_switch(event: DpSwitchEvent) {
     }
 }
 
+/// A DAG job event: a release (`DAG_EV_RELEASE`, `node_id` unused) or one
+/// node finishing a job (`DAG_EV_NODE_DONE`). Times are uptime
+/// nanoseconds.
+#[derive(Clone, Copy, Default)]
+pub struct DagJobEvent {
+    pub kind: u8,
+    pub dag_id: u32,
+    pub node_id: u32,
+    pub job: u64,
+    /// Release: the scheduled release time. Node done: when it finished.
+    pub at_ns: u64,
+    /// Release: when the source node actually woke up for it.
+    pub observed_ns: u64,
+}
+
+pub const DAG_EV_CAP: usize = 4096;
+pub const DAG_EV_RELEASE: u8 = 0;
+pub const DAG_EV_NODE_DONE: u8 = 1;
+
+static DAG_EV_IDX: [AtomicUsize; NUM_MAX_CPU] = array![_ => AtomicUsize::new(0); NUM_MAX_CPU];
+
+static mut DAG_EV_BUFS: [Option<Vec<DagJobEvent>>; NUM_MAX_CPU] = [const { None }; NUM_MAX_CPU];
+
+/// Record a DAG job event on the current CPU. Lock-free, like [`record`].
+pub(crate) fn record_dag_event(event: DagJobEvent) {
+    if !ENABLED.load(Ordering::Acquire) {
+        return;
+    }
+    let cpu_id = awkernel_lib::cpu::cpu_id();
+    let i = DAG_EV_IDX[cpu_id].fetch_add(1, Ordering::Relaxed);
+    if i >= DAG_EV_CAP {
+        return;
+    }
+    unsafe {
+        let bufs = &mut *core::ptr::addr_of_mut!(DAG_EV_BUFS);
+        if let Some(slot) = bufs[cpu_id].as_mut().and_then(|buf| buf.get_mut(i)) {
+            *slot = event;
+        }
+    }
+}
+
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
 static IDX: [AtomicUsize; NUM_MAX_CPU] = array![_ => AtomicUsize::new(0); NUM_MAX_CPU];
+
+/// Per CPU: the buffer slot of the latest `KIND_START` event not yet closed
+/// by a `KIND_END` (`usize::MAX`: none). A slice's start is recorded before
+/// the task's poll learns which period it is working on (a reactor stores
+/// `DagInfo::period_index` inside the poll), so its label can be one
+/// period behind; the matching end carries the right one, and relabels the
+/// start with it (see [`record`]). Starts and ends pair up per CPU: a
+/// context switch always records the end first.
+#[cfg(feature = "period-index-propagation")]
+static OPEN_START: [AtomicUsize; NUM_MAX_CPU] =
+    array![_ => AtomicUsize::new(usize::MAX); NUM_MAX_CPU];
 
 static mut BUFS: [Option<Vec<TraceEvent>>; NUM_MAX_CPU] = [const { None }; NUM_MAX_CPU];
 
@@ -163,6 +215,18 @@ pub(crate) fn record(task_id: u32, kind: u8, period_index: Option<u32>) {
                     kind,
                     period_index,
                 };
+                // Give the slice's start the period its end reports, so
+                // both events of one slice carry the same label.
+                if kind == KIND_START {
+                    OPEN_START[cpu_id].store(i, Ordering::Relaxed);
+                } else if kind == KIND_END {
+                    let open = OPEN_START[cpu_id].swap(usize::MAX, Ordering::Relaxed);
+                    if let Some(start) = buf.get_mut(open) {
+                        if start.task_id == task_id && start.kind == KIND_START {
+                            start.period_index = period_index;
+                        }
+                    }
+                }
             }
             #[cfg(not(feature = "period-index-propagation"))]
             {
@@ -194,6 +258,10 @@ pub fn start() {
     for idx in IDX.iter().take(n) {
         idx.store(0, Ordering::Relaxed);
     }
+    #[cfg(feature = "period-index-propagation")]
+    for open in OPEN_START.iter().take(n) {
+        open.store(usize::MAX, Ordering::Relaxed);
+    }
 
     unsafe {
         let bufs = &mut *core::ptr::addr_of_mut!(DPSW_BUFS);
@@ -204,6 +272,18 @@ pub fn start() {
         }
     }
     for idx in DPSW_IDX.iter().take(n) {
+        idx.store(0, Ordering::Relaxed);
+    }
+
+    unsafe {
+        let bufs = &mut *core::ptr::addr_of_mut!(DAG_EV_BUFS);
+        for buf in bufs.iter_mut().take(n) {
+            if buf.is_none() {
+                *buf = Some(alloc::vec![DagJobEvent::default(); DAG_EV_CAP]);
+            }
+        }
+    }
+    for idx in DAG_EV_IDX.iter().take(n) {
         idx.store(0, Ordering::Relaxed);
     }
 
@@ -435,6 +515,42 @@ pub fn dump_to_console() {
         if n > DPSW_CAP {
             console::print(&format!("TRACE_DPSW_DROPPED,{cpu_id},{}\r\n", n - DPSW_CAP));
         }
+    }
+
+    // TRACE_REL,<dag_id>,<job>,<release_ns>,<woke_ns>
+    //   a job release: its scheduled time and when the source woke for it.
+    // TRACE_NDONE,<dag_id>,<node_id>,<job>,<done_ns>
+    //   a node finishing a job.
+    let mut dropped_dag_events = 0;
+    for cpu_id in 0..awkernel_lib::cpu::num_cpu() {
+        let n = DAG_EV_IDX[cpu_id].load(Ordering::Relaxed);
+        dropped_dag_events += n.saturating_sub(DAG_EV_CAP);
+        let mut out = String::new();
+        unsafe {
+            let bufs = &*core::ptr::addr_of!(DAG_EV_BUFS);
+            if let Some(buf) = bufs[cpu_id].as_ref() {
+                for e in buf.iter().take(n.min(DAG_EV_CAP)) {
+                    match e.kind {
+                        DAG_EV_RELEASE => out.push_str(&format!(
+                            "TRACE_REL,{},{},{},{}\r\n",
+                            e.dag_id, e.job, e.at_ns, e.observed_ns
+                        )),
+                        _ => out.push_str(&format!(
+                            "TRACE_NDONE,{},{},{},{}\r\n",
+                            e.dag_id, e.node_id, e.job, e.at_ns
+                        )),
+                    }
+                    if out.len() > 4096 {
+                        console::print(&out);
+                        out.clear();
+                    }
+                }
+            }
+        }
+        console::print(&out);
+    }
+    if dropped_dag_events > 0 {
+        console::print(&format!("TRACE_DAG_EV_DROPPED,{dropped_dag_events}\r\n"));
     }
 
     console::print("TRACE_END\r\n");

@@ -53,6 +53,10 @@ static ENTITLEMENT_DIRTY: [AtomicBool; NUM_MAX_CPU] =
 /// IPI 255.
 static KICK: [AtomicBool; NUM_MAX_CPU] = array![_ => AtomicBool::new(false); NUM_MAX_CPU];
 
+/// Set by [`kick_cpu_replace`]: on the next IPI 255, drop the rest of the
+/// current plane and move to the newest one before polling.
+static REPLACE: [AtomicBool; NUM_MAX_CPU] = array![_ => AtomicBool::new(false); NUM_MAX_CPU];
+
 /// What an entitlement change means for the CPU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SwitchAction {
@@ -337,6 +341,15 @@ pub(crate) mod measure {
     }
 }
 
+/// Planner side, event-driven (③): like [`kick_cpu`], but the CPU first
+/// replaces the rest of its current plane with the newest published one.
+pub fn kick_cpu_replace(cpu_id: usize) {
+    if let Some(replace) = REPLACE.get(cpu_id) {
+        replace.store(true, Ordering::Release);
+    }
+    kick_cpu(cpu_id);
+}
+
 /// The parts that only exist with preemption (`do_preemption` is compiled
 /// out under `no_preempt`, e.g. the `std` build).
 #[cfg(not(feature = "no_preempt"))]
@@ -394,6 +407,13 @@ mod preemption_side {
             .get(cpu_id)
             .is_some_and(|kick| kick.swap(false, Ordering::AcqRel))
         {
+            if REPLACE
+                .get(cpu_id)
+                .is_some_and(|replace| replace.swap(false, Ordering::AcqRel))
+            {
+                // `cpu_id` is this CPU, so it is always in range.
+                let _ = switch_table::jump_cpu_to_latest(cpu_id);
+            }
             // Sets the dirty flag itself if the kick brings a switch.
             service_switch_table(cpu_id, Instant::now());
         }

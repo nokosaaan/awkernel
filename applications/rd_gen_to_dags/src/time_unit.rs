@@ -67,7 +67,12 @@ pub(super) fn convert_duration_f64(duration: f64) -> Option<Duration> {
     feature = "nanoseconds"
 ))]
 pub(super) fn simulated_execution_time(duration: u64) {
+    #[cfg(not(feature = "cpu_time_work"))]
     awkernel_lib::busy_work::spin_work(convert_duration(duration));
+    // `cpu_time_work`: exactly `duration` of CPU time, whatever the core's
+    // speed (see `awkernel_async_lib::task::cpu_time`).
+    #[cfg(feature = "cpu_time_work")]
+    awkernel_async_lib::task::cpu_time::spin_cpu_time(convert_duration(duration));
 }
 
 // default

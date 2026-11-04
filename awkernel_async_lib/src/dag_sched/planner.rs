@@ -35,6 +35,18 @@
 //! then each CPU has moved on to that span, so the planner may fill the
 //! other plane with the span after it.
 //!
+//! # Event-driven variant (③, the `dagfluid_event` feature)
+//! Releases stay time-driven, but segment `j + 1` of a job arrives when
+//! segment `j`'s completion gate has finished (`dag_sched::event_driven`),
+//! and must finish by its arrival plus `d_j+1`. Future boundaries are
+//! therefore unknown: the planner instead wakes at every segment completion
+//! (notified), every release and every segment deadline, lays out only the
+//! current Deadline Partition (until the next known release or deadline),
+//! publishes it to every CPU and kicks them to replace what is left of
+//! their current plane (`dp_switch::kick_cpu_replace`). A segment still
+//! running past its deadline keeps its rate until it completes (the
+//! papers leave this open); such overruns are counted and logged.
+//!
 //! # Before the first release (bootstrap)
 //! A source node is a DP-Wrap task too, so it cannot release its first job
 //! before its DAG is entitled to some CPU. Until a DAG's first release shows
@@ -167,8 +179,7 @@ pub fn plan_window(
     cuts.sort_unstable();
     cuts.dedup();
 
-    let mut owners: Vec<u32> = Vec::new();
-    let mut densities: Vec<(usize, f64)> = Vec::new();
+    let mut active: Vec<(u32, u32, f64)> = Vec::new();
     for dp in cuts.windows(2) {
         let (Some(&dp_start), Some(&dp_end)) = (dp.first(), dp.get(1)) else {
             continue;
@@ -178,8 +189,7 @@ pub fn plan_window(
             continue;
         }
 
-        owners.clear();
-        densities.clear();
+        active.clear();
         for dag in dags {
             for job in dag.jobs_overlapping(dp_start, dp_end) {
                 let Some(release) = dag.release(job) else {
@@ -189,43 +199,66 @@ pub fn plan_window(
                     let seg_start = release + segment.offset;
                     let seg_end = seg_start + segment.relative_deadline;
                     if seg_start <= dp_start && dp_start < seg_end {
-                        for _ in 0..segment.concurrency {
-                            densities.push((owners.len(), segment.rate));
-                            owners.push(dag.dag_id);
-                        }
+                        active.push((dag.dag_id, segment.concurrency, segment.rate));
                     }
                 }
             }
         }
+        plan_dp(&active, dp_start, dp_end, &mut plans);
+    }
+    plans
+}
 
-        let blocks = wrap_blocks(&densities, num_cpus);
-        let at = |fraction: f64| {
-            Duration::try_from_secs_f64(dp_len.as_secs_f64() * fraction)
-                .ok()
-                .map(|offset| dp_start + offset)
-        };
-        for (plan, chunk) in plans.iter_mut().zip(blocks.iter()) {
-            let mut used = 0.0_f64;
-            for &(owner, from, to) in chunk {
-                if let (Some(time), Some(&dag_id)) = (at(from), owners.get(owner)) {
-                    plan.push(SwitchEntry {
-                        at: time,
-                        dag_id: Some(dag_id),
-                    });
-                }
-                used = to;
+/// Append each CPU's switch points for one DP `[dp_start, dp_end)` running
+/// `active` segments, given as `(dag_id, concurrency, rate)`, to `plans`
+/// (one per pool CPU): McNaughton's wrap of `concurrency` copies of each
+/// `rate`, scaled by the DP's length; trailing idle time is a switch to no
+/// DAG.
+pub fn plan_dp(
+    active: &[(u32, u32, f64)],
+    dp_start: Instant,
+    dp_end: Instant,
+    plans: &mut [Vec<SwitchEntry>],
+) {
+    let dp_len = dp_end.saturating_duration_since(dp_start);
+    if dp_len.is_zero() {
+        return;
+    }
+    let mut owners: Vec<u32> = Vec::new();
+    let mut densities: Vec<(usize, f64)> = Vec::new();
+    for &(dag_id, concurrency, rate) in active {
+        for _ in 0..concurrency {
+            densities.push((owners.len(), rate));
+            owners.push(dag_id);
+        }
+    }
+
+    let blocks = wrap_blocks(&densities, plans.len());
+    let at = |fraction: f64| {
+        Duration::try_from_secs_f64(dp_len.as_secs_f64() * fraction)
+            .ok()
+            .map(|offset| dp_start + offset)
+    };
+    for (plan, chunk) in plans.iter_mut().zip(blocks.iter()) {
+        let mut used = 0.0_f64;
+        for &(owner, from, to) in chunk {
+            if let (Some(time), Some(&dag_id)) = (at(from), owners.get(owner)) {
+                plan.push(SwitchEntry {
+                    at: time,
+                    dag_id: Some(dag_id),
+                });
             }
-            if used < 1.0 - FRACTION_EPSILON {
-                if let Some(time) = at(used) {
-                    plan.push(SwitchEntry {
-                        at: time,
-                        dag_id: None,
-                    });
-                }
+            used = to;
+        }
+        if used < 1.0 - FRACTION_EPSILON {
+            if let Some(time) = at(used) {
+                plan.push(SwitchEntry {
+                    at: time,
+                    dag_id: None,
+                });
             }
         }
     }
-    plans
 }
 
 /// Half the shortest period: the length a span is joined up to.
@@ -284,11 +317,15 @@ fn anchor_of(ring: &JobRing) -> Option<Instant> {
 pub fn spawn_planner() {
     crate::task::spawn(
         "dag_fluid planner".into(),
+        #[cfg(not(feature = "dagfluid_event"))]
         run_planner(),
+        #[cfg(feature = "dagfluid_event")]
+        run_planner_event(),
         crate::scheduler::SchedulerType::PrioritizedFIFO(31),
     );
 }
 
+#[cfg(not(feature = "dagfluid_event"))]
 async fn run_planner() -> Result<(), Cow<'static, str>> {
     let rings: Vec<(u32, Arc<JobRing>)> = job_table::registered_rings();
     let pool: Vec<usize> = super::resource::dagfluid_pool_cpu_set().iter().collect();
@@ -414,6 +451,186 @@ async fn run_planner() -> Result<(), Cow<'static, str>> {
             wake.min(now + BOOTSTRAP_POLL)
         })
         .await;
+    }
+}
+
+/// Where one job stands in the event-driven variant (③).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventJobState {
+    /// `segment` arrived at `arrival` and has not completed; it is due by
+    /// `deadline`.
+    Active {
+        segment: usize,
+        arrival: Instant,
+        deadline: Instant,
+    },
+    /// Every segment has completed.
+    Done,
+}
+
+/// ③: the state of a job released at `release`, given when each of its
+/// segments completed (`event_driven::completed_segments`). Segment 0
+/// arrives at the release; segment `j + 1` when segment `j` completed (or
+/// arrived, if it completed even earlier).
+pub fn event_job_state(
+    segments: &[SegmentTemplate],
+    release: Instant,
+    complete_at: &[Option<Instant>],
+) -> EventJobState {
+    let mut arrival = release;
+    for (segment, template) in segments.iter().enumerate() {
+        match complete_at.get(segment).copied().flatten() {
+            Some(done) => arrival = arrival.max(done),
+            None => {
+                return EventJobState::Active {
+                    segment,
+                    arrival,
+                    deadline: arrival + template.relative_deadline,
+                };
+            }
+        }
+    }
+    EventJobState::Done
+}
+
+/// How long the event-driven planner waits for a CPU to take its previous
+/// plane before re-planning (`ReaderBehind`).
+#[cfg(feature = "dagfluid_event")]
+const REPLACE_RETRY: Duration = Duration::from_micros(50);
+
+#[cfg(feature = "dagfluid_event")]
+async fn run_planner_event() -> Result<(), Cow<'static, str>> {
+    use super::event_driven;
+    use alloc::collections::BTreeSet;
+    use core::pin::pin;
+
+    let rings: Vec<(u32, Arc<JobRing>)> = job_table::registered_rings();
+    let pool: Vec<usize> = super::resource::dagfluid_pool_cpu_set().iter().collect();
+    if rings.is_empty() || pool.is_empty() {
+        log::warn!(
+            "dag_fluid planner (event): nothing to plan ({} DAGs, {} pool CPUs)",
+            rings.len(),
+            pool.len()
+        );
+        return Ok(());
+    }
+    log::info!(
+        "dag_fluid planner (event): {} DAGs on pool CPUs {pool:?}",
+        rings.len()
+    );
+
+    let boot = Instant::now();
+    let mut anchors: Vec<Option<Instant>> = vec![None; rings.len()];
+    // Per DAG: the oldest job not known to be done.
+    let mut first_open: Vec<u64> = vec![0; rings.len()];
+    // Segments seen running past their deadline: (dag_id, job, segment).
+    let mut overruns: BTreeSet<(u32, u64, usize)> = BTreeSet::new();
+    let mut overruns_logged = 0;
+    let mut last_log = boot;
+
+    loop {
+        let now = Instant::now();
+        for (anchor, (_, ring)) in anchors.iter_mut().zip(rings.iter()) {
+            if let Some(real) = anchor_of(ring) {
+                *anchor = Some(real);
+            }
+        }
+        let all_released = anchors.iter().all(Option::is_some);
+        let dags: Vec<PlanDag<'_>> = rings
+            .iter()
+            .zip(anchors.iter())
+            .map(|((dag_id, ring), anchor)| PlanDag {
+                dag_id: *dag_id,
+                period: ring.template().period(),
+                virtual_deadline: ring.template().virtual_deadline(),
+                segments: ring.template().segments(),
+                anchor: anchor.unwrap_or(boot),
+            })
+            .collect();
+
+        // The active segment of every released, unfinished job.
+        let mut active: Vec<(u32, u32, f64)> = Vec::new();
+        let mut next_event = next_release_after(&dags, now);
+        for (dag, first) in dags.iter().zip(first_open.iter_mut()) {
+            let Some(last) = dag.first_job_after(now).and_then(|k| k.checked_sub(1)) else {
+                continue;
+            };
+            let mut job = *first;
+            while job <= last {
+                let Some(release) = dag.release(job) else {
+                    break;
+                };
+                let done = event_driven::completed_segments(dag.dag_id, job);
+                match event_job_state(dag.segments, release, &done) {
+                    EventJobState::Done => {
+                        if job == *first {
+                            *first = job.saturating_add(1);
+                            event_driven::forget_jobs_before(dag.dag_id, *first);
+                        }
+                    }
+                    EventJobState::Active {
+                        segment, deadline, ..
+                    } => {
+                        if let Some(template) = dag.segments.get(segment) {
+                            active.push((dag.dag_id, template.concurrency, template.rate));
+                        }
+                        if deadline > now {
+                            next_event = Some(next_event.map_or(deadline, |t| t.min(deadline)));
+                        } else {
+                            overruns.insert((dag.dag_id, job, segment));
+                        }
+                    }
+                }
+                job = job.saturating_add(1);
+            }
+        }
+        overruns.retain(|&(dag_id, job, _)| {
+            rings
+                .iter()
+                .position(|(id, _)| *id == dag_id)
+                .and_then(|i| first_open.get(i))
+                .is_some_and(|&first| job >= first)
+        });
+
+        // Lay out the current DP and replace every CPU's plan with it.
+        let end = next_event.unwrap_or(now + BOOTSTRAP_POLL);
+        let mut plans: Vec<Vec<SwitchEntry>> = vec![Vec::new(); pool.len()];
+        plan_dp(&active, now, end, &mut plans);
+        let mut behind = false;
+        for (&cpu_id, plan) in pool.iter().zip(plans.iter()) {
+            // Taken only to keep the flag fresh: every plan here is followed
+            // by a kick anyway.
+            let _ = switch_table::take_cpu_starved(cpu_id);
+            match switch_table::publish_cpu_plan(cpu_id, plan) {
+                Ok(_) => dp_switch::kick_cpu_replace(cpu_id),
+                // The CPU has not taken the previous plan yet: re-plan
+                // shortly with whatever has changed meanwhile.
+                Err(SwitchTableError::ReaderBehind { .. }) => behind = true,
+                Err(e) => log_publish_error(cpu_id, e),
+            }
+        }
+
+        if overruns.len() != overruns_logged
+            && now.saturating_duration_since(last_log) >= Duration::from_secs(1)
+        {
+            log::warn!(
+                "dag_fluid planner (event): {} segments running past their deadline",
+                overruns.len()
+            );
+            overruns_logged = overruns.len();
+            last_log = now;
+        }
+
+        let wake = if behind {
+            now + REPLACE_RETRY
+        } else if all_released {
+            end
+        } else {
+            end.min(now + BOOTSTRAP_POLL)
+        };
+        let sleep = pin!(crate::sleep_until(wake));
+        let notified = pin!(event_driven::notified());
+        futures::future::select(sleep, notified).await;
     }
 }
 
@@ -567,6 +784,66 @@ mod tests {
         assert!(end < at_ms(1_000));
         assert!(plans[0].len() <= SWITCH_TABLE_CAPACITY);
         assert!(!plans[0].is_empty());
+    }
+
+    #[test]
+    fn event_job_moves_through_segments_as_they_complete() {
+        let s = [seg(0, 20, 1, 1.0), seg(20, 30, 2, 0.5), seg(50, 10, 1, 1.0)];
+        let r = at_ms(100);
+        assert_eq!(
+            event_job_state(&s, r, &[]),
+            EventJobState::Active {
+                segment: 0,
+                arrival: at_ms(100),
+                deadline: at_ms(120)
+            }
+        );
+        // Segment 0 completed early at 112: segment 1 arrives then, due 30 ms
+        // later (not at the fixed offset 120 / 150).
+        assert_eq!(
+            event_job_state(&s, r, &[Some(at_ms(112))]),
+            EventJobState::Active {
+                segment: 1,
+                arrival: at_ms(112),
+                deadline: at_ms(142)
+            }
+        );
+        assert_eq!(
+            event_job_state(
+                &s,
+                r,
+                &[Some(at_ms(112)), Some(at_ms(160)), Some(at_ms(165))]
+            ),
+            EventJobState::Done
+        );
+    }
+
+    #[test]
+    fn event_arrival_never_goes_back_in_time() {
+        // Segment 1 "completed" before segment 0 did (its gate ran early):
+        // segment 2 still arrives when segment 0 completed.
+        let s = [seg(0, 20, 1, 1.0), seg(20, 30, 1, 1.0), seg(50, 10, 1, 1.0)];
+        assert_eq!(
+            event_job_state(&s, at_ms(0), &[Some(at_ms(15)), Some(at_ms(10))]),
+            EventJobState::Active {
+                segment: 2,
+                arrival: at_ms(15),
+                deadline: at_ms(25)
+            }
+        );
+    }
+
+    #[test]
+    fn plan_dp_lays_out_one_partition() {
+        let mut plans = vec![Vec::new(), Vec::new()];
+        plan_dp(
+            &[(1, 1, 0.6), (2, 1, 0.6)],
+            at_ms(0),
+            at_ms(100),
+            &mut plans,
+        );
+        assert_eq!(plans[0], vec![e(0, Some(1)), e(60, Some(2))]);
+        assert_eq!(plans[1], vec![e(0, Some(2)), e(20, None)]);
     }
 
     #[test]

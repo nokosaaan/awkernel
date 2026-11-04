@@ -42,6 +42,12 @@ prioritized_fifo = []
 vfed = []
 laxity = []
 dagfluid = []
+# DAG-Fluid with event-driven per-core dispatch (③) instead of the default
+# time-driven one (①).
+dagfluid_event = ["dagfluid", "awkernel_async_lib/dagfluid_event"]
+# Run each node for its execution time in CPU time (time on a CPU,
+# whatever the core's speed) instead of a calibrated amount of work.
+cpu_time_work = ["awkernel_async_lib/cpu_time_work"]
 
 # For test
 std = ["awkernel_lib/std", "awkernel_async_lib/std"]

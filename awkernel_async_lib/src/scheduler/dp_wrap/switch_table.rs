@@ -281,6 +281,19 @@ impl PerCpuSwitchTable {
         }
     }
 
+    /// CPU side: drop the rest of the current plane and move to the newest
+    /// published one. For the event-driven planner (③), whose newest plan
+    /// replaces the current one rather than following it. A no-op if
+    /// nothing newer is published.
+    pub fn jump_to_latest(&self) {
+        let reader = self.reader_gen.load(Ordering::Relaxed);
+        let published = self.published_gen.load(Ordering::Acquire);
+        if published > reader {
+            self.reader_idx.store(0, Ordering::Relaxed);
+            self.reader_gen.store(published, Ordering::Release);
+        }
+    }
+
     /// Planner side: whether the CPU's plan ran out since the last call
     /// (true before its first plan too). Clears the flag.
     pub fn take_starved(&self) -> bool {
@@ -316,6 +329,16 @@ pub fn take_cpu_starved(cpu_id: usize) -> Result<bool, SwitchTableError> {
         .get(cpu_id)
         .ok_or(SwitchTableError::NoSuchCpu(cpu_id))?
         .take_starved())
+}
+
+/// CPU side: see [`PerCpuSwitchTable::jump_to_latest`]. Must only be called
+/// on `cpu_id`.
+pub fn jump_cpu_to_latest(cpu_id: usize) -> Result<(), SwitchTableError> {
+    SWITCH_TABLES
+        .get(cpu_id)
+        .ok_or(SwitchTableError::NoSuchCpu(cpu_id))?
+        .jump_to_latest();
+    Ok(())
 }
 
 /// CPU side: poll `cpu_id`'s own table. Must only be called on `cpu_id`.
@@ -393,6 +416,25 @@ mod tests {
         assert!(!t.take_starved(), "an entry is still pending");
         t.poll(at_us(100));
         assert!(t.take_starved(), "the last entry was consumed");
+    }
+
+    #[test]
+    fn jump_replaces_the_rest_of_the_current_plane() {
+        let t = PerCpuSwitchTable::new();
+        t.publish(&[e(100, Some(1)), e(200, Some(2)), e(300, Some(3))])
+            .unwrap();
+        assert_eq!(t.poll(at_us(100)).due, Some(e(100, Some(1))));
+        // A new plan made at 150 replaces 200/300.
+        t.publish(&[e(150, Some(4)), e(400, None)]).unwrap();
+        t.jump_to_latest();
+        assert_eq!(t.reader_generation(), 2);
+        let r = t.poll(at_us(250));
+        assert_eq!(r.due, Some(e(150, Some(4))));
+        assert_eq!(r.next_at, Some(at_us(400)));
+        // Nothing newer: jumping again changes nothing.
+        t.jump_to_latest();
+        assert_eq!(t.reader_generation(), 2);
+        assert_eq!(t.poll(at_us(400)).due, Some(e(400, None)));
     }
 
     #[test]

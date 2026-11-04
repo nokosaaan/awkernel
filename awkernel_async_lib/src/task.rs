@@ -12,6 +12,9 @@ mod preempt;
 #[cfg(feature = "perf")]
 pub mod trace;
 
+#[cfg(feature = "cpu_time_work")]
+pub mod cpu_time;
+
 use crate::scheduler::{self, get_scheduler, pop_preemption_pending, Scheduler, SchedulerType};
 use alloc::{
     borrow::Cow,
@@ -136,6 +139,9 @@ pub struct Task {
     scheduler: &'static dyn Scheduler,
     pub priority: PriorityInfo,
     pub cpu_set: Option<CpuSet>, // The set of cores on which the task may run in clustered scheduling. None if not assigned.
+    /// CPU time this task has used so far, in nanoseconds (see `cpu_time`).
+    #[cfg(feature = "cpu_time_work")]
+    pub(crate) exec_ns: AtomicU64,
 }
 
 impl Task {
@@ -548,6 +554,8 @@ impl Tasks {
                     info,
                     priority: PriorityInfo::new(scheduler.priority(), task_priority),
                     cpu_set,
+                    #[cfg(feature = "cpu_time_work")]
+                    exec_ns: AtomicU64::new(0),
                 };
 
                 e.insert(Arc::new(task));
@@ -1633,7 +1641,10 @@ pub fn run_main() {
                 // this closure's own END record once the poll finally
                 // returns, contradicts them -- two swapped-looking slices
                 // for what was really one continuous span. See the END
-                // record below for the fix.
+                // record below for the fix. This start label can still be
+                // one period behind; `trace::record` overwrites it with the
+                // END's label when the slice closes (2026-11-03), so both
+                // events of a slice end up with the same, correct period.
                 #[cfg(feature = "perf")]
                 let period_index_at_start: Option<u32> = {
                     let mut node = MCSNode::new();
@@ -1663,8 +1674,14 @@ pub fn run_main() {
                     // matching recorded start (see `POLLING`).
                     POLLING[awkernel_lib::cpu::cpu_id()].store(task.id, Ordering::Relaxed);
 
+                    #[cfg(feature = "cpu_time_work")]
+                    cpu_time::slice_start(task.exec_ns.load(Ordering::Relaxed));
+
                     #[allow(clippy::let_and_return)]
                     let result = guard.poll_unpin(&mut ctx);
+
+                    #[cfg(feature = "cpu_time_work")]
+                    task.exec_ns.store(cpu_time::slice_end(), Ordering::Relaxed);
 
                     // The poll may resume on a different CPU than it started
                     // on; clear the flag where it actually ends.

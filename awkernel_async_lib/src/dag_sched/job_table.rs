@@ -360,8 +360,24 @@ pub fn notify_job_release(ring: Option<&JobRing>, dag_id: u32, release: Instant)
     let Some(ring) = ring else {
         return;
     };
-    if let Err(e) = ring.publish_release(release) {
-        log::warn!("job_table: DAG#{dag_id} failed to record release at {release:?}: {e:?}");
+    match ring.publish_release(release) {
+        #[cfg(feature = "perf")]
+        Ok(job) => {
+            let ns = |t: Instant| u64::try_from(t.uptime().as_nanos()).unwrap_or(u64::MAX);
+            crate::task::trace::record_dag_event(crate::task::trace::DagJobEvent {
+                kind: crate::task::trace::DAG_EV_RELEASE,
+                dag_id,
+                node_id: 0,
+                job,
+                at_ns: ns(release),
+                observed_ns: ns(Instant::now()),
+            });
+        }
+        #[cfg(not(feature = "perf"))]
+        Ok(_) => {}
+        Err(e) => {
+            log::warn!("job_table: DAG#{dag_id} failed to record release at {release:?}: {e:?}");
+        }
     }
 }
 

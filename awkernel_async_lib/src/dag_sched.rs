@@ -22,11 +22,14 @@
 //!   SFS, DAG-Fluid), each combining `metrics`/`graph`/`resource` into that
 //!   algorithm's own admission test and turning its decision into a
 //!   [`crate::scheduler::SchedulerType`].
+//! - [`event_driven`]: segment completion tracking for the event-driven
+//!   variant (③) of DAG-Fluid's per-core dispatch.
 //! - [`planner`]: DAG-Fluid's per-core dispatch planner (publishes each
 //!   DAG-pool CPU's switch table window by window); see its own module doc.
 //! - [`job_table`]: per-DAG ring of periodic job releases, the input of
 //!   DAG-Fluid's per-core dispatch planner; see its own module doc.
 pub mod admission;
+pub mod event_driven;
 pub mod graph;
 pub mod job_table;
 pub mod metrics;

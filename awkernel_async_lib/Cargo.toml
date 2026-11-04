@@ -50,3 +50,12 @@ spinlock = ["awkernel_lib/spinlock"]
 clippy = []
 perf = []
 period-index-propagation = ["perf"]
+# DAG-Fluid's per-core dispatch, event-driven variant (③): a segment
+# arrives when the previous one's completion gate finishes, and the planner
+# re-plans at every arrival (see `dag_sched::planner`). Without it the
+# dispatch is time-driven (①).
+dagfluid_event = []
+# Count each task's CPU time and offer `task::cpu_time::spin_cpu_time`, a
+# busy loop that runs for a given amount of CPU time instead of a given
+# amount of calibrated work (see that module).
+cpu_time_work = []

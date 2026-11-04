@@ -97,6 +97,17 @@ fn yield_preempted_and_wake_task(current_task: Arc<Task>, next_thread: PtrWorker
         info.num_preempt += 1;
     }
 
+    // [pause] This task's CPU time so far, kept on this stack for the
+    // resume below (see `task::cpu_time`).
+    #[cfg(feature = "cpu_time_work")]
+    let exec_ns = if was_polling {
+        let total = super::cpu_time::slice_end();
+        current_task.exec_ns.store(total, Ordering::Relaxed);
+        total
+    } else {
+        0
+    };
+
     {
         let mut node = MCSNode::new();
         let mut tasks = PREEMPTED_TASKS[cpu_id].lock(&mut node);
@@ -128,6 +139,9 @@ fn yield_preempted_and_wake_task(current_task: Arc<Task>, next_thread: PtrWorker
         // PERF_STATES is per-CPU, not per-task.
         if was_polling {
             super::POLLING[awkernel_lib::cpu::cpu_id()].store(task_id, Ordering::Relaxed);
+
+            #[cfg(feature = "cpu_time_work")]
+            super::cpu_time::slice_start(exec_ns);
 
             #[cfg(feature = "perf")]
             {

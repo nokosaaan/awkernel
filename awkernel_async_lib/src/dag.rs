@@ -733,8 +733,9 @@ impl Dag {
             && absolute_deadlines.contains_key(&node_info.num_finished)
     }
 
-    /// Records that the node at `node_idx` finished its current job.
-    fn finish_job(&self, node_idx: NodeIndex) {
+    /// Records that the node at `node_idx` finished its current job, and
+    /// returns that job's number (0 for the node's first job).
+    fn finish_job(&self, node_idx: NodeIndex) -> u64 {
         let mut node = MCSNode::new();
         let mut absolute_deadlines = self.absolute_deadlines.lock(&mut node);
 
@@ -742,6 +743,16 @@ impl Dag {
         let mut graph = self.graph.lock(&mut graph_node);
         let node_info = graph.node_weight_mut(node_idx).unwrap();
         node_info.num_finished += 1;
+        let finished_job = node_info.num_finished - 1;
+        #[cfg(feature = "perf")]
+        crate::task::trace::record_dag_event(crate::task::trace::DagJobEvent {
+            kind: crate::task::trace::DAG_EV_NODE_DONE,
+            dag_id: self.id,
+            node_id: node_idx.index() as u32,
+            job: finished_job,
+            at_ns: awkernel_lib::delay::uptime_nano() as u64,
+            observed_ns: 0,
+        });
 
         let oldest_unfinished = graph
             .node_indices()
@@ -758,6 +769,7 @@ impl Dag {
         while absolute_deadlines.len() > max_unfinished {
             absolute_deadlines.pop_first();
         }
+        finished_job
     }
 }
 
@@ -1341,6 +1353,17 @@ where
                 publishers.send_all(results).await;
             }
 
+            // DAG-Fluid ③: a node's completion may complete a segment.
+            #[cfg(feature = "dagfluid_event")]
+            {
+                let job = dag.finish_job(node_idx);
+                crate::dag_sched::event_driven::notify_node_done(
+                    dag_info.dag_id,
+                    dag_info.node_id,
+                    job,
+                );
+            }
+            #[cfg(not(feature = "dagfluid_event"))]
             dag.finish_job(node_idx);
         }
     };
@@ -1429,6 +1452,17 @@ where
                 publishers.send_all(results).await;
             }
 
+            // DAG-Fluid ③: a node's completion may complete a segment.
+            #[cfg(feature = "dagfluid_event")]
+            {
+                let job = dag.finish_job(node_idx);
+                crate::dag_sched::event_driven::notify_node_done(
+                    dag_info.dag_id,
+                    dag_info.node_id,
+                    job,
+                );
+            }
+            #[cfg(not(feature = "dagfluid_event"))]
             dag.finish_job(node_idx);
 
             #[cfg(feature = "perf")]
@@ -1517,6 +1551,17 @@ where
                 f(args);
             }
 
+            // DAG-Fluid ③: a node's completion may complete a segment.
+            #[cfg(feature = "dagfluid_event")]
+            {
+                let job = dag.finish_job(node_idx);
+                crate::dag_sched::event_driven::notify_node_done(
+                    dag_info.dag_id,
+                    dag_info.node_id,
+                    job,
+                );
+            }
+            #[cfg(not(feature = "dagfluid_event"))]
             dag.finish_job(node_idx);
         }
     };
