@@ -25,7 +25,7 @@ use awkernel_lib::{
     arch::x86_64::{
         acpi::AcpiMapper,
         cpu::set_raw_cpu_id_to_numa,
-        delay::synchronize_tsc,
+        delay::{log_tsc_frequency, synchronize_tsc},
         identity_map::identity_map,
         interrupt_remap::init_interrupt_remap,
         page_allocator::{self, get_page_table, PageAllocator, VecPageAllocator},
@@ -399,6 +399,7 @@ fn kernel_main2(
     unsafe { synchronize_tsc(non_primary_cpus.len() + 1) };
 
     log::info!("All CPUs are ready.");
+    log_tsc_frequency();
 
     let kernel_info = KernelInfo {
         info: Some(boot_info),
