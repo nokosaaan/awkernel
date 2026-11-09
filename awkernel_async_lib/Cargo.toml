@@ -12,7 +12,7 @@ array-macro = "2.1"
 fixedbitset = "0.5.7"
 async-trait = "0.1"
 async-recursion = "1.1"
-affinity_btree_queue = { path = "../affinity_btree_queue" }
+affinity_btree_queue = { workspace = true }
 
 [dependencies.futures]
 version = "0.3"
@@ -27,9 +27,6 @@ features = ["alloc", "async-await", "async-await-macro"]
 [dependencies.awkernel_lib]
 path = "../awkernel_lib"
 default-features = false
-
-[dependencies.awkernel_async_lib_verified]
-path = "../awkernel_async_lib_verified"
 
 [dependencies.awkernel_futures_macro]
 path = "../awkernel_futures_macro"

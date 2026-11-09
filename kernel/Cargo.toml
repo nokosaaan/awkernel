@@ -43,8 +43,8 @@ optional = true
 version = "0.2"
 optional = true
 
-[dependencies.userland]
-path = "../userland"
+[dependencies.awkernel_macros]
+path = "../awkernel_macros"
 
 [dependencies.awkernel_async_lib]
 path = "../awkernel_async_lib"
@@ -57,10 +57,6 @@ default-features = false
 [dependencies.awkernel_drivers]
 path = "../awkernel_drivers"
 default-features = false
-
-[dependencies.awkernel_aarch64]
-path = "../awkernel_aarch64"
-optional = true
 
 [dependencies.x86_64]
 version = "0.15"
@@ -79,15 +75,15 @@ optional = true
 default = ["x86"]
 heap-tlsf = ["awkernel_lib/heap-tlsf"]
 heap-wf-alloc = ["awkernel_lib/heap-wf-alloc"]
-perf = ["awkernel_async_lib/perf", "userland/perf"]
+perf = ["awkernel_async_lib/perf"]
 period-index-propagation = [
     "perf",
     "awkernel_async_lib/period-index-propagation",
 ]
 no_std_unwinding = ["dep:unwinding"]
 debug = ["dep:gimli", "dep:addr2line"]
+usb_serial = ["awkernel_drivers/xhci"]
 x86 = [
-    "perf",
     "no_std_unwinding",
     "awkernel_lib/x86",
     "dep:x86_64",
@@ -96,10 +92,10 @@ x86 = [
     "awkernel_drivers/x86",
     "awkernel_drivers/all_pcie",
     "awkernel_drivers/uart_16550",
+    "usb_serial",
     "heap-wf-alloc",
 ]
 rv32 = [
-    "perf",
     "no_std_unwinding",
     "awkernel_lib/rv32",
     "dep:ns16550a",
@@ -107,18 +103,15 @@ rv32 = [
     "heap-tlsf",
 ]
 rv64 = [
-    "perf",
     "no_std_unwinding",
     "awkernel_lib/rv64",
     "dep:ns16550a",
     "heap-tlsf",
     #    "awkernel_drivers/rv64",
 ]
-std = ["perf", "awkernel_lib/std", "awkernel_async_lib/std", "dep:libc"]
+std = ["awkernel_lib/std", "awkernel_async_lib/std", "dep:libc"]
 aarch64 = [
-    "perf",
     "no_std_unwinding",
-    "dep:awkernel_aarch64",
     "awkernel_lib/aarch64",
     "awkernel_drivers/aarch64",
 ]
@@ -149,6 +142,4 @@ aarch64_virt = [
 ]
 spinlock = ["awkernel_lib/spinlock"]
 linux = []
-test_clustered_edf = ["userland/test_clustered_edf"]
-test_dvfs = ["userland/test_dvfs"]
-test_raspi_dvfs = ["userland/test_raspi_dvfs"]
+dvfs = []
