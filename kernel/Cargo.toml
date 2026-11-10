@@ -144,12 +144,8 @@ aarch64_virt = [
 ]
 spinlock = ["awkernel_lib/spinlock"]
 linux = []
+dvfs = []
 fully_one_shot_timer = ["awkernel_drivers/fully_one_shot_timer"]
-test_clustered_edf = ["userland/test_clustered_edf"]
-test_active_vp = ["userland/test_active_vp"]
-rd_gen_vfed = ["userland/rd_gen_vfed"]
-rd_gen_laxity = ["userland/rd_gen_laxity"]
-rd_gen_dagfluid = ["userland/rd_gen_dagfluid"]
 
 # Skip waking any AP whose local APIC ID has bit 0 set, i.e. every SMT/Hyper-
 # Threading sibling thread, so the kernel only brings up one logical CPU per
@@ -164,5 +160,3 @@ smt_disable = []
 # core uses its own level, so hybrid P/E-cores each run at their own base clock.
 # Off by default; no effect on CPUs without HWP (e.g. QEMU).
 fix_freq = []
-test_dvfs = ["userland/test_dvfs"]
-test_raspi_dvfs = ["userland/test_raspi_dvfs"]

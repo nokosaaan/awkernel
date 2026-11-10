@@ -52,6 +52,11 @@ period-index-propagation = ["perf"]
 # re-plans at every arrival (see `dag_sched::planner`). Without it the
 # dispatch is time-driven (①).
 dagfluid_event = []
+# DAG-Fluid's per-core dispatch, per node: every slot of the plan names one
+# node (one thread of a segment, as in the papers) instead of a whole DAG,
+# and a CPU runs only that node during the slot (see `dag_sched::planner`
+# and `scheduler::dp_wrap`). Time-driven (①) only.
+dagfluid_node = []
 # Count each task's CPU time and offer `task::cpu_time::spin_cpu_time`, a
 # busy loop that runs for a given amount of CPU time instead of a given
 # amount of calibrated work (see that module).

@@ -657,6 +657,7 @@ mod tests {
             concurrency,
             rate,
             gate_nodes: Vec::new(),
+            active_nodes: Vec::new(),
         }
     }
 

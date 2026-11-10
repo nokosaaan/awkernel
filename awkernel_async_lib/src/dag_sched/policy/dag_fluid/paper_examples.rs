@@ -81,6 +81,26 @@ fn fig1b_segment_completion_gates() {
     );
 }
 
+/// Derived from Fig. 1b: the threads of each segment. tau_i,4 ([10, 60))
+/// is a thread of segments 2 to 5, tau_i,5 ([20, 50)) of segments 3 and 4.
+#[test]
+fn fig1b_segment_active_nodes() {
+    let nodes = segment_active_nodes(&fig1a());
+    assert_eq!(
+        nodes,
+        alloc::vec![
+            alloc::vec![0],
+            alloc::vec![1, 3],
+            alloc::vec![2, 3, 4],
+            alloc::vec![3, 4],
+            alloc::vec![3]
+        ]
+    );
+    for (active, segment) in nodes.iter().zip(fig1c()) {
+        assert_eq!(active.len(), segment.concurrency as usize);
+    }
+}
+
 /// Table 1, row 1: `T_i/D_i = 90/80 in [1, inf)` gives `D*_i = D_i = 80`
 /// (Fig. 1d caption: `D*_i = 80`).
 #[test]

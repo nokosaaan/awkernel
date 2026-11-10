@@ -234,6 +234,32 @@ pub fn segment_completion_gates(graph: &DagGraph) -> Vec<Vec<usize>> {
         .collect()
 }
 
+/// For each segment [`decompose_segments`] produces (same order, same
+/// skipped windows), the [`DagGraph`] indices of the nodes active during it
+/// in the "infinite processors" timeline (`start <= t0 < finish`): the
+/// segment's threads, one per node. `len()` equals that segment's
+/// `concurrency`. Ascending index order.
+///
+/// A node whose execution spans several segments appears in each of them;
+/// in the papers each appearance is a separate thread with its segment's
+/// own rate. Used by the per-node dispatch (the `dagfluid_node` feature),
+/// which gives each thread its own slot.
+pub fn segment_active_nodes(graph: &DagGraph) -> Vec<Vec<usize>> {
+    let (timing, events) = segment_timeline(graph);
+    events
+        .windows(2)
+        .filter(|w| active_at(&timing, w[0]) > 0)
+        .map(|w| {
+            timing
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.is_some_and(|(s, f)| s <= w[0] && w[0] < f))
+                .map(|(v, _)| v)
+                .collect()
+        })
+        .collect()
+}
+
 /// Table 1 (2022 paper): pick the virtual deadline `D*_i`. See this
 /// module's own doc for the full table; `period`/`deadline`/`critical_path`
 /// are `T_i`/`D_i`/`L_i`. Always returns `deadline` (row 1) when `period >=
@@ -588,6 +614,27 @@ mod tests {
                 alloc::vec![3], // ends at 45
             ]
         );
+    }
+
+    /// Same diamond: node1 ([10,40)) is a thread of segments [1] and [2].
+    #[test]
+    fn test_segment_active_nodes_diamond() {
+        let g = diamond();
+        let nodes = segment_active_nodes(&g);
+        assert_eq!(
+            nodes,
+            alloc::vec![
+                alloc::vec![0],    // [0,10)
+                alloc::vec![1, 2], // [10,15)
+                alloc::vec![1],    // [15,40)
+                alloc::vec![3],    // [40,45)
+            ]
+        );
+        let segments = decompose_segments(&g);
+        assert_eq!(nodes.len(), segments.len());
+        for (active, segment) in nodes.iter().zip(&segments) {
+            assert_eq!(active.len(), segment.concurrency as usize);
+        }
     }
 
     #[test]

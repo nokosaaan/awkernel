@@ -4,6 +4,10 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
+// The per-node DAG-Fluid dispatch is time-driven (①) only.
+#[cfg(all(feature = "dagfluid_node", feature = "dagfluid_event"))]
+compile_error!("features `dagfluid_node` and `dagfluid_event` cannot be enabled together");
+
 extern crate alloc;
 
 mod accepter;

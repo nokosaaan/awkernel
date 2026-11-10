@@ -744,6 +744,8 @@ impl Dag {
         let node_info = graph.node_weight_mut(node_idx).unwrap();
         node_info.num_finished += 1;
         let finished_job = node_info.num_finished - 1;
+        #[cfg(feature = "dagfluid_node")]
+        crate::dag_sched::node_table::note_job_done(self.id, node_idx.index() as u32, finished_job);
         #[cfg(feature = "perf")]
         crate::task::trace::record_dag_event(crate::task::trace::DagJobEvent {
             kind: crate::task::trace::DAG_EV_NODE_DONE,
@@ -1266,6 +1268,23 @@ async fn spawn_dag(dag: &Arc<Dag>) {
     }
 }
 
+/// Spawn a node's reactor task. With the per-node DAG-Fluid dispatch
+/// (`dagfluid_node`), also record which task runs the node
+/// (`dag_sched::node_table`), since the per-node plan names slots by task.
+fn spawn_node_task(
+    reactor_name: Cow<'static, str>,
+    future: impl Future<Output = crate::task::TaskResult> + 'static + Send,
+    sched_type: SchedulerType,
+    dag_info: DagInfo,
+) -> u32 {
+    #[cfg(feature = "dagfluid_node")]
+    let (dag_id, node_id) = (dag_info.dag_id, dag_info.node_id);
+    let task_id = crate::task::spawn_with_dag_info(reactor_name, future, sched_type, dag_info);
+    #[cfg(feature = "dagfluid_node")]
+    crate::dag_sched::node_table::register_node_task(dag_id, node_id, task_id);
+    task_id
+}
+
 async fn spawn_reactor<F, Args, Ret>(
     reactor_name: Cow<'static, str>,
     f: F,
@@ -1368,7 +1387,7 @@ where
         }
     };
 
-    crate::task::spawn_with_dag_info(reactor_name, future, sched_type, dag_info)
+    spawn_node_task(reactor_name, future, sched_type, dag_info)
 }
 
 async fn spawn_periodic_reactor<F, Ret>(
@@ -1477,7 +1496,7 @@ where
         }
     };
 
-    let task_id = crate::task::spawn_with_dag_info(reactor_name, future, sched_type, dag_info);
+    let task_id = spawn_node_task(reactor_name, future, sched_type, dag_info);
 
     #[cfg(feature = "perf")]
     release_measure();
@@ -1566,7 +1585,7 @@ where
         }
     };
 
-    crate::task::spawn_with_dag_info(reactor_name, future, sched_type, dag_info)
+    spawn_node_task(reactor_name, future, sched_type, dag_info)
 }
 
 #[cfg(test)]

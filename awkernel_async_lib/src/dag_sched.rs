@@ -33,6 +33,7 @@ pub mod event_driven;
 pub mod graph;
 pub mod job_table;
 pub mod metrics;
+pub mod node_table;
 pub mod partition;
 pub mod planner;
 pub mod policy;

@@ -137,6 +137,9 @@ rd_gen_dagfluid = ["rd_gen_to_dags", "rd_gen_to_dags/dagfluid"]
 # DAG-Fluid with event-driven per-core dispatch (③): a segment starts when
 # the previous one completes, instead of at its fixed offset (①).
 rd_gen_dagfluid_event = ["rd_gen_to_dags", "rd_gen_to_dags/dagfluid_event"]
+# DAG-Fluid with per-node slots (each slot belongs to one node, not the
+# whole DAG), time-driven (①).
+rd_gen_dagfluid_node = ["rd_gen_to_dags", "rd_gen_to_dags/dagfluid_node"]
 # Run every rd_gen_to_dags node for its execution time in CPU time instead
 # of a calibrated amount of work (combine with any policy feature above).
 rd_gen_cpu_time = ["rd_gen_to_dags", "rd_gen_to_dags/cpu_time_work"]

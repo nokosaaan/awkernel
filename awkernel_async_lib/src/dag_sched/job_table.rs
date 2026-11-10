@@ -67,6 +67,8 @@ pub enum JobTableError {
     AlreadyRegistered(u32),
     /// A reader kept catching a slot mid-write; see [`MAX_READ_RETRIES`].
     ReadContended,
+    /// A segment lists active nodes, but not as many as its `concurrency`.
+    NodeCountMismatch,
 }
 
 /// One segment of a DAG-Fluid task, relative to its job's release.
@@ -84,6 +86,11 @@ pub struct SegmentTemplate {
     /// Node ids expected to finish by this segment's end
     /// (`dag_fluid::segment_completion_gates`).
     pub gate_nodes: Vec<u32>,
+    /// Node ids of this segment's threads, one per node active during it
+    /// (`dag_fluid::segment_active_nodes`). Either empty (not used) or
+    /// exactly `concurrency` long; the per-node dispatch (`dagfluid_node`)
+    /// gives each of them its own slot.
+    pub active_nodes: Vec<u32>,
 }
 
 /// Immutable per-DAG parameters registered at admission.
@@ -102,6 +109,11 @@ impl DagTemplate {
         }
         let mut virtual_deadline = Duration::ZERO;
         for segment in &segments {
+            if !segment.active_nodes.is_empty()
+                && u32::try_from(segment.active_nodes.len()).ok() != Some(segment.concurrency)
+            {
+                return Err(JobTableError::NodeCountMismatch);
+            }
             let end = segment
                 .offset
                 .checked_add(segment.relative_deadline)
@@ -393,6 +405,7 @@ mod tests {
             concurrency: 1,
             rate: 1.0,
             gate_nodes: Vec::new(),
+            active_nodes: Vec::new(),
         }
     }
 
@@ -413,6 +426,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(template.virtual_deadline(), Duration::from_micros(125));
+    }
+
+    #[test]
+    fn active_nodes_must_match_concurrency() {
+        let with_nodes = |concurrency, nodes: Vec<u32>| SegmentTemplate {
+            concurrency,
+            active_nodes: nodes,
+            ..segment(0, 10)
+        };
+        let period = Duration::from_micros(100);
+        // Empty: not used.
+        assert!(DagTemplate::new(period, vec![with_nodes(2, Vec::new())]).is_ok());
+        assert!(DagTemplate::new(period, vec![with_nodes(2, vec![3, 5])]).is_ok());
+        assert_eq!(
+            DagTemplate::new(period, vec![with_nodes(2, vec![3])]),
+            Err(JobTableError::NodeCountMismatch)
+        );
     }
 
     #[test]

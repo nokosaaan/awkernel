@@ -45,6 +45,9 @@ dagfluid = []
 # DAG-Fluid with event-driven per-core dispatch (③) instead of the default
 # time-driven one (①).
 dagfluid_event = ["dagfluid", "awkernel_async_lib/dagfluid_event"]
+# DAG-Fluid with per-node slots: each slot belongs to one node, as in the
+# papers, instead of to the whole DAG (time-driven ① only).
+dagfluid_node = ["dagfluid", "awkernel_async_lib/dagfluid_node"]
 # Run each node for its execution time in CPU time (time on a CPU,
 # whatever the core's speed) instead of a calibrated amount of work.
 cpu_time_work = ["awkernel_async_lib/cpu_time_work"]

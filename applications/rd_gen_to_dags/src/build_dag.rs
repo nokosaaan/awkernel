@@ -1414,6 +1414,13 @@ async fn build_dag_impl(
                     .into_iter()
                     .map(|gate| gate.iter().filter_map(|&v| node_ids.get(v).copied()).collect())
                     .collect();
+            // Each segment's threads, as node ids (the per-node dispatch,
+            // `dagfluid_node`, gives each its own slot).
+            let active: Vec<Vec<u32>> =
+                awkernel_async_lib::dag_sched::policy::dag_fluid::segment_active_nodes(&graph)
+                    .into_iter()
+                    .map(|nodes| nodes.iter().filter_map(|&v| node_ids.get(v).copied()).collect())
+                    .collect();
             // Convert every value from this build's time unit once, here, so
             // `job_table` and the planner only ever see `Duration`s.
             let mut templates = Vec::with_capacity(schedule.len());
@@ -1441,6 +1448,7 @@ async fn build_dag_impl(
                     concurrency: seg.concurrency,
                     rate: seg.rate,
                     gate_nodes: gates.get(j).cloned().unwrap_or_default(),
+                    active_nodes: active.get(j).cloned().unwrap_or_default(),
                 });
             }
 
