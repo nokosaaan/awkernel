@@ -1,7 +1,7 @@
 #[cfg(all(feature = "aarch64", not(feature = "std")))]
 pub mod aarch64;
 
-#[cfg(all(feature = "x86", not(feature = "std")))]
+#[cfg(all(target_arch = "x86_64", any(feature = "x86", feature = "std")))]
 pub mod x86_64;
 
 #[cfg(all(any(feature = "rv32", feature = "rv64"), not(feature = "std")))]

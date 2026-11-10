@@ -4,19 +4,20 @@
 //! It can execute async/await applications in kernel space safely.
 
 #![cfg_attr(feature = "x86", feature(abi_x86_interrupt))]
-#![no_main]
 #![allow(unused_features)]
-#![feature(allocator_api)]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use awkernel_async_lib::{
     scheduler::{wake_task, SchedulerType},
-    task,
+    task::{self, TaskResult},
 };
 use core::{
     fmt::Debug,
+    future::Future,
+    pin::Pin,
     sync::atomic::{AtomicBool, AtomicU16, Ordering},
 };
 use kernel_info::KernelInfo;
@@ -27,6 +28,18 @@ mod kernel_info;
 
 #[cfg(not(feature = "std"))]
 mod nostd;
+
+pub use awkernel_macros::main;
+
+/// Signature of the symbol defined by `#[awkernel::main]`.
+pub type UserMain = fn() -> Pin<Box<dyn Future<Output = TaskResult> + Send>>;
+
+extern "Rust" {
+    fn __awkernel_user_main() -> Pin<Box<dyn Future<Output = TaskResult> + Send>>;
+}
+
+// Fails to compile if the extern declaration drifts from `UserMain`.
+const _: UserMain = || unsafe { __awkernel_user_main() };
 
 static PRIMARY_READY: AtomicBool = AtomicBool::new(false);
 static NUM_READY_WORKER: AtomicU16 = AtomicU16::new(0);
@@ -56,7 +69,6 @@ fn main<Info: Debug>(kernel_info: KernelInfo<Info>) {
 
         init_cpu_execution_speed(kernel_info.cpu_id);
 
-        // Initialize interrupts.
         #[cfg(not(feature = "std"))]
         init_interrupt();
 
@@ -65,7 +77,7 @@ fn main<Info: Debug>(kernel_info: KernelInfo<Info>) {
         // Userland.
         task::spawn(
             "main".into(),
-            async move { userland::main().await },
+            unsafe { __awkernel_user_main() },
             SchedulerType::PrioritizedFIFO(31),
         );
 
@@ -140,8 +152,6 @@ fn main<Info: Debug>(kernel_info: KernelInfo<Info>) {
         awkernel_lib::delay::wait_microsec(10);
     }
 
-    // Before NUM_READY_WORKER is incremented, so this CPU runs no task until its
-    // frequency is final and its busy-work rate is measured.
     init_cpu_execution_speed(kernel_info.cpu_id);
 
     #[cfg(not(feature = "std"))]
@@ -301,4 +311,13 @@ fn init_interrupt() {
     // IRQ for wakeup CPUs.
     awkernel_lib::interrupt::set_wakeup_irq(config::WAKEUP_IRQ);
     awkernel_lib::interrupt::enable_irq(config::WAKEUP_IRQ);
+}
+
+#[cfg_attr(any(not(feature = "dvfs"), feature = "std"), allow(unused_variables))]
+fn init_cpu_execution_speed(cpu_id: usize) {
+    #[cfg(all(feature = "dvfs", not(feature = "std")))]
+    match unsafe { awkernel_lib::dvfs::cpu_init(cpu_id) } {
+        Ok(_) => log::info!("CPU#{cpu_id} Successfully initialized DVFS"),
+        Err(e) => log::warn!("CPU#{cpu_id} Failed to initialize DVFS: {e:?}"),
+    }
 }
