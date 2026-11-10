@@ -50,6 +50,7 @@ pub type CmdRingMem = [Trb; CMD_RING_SIZE];
         let [_, _, ep, _] = self.ctrl.to_le_bytes();
         ep & 0x1f
     }
+}
 
 /// Event Ring Segment Table entry — 16 bytes. xHCI spec §6.5.
 ///

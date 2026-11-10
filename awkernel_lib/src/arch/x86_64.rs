@@ -13,9 +13,7 @@ pub mod delay;
 #[cfg(not(feature = "std"))]
 pub mod dvfs;
 pub mod fault;
-pub mod hwp;
 pub mod identity_map;
-#[cfg(not(feature = "std"))]
 pub(super) mod interrupt;
 #[cfg(not(feature = "std"))]
 pub mod interrupt_remap;
