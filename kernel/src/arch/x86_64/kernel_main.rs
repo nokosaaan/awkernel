@@ -105,17 +105,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     super::console::init_device(); // 2. Initialize the serial port.
 
-    // BAR 0 (red): kernel_main reached, FPU + serial init done.
-    draw_boot_bar(boot_info, 0, 255, 0, 0);
-
     unsafe { unsafe_puts("\r\nThe primary CPU is waking up.\r\n") };
 
     // 3. Initialize virtual memory
 
     unsafe { page_allocator::init(boot_info) };
     let mut page_table = if let Some(page_table) = unsafe { get_page_table() } {
-        // BAR 1 (green): page table mapped OK.
-        draw_boot_bar(boot_info, 1, 0, 255, 0);
         page_table
     } else {
         unsafe { unsafe_puts("Physical memory is not mapped.\r\n") };
@@ -155,9 +150,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // 6. Initialize the backup heap memory allocator.
     let (backup_pages, backup_region, backup_next_frame) =
         init_backup_heap(boot_info, &mut page_table, early_num_cpu);
-
-    // BAR 2 (blue): backup heap OK — about to enter kernel_main2.
-    draw_boot_bar(boot_info, 2, 0, 0, 255);
 
     let _ = catch_unwind(|| {
         kernel_main2(
@@ -210,23 +202,9 @@ fn kernel_main2(
     acpi: AcpiTables<AcpiMapper>,
     offset: u64,
 ) {
-    // BAR 3 (yellow): kernel_main2 entered — inside catch_unwind.
-    draw_boot_bar(boot_info, 3, 255, 255, 0);
-
     // 7. Enable logger.
     super::console::register_console();
 
-    // BAR 4 (cyan): register_console returned — about to init framebuffer.
-    draw_boot_bar(boot_info, 4, 0, 255, 255);
-
-    // Early framebuffer init: lets log::info! appear on screen before PCIe/xHCI.
-    if let Some(framebuffer) = boot_info.framebuffer.take() {
-        let info = framebuffer.info();
-        let buffer = framebuffer.into_buffer();
-        unsafe { awkernel_drivers::ic::x86_64::lfb::init(info, buffer) };
-    }
-
-    log::info!("[boot] step 5: logger + framebuffer ready");
     log::info!(
         "Backup heap: start = 0x{:x}, size = {}MiB",
         HEAP_START,
@@ -300,32 +278,6 @@ fn kernel_main2(
                     && (matches!(type_apic, TypeApic::Xapic(_)) && p.local_apic_id < 255
                         || matches!(type_apic, TypeApic::X2Apic(_)))
                 {
-                    // `smt_disable`: leave every SMT/Hyper-Threading sibling thread
-                    // parked in `WaitingForSipi` (never sent a SIPI, never runs) so
-                    // only one logical CPU per physical core is woken. A stand-in for
-                    // a BIOS/UEFI HT toggle on machines that don't expose one -- see
-                    // real-machine.md's "実機対応記録": HT's two logical CPUs share
-                    // one physical core's execution units, so a task's measured WCET
-                    // varies with whatever its sibling happens to be doing at the
-                    // time, a channel Federated-style admission (which assumes `m`
-                    // independent identical processors) doesn't model, and worse,
-                    // leaving both siblings enabled makes Awkernel see double the
-                    // real core count, over-admitting DAGs the physical machine can't
-                    // actually schedule. The filter relies on the low bit of the
-                    // initial APIC ID encoding the SMT thread index within a core
-                    // (Intel's CPUID leaf 0x1F/0xB topology enumeration) -- true on
-                    // every machine confirmed so far, but not an architectural
-                    // guarantee, so a target with a different APIC ID layout would
-                    // need a different filter, not just this bit.
-                    #[cfg(feature = "smt_disable")]
-                    if p.local_apic_id & 1 != 0 {
-                        log::info!(
-                            "smt_disable: leaving SMT sibling AP parked (APIC ID {})",
-                            p.local_apic_id
-                        );
-                        continue;
-                    }
-
                     non_primary_cpus.insert(p.local_apic_id);
                 }
             }
@@ -354,20 +306,10 @@ fn kernel_main2(
     }
 
     let mut cpu_mapping = BTreeMap::<usize, usize>::new();
-    // DIAGNOSTIC (temporary): a copy of the same pairs kept around to re-log
-    // once the console is confirmed reachable (see below) -- `cpu_mapping`
-    // itself is moved into `set_raw_cpu_id_to_cpu_id` right after this loop,
-    // and logging inline here was confirmed (2026-09-24, via the
-    // cdc_skipped_no_dev counter) to be silently dropped: this early in boot
-    // the USB/PL2303 console device hasn't finished `attach()` yet
-    // (`CDC_DEV_PTR` is still 0), not a locking/timing race, so no amount of
-    // delay between these lines fixes it -- the write target doesn't exist
-    // yet, full stop.
-    let mut cpu_id_pairs = alloc::vec::Vec::new();
     for (cpu_id, raw_cpu_id) in non_primary_cpus.iter().enumerate() {
         let cpu_id = cpu_id + 1; // Non-primary CPU ID starts from 1.
         cpu_mapping.insert(*raw_cpu_id as usize, cpu_id);
-        cpu_id_pairs.push((*raw_cpu_id, cpu_id));
+        log::info!("Raw CPU ID/CPU ID: {raw_cpu_id}/{cpu_id}");
     }
     unsafe { awkernel_lib::arch::x86_64::cpu::set_raw_cpu_id_to_cpu_id(cpu_mapping) };
 
@@ -433,6 +375,20 @@ fn kernel_main2(
     // 17. Initialize interrupt handlers.
     unsafe { interrupt_handler::init() };
 
+    if let Some(framebuffer) = boot_info.framebuffer.take() {
+        let info = framebuffer.info();
+        let buffer = framebuffer.into_buffer();
+
+        log::info!(
+            "Framebuffer: width = {}, height = {}, pixel_format = {:?}",
+            info.width,
+            info.height,
+            info.pixel_format
+        );
+
+        unsafe { awkernel_drivers::ic::x86_64::lfb::init(info, buffer) };
+    }
+
     BSP_READY.store(true, Ordering::SeqCst);
 
     while BOOTED_APS.load(Ordering::Relaxed) != 0 {
@@ -443,25 +399,6 @@ fn kernel_main2(
     unsafe { synchronize_tsc(non_primary_cpus.len() + 1) };
 
     log::info!("All CPUs are ready.");
-
-    // DIAGNOSTIC (temporary): report why some early-boot serial console lines
-    // (e.g. the "Raw CPU ID/CPU ID" lines above) never reach the host --
-    // console output is proven reliable by this point (this line and the ones
-    // right before it were captured), so this print itself should get through
-    // and tell us which failure mode dropped the earlier ones.
-    log::info!(
-        "USB console diag: ok={} skipped_locked={} skipped_no_dev={} write_err={}",
-        awkernel_drivers::pcie::usb::xhci::cdc_write_ok(),
-        awkernel_drivers::pcie::usb::xhci::cdc_skipped_locked(),
-        awkernel_drivers::pcie::usb::xhci::cdc_skipped_no_dev(),
-        awkernel_drivers::pcie::usb::xhci::cdc_write_err(),
-    );
-
-    // DIAGNOSTIC (temporary): re-log the raw-APIC-ID/awkernel-cpu_id pairs
-    // saved above, now that the console is confirmed reachable.
-    for (raw_cpu_id, cpu_id) in &cpu_id_pairs {
-        log::info!("Raw CPU ID/CPU ID: {raw_cpu_id}/{cpu_id}");
-    }
 
     let kernel_info = KernelInfo {
         info: Some(boot_info),
@@ -1001,46 +938,4 @@ fn init_dma(
     };
 
     page_allocator
-}
-
-/// Draw a solid 16-pixel-high horizontal bar directly onto the bootloader
-/// framebuffer.  bar_index 0 → rows [0,16), index 1 → [16,32), …
-///
-/// Safe to call before any driver init and before the logger is ready.
-/// No-ops silently if the framebuffer is absent or already consumed.
-fn draw_boot_bar(boot_info: &mut BootInfo, bar_index: usize, r: u8, g: u8, b: u8) {
-    use bootloader_api::info::PixelFormat;
-    let Some(fb) = boot_info.framebuffer.as_mut() else {
-        return;
-    };
-    let info = fb.info();
-    let buf = fb.buffer_mut();
-    const BAR_H: usize = 16;
-    let y0 = bar_index * BAR_H;
-    let y1 = (y0 + BAR_H).min(info.height);
-    for y in y0..y1 {
-        for x in 0..info.width {
-            // stride is in pixels (bootloader_api spec)
-            let off = (y * info.stride + x) * info.bytes_per_pixel;
-            if off + 3 > buf.len() {
-                break;
-            }
-            match info.pixel_format {
-                PixelFormat::Rgb => {
-                    buf[off] = r;
-                    buf[off + 1] = g;
-                    buf[off + 2] = b;
-                }
-                PixelFormat::Bgr => {
-                    buf[off] = b;
-                    buf[off + 1] = g;
-                    buf[off + 2] = r;
-                }
-                _ => {
-                    let luma = ((r as u16 + g as u16 + b as u16) / 3) as u8;
-                    buf[off] = luma;
-                }
-            }
-        }
-    }
 }

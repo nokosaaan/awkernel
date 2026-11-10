@@ -37,16 +37,7 @@ use regs::{completion, trb_flag, trb_type};
 use ring::{publish, CommandRing, Dcbaa, EventRing, TransferRing, Trb};
 
 // ---------------------------------------------------------------------------
-// Phase 9: global CDC-ACM console writer
-//
-// After the xHCI driver configures a CDC-ACM device it stores a raw pointer
-// to the (heap-pinned) XhciDevice here.  xhci_usb_serial_puts() uses this
-// pointer to write strings via bulk OUT without going through Arc/dyn dispatch.
-//
-// Safety contract:
-//   - CDC_DEV_PTR is written exactly once (in attach()) after Arc::new(dev)
-//     pins the device on the heap; the Arc is never dropped in kernel lifetime.
-//   - CDC_LOCK prevents concurrent/reentrant access.
+// Constants
 // ---------------------------------------------------------------------------
 
 /// Polling budget for controller state transitions (USBSTS / USBCMD / PORTSC).
@@ -62,13 +53,10 @@ const PORT_SETTLE_USEC: u64 = 500_000;
 /// device is required to answer SET_ADDRESS.
 const PORT_RESET_RECOVERY_USEC: u64 = 10_000;
 
-/// DIAGNOSTIC (temporary): counts why `xhci_usb_serial_puts` dropped a line,
-/// to find why some early-boot log lines never reach the serial console --
-/// see kernel_main.rs's own print of these once past the affected window.
-static CDC_SKIPPED_LOCKED: AtomicUsize = AtomicUsize::new(0);
-static CDC_SKIPPED_NO_DEV: AtomicUsize = AtomicUsize::new(0);
-static CDC_WRITE_ERR: AtomicUsize = AtomicUsize::new(0);
-static CDC_WRITE_OK: AtomicUsize = AtomicUsize::new(0);
+/// All DMA allocations go to NUMA node 0.
+const NUMA_NODE: usize = 0;
+const PAGE_SIZE: usize = 4096;
+type Page = [u8; PAGE_SIZE];
 
 /// Scratchpad pointer array: one 8-byte entry per page, in one DMA page.
 const MAX_SCRATCHPAD: usize = PAGE_SIZE / 8;
@@ -124,217 +112,15 @@ pub(super) enum XhciErr {
     InvalidEndpoint,
 }
 
-/// Incremented each time start_controller() succeeds.
-static XHCI_STARTED: AtomicUsize = AtomicUsize::new(0);
-/// Incremented for every port with CCS=1 seen across all boot_enumerate() calls.
-static XHCI_CCS_SEEN: AtomicUsize = AtomicUsize::new(0);
-/// Incremented when enumerate_port() returns Ok (device was addressed + described).
-static XHCI_ENUM_OK: AtomicUsize = AtomicUsize::new(0);
-/// VID of the last device whose Device Descriptor was successfully read.
-static XHCI_LAST_VID: AtomicU32 = AtomicU32::new(0);
-/// PID of the last device whose Device Descriptor was successfully read.
-static XHCI_LAST_PID: AtomicU32 = AtomicU32::new(0);
-/// Set when try_setup_pl2303() sees VID:PID 067b:23xx (PL2303 chip identified).
-static XHCI_PL2303_VID_SEEN: AtomicBool = AtomicBool::new(false);
-/// Set after get_config_descriptor() succeeds inside try_setup_pl2303().
-static XHCI_PL2303_GOT_CFG: AtomicBool = AtomicBool::new(false);
-/// Set after find_bulk_endpoints() finds IN+OUT pair inside try_setup_pl2303().
-static XHCI_PL2303_GOT_EPS: AtomicBool = AtomicBool::new(false);
-/// Set after set_configuration() succeeds inside try_setup_pl2303().
-static XHCI_PL2303_SET_CFG: AtomicBool = AtomicBool::new(false);
-/// Set after configure_bulk_endpoints() (CONFIGURE_EP) succeeds.
-static XHCI_PL2303_CFG_EPS: AtomicBool = AtomicBool::new(false);
-/// Set after pl2303_init_seq() completes successfully.
-static XHCI_PL2303_INIT_SEQ: AtomicBool = AtomicBool::new(false);
-/// Set after the first 9-byte control_transfer_in in get_config_descriptor succeeds
-/// (only meaningful when called from try_setup_pl2303; MSC/CDC calls are skipped for PL2303).
-static XHCI_PL2303_CFG_P1_OK: AtomicBool = AtomicBool::new(false);
-/// Set if wTotalLength parsed from the first-pass config descriptor is non-zero
-/// (indicates DMA buffer was actually written; not a cache-coherency ghost).
-static XHCI_PL2303_CFG_TOTAL_OK: AtomicBool = AtomicBool::new(false);
-/// Last control_transfer_in failure code: 0=no failure yet, 0xFFFF=timeout,
-/// 0xFFFE=exhausted SP retries, else the raw xHCI completion code (e.g. 6=STALL).
-static XHCI_CTRL_FAIL_CODE: AtomicU32 = AtomicU32::new(0);
-/// wTotalLength (capped to 255) read from the first-pass config descriptor.
-/// 0 = not yet set (get_config_descriptor not yet called or first pass failed).
-static XHCI_CFG_FETCH: AtomicU8 = AtomicU8::new(0);
-/// Incremented when port reset (PRC polling) succeeds.
-static XHCI_PORT_RESET_OK: AtomicUsize = AtomicUsize::new(0);
-/// Incremented when Enable Slot command completes with code=1.
-static XHCI_SLOT_ENABLED: AtomicUsize = AtomicUsize::new(0);
-/// Incremented when Address Device command completes with code=1 inside enumerate_port.
-static XHCI_ADDR_DEV_OK: AtomicUsize = AtomicUsize::new(0);
-/// Failure code from the last failed Address Device: 0=none, 0xFFFF=timeout, else xHCI code.
-static XHCI_ADDR_DEV_FAIL: AtomicU32 = AtomicU32::new(0);
-/// Number of successful get_device_descriptor() calls (incremented after VID/PID stored).
-static XHCI_GDESC_OK: AtomicUsize = AtomicUsize::new(0);
-/// Failure code from last failed get_device_descriptor: 0=none, 0xFFFF=timeout, else xHCI code.
-static XHCI_GDESC_FAIL_CODE: AtomicU32 = AtomicU32::new(0);
-/// 0=not attempted, 1=OK, 2=failed/timeout
-static XHCI_NOOP_RESULT: AtomicU32 = AtomicU32::new(0);
-/// USBSTS value captured at the first command timeout; u32::MAX = no timeout yet.
-static XHCI_USBSTS_ON_SLOT_FAIL: AtomicU32 = AtomicU32::new(u32::MAX);
-/// Set to true if BUS_MASTER bit confirmed set after enable_bus_master().
-static XHCI_BUS_MASTER_OK: AtomicBool = AtomicBool::new(false);
-
-/// Returns true if a CDC-ACM or PL2303 device was found and registered.
-pub fn is_cdc_registered() -> bool {
-    CDC_DEV_PTR.load(Ordering::Acquire) != 0
-}
-
-/// Returns true if at least one xHCI controller successfully started.
-pub fn xhci_any_started() -> bool {
-    XHCI_STARTED.load(Ordering::Relaxed) > 0
-}
-
-/// Returns true if at least one USB device (CCS=1) was seen during enumeration.
-pub fn xhci_any_device_seen() -> bool {
-    XHCI_CCS_SEEN.load(Ordering::Relaxed) > 0
-}
-/// Total number of ports with CCS=1 seen at boot.
-pub fn xhci_ccs_count() -> usize {
-    XHCI_CCS_SEEN.load(Ordering::Relaxed)
-}
-/// Total number of successful port resets.
-pub fn xhci_port_reset_count() -> usize {
-    XHCI_PORT_RESET_OK.load(Ordering::Relaxed)
-}
-/// Total number of Enable Slot successes.
-pub fn xhci_slot_count() -> usize {
-    XHCI_SLOT_ENABLED.load(Ordering::Relaxed)
-}
-/// Total number of successful Address Device commands inside enumerate_port.
-pub fn xhci_addr_dev_ok() -> usize {
-    XHCI_ADDR_DEV_OK.load(Ordering::Relaxed)
-}
-/// Failure code from last failed Address Device (0=none, 0xFFFF=timeout, else xHCI code).
-pub fn xhci_addr_dev_fail() -> u32 {
-    XHCI_ADDR_DEV_FAIL.load(Ordering::Relaxed)
-}
-/// Total number of successful get_device_descriptor() calls.
-pub fn xhci_gdesc_ok() -> usize {
-    XHCI_GDESC_OK.load(Ordering::Relaxed)
-}
-/// Failure code from last failed get_device_descriptor (0=none, 0xFFFF=timeout, else xHCI).
-pub fn xhci_gdesc_fail_code() -> u32 {
-    XHCI_GDESC_FAIL_CODE.load(Ordering::Relaxed)
-}
-/// Total number of successful enumerate_port() calls.
-pub fn xhci_enum_count() -> usize {
-    XHCI_ENUM_OK.load(Ordering::Relaxed)
-}
-/// VID of the last device whose Device Descriptor was successfully read (0 = none yet).
-pub fn xhci_last_vid() -> u16 {
-    XHCI_LAST_VID.load(Ordering::Relaxed) as u16
-}
-/// PID of the last device whose Device Descriptor was successfully read (0 = none yet).
-pub fn xhci_last_pid() -> u16 {
-    XHCI_LAST_PID.load(Ordering::Relaxed) as u16
-}
-
-/// Returns true if at least one port reset completed (PRC=1 seen).
-pub fn xhci_any_port_reset_ok() -> bool {
-    XHCI_PORT_RESET_OK.load(Ordering::Relaxed) > 0
-}
-
-/// Returns true if at least one Enable Slot command completed successfully.
-pub fn xhci_any_slot_enabled() -> bool {
-    XHCI_SLOT_ENABLED.load(Ordering::Relaxed) > 0
-}
-
-/// Returns true if at least one device was fully addressed (enumerate_port returned Ok).
-pub fn xhci_any_enum_ok() -> bool {
-    XHCI_ENUM_OK.load(Ordering::Relaxed) > 0
-}
-
-/// Returns true if PL2303 VID:PID (067b:23xx) was matched during setup.
-pub fn xhci_pl2303_vid_seen() -> bool {
-    XHCI_PL2303_VID_SEEN.load(Ordering::Relaxed)
-}
-pub fn xhci_pl2303_cfg_p1_ok() -> bool {
-    XHCI_PL2303_CFG_P1_OK.load(Ordering::Relaxed)
-}
-pub fn xhci_pl2303_cfg_total_ok() -> bool {
-    XHCI_PL2303_CFG_TOTAL_OK.load(Ordering::Relaxed)
-}
-/// 0 = no failure, 0xFFFF = timeout, 0xFFFE = SP-retry exhausted, else xHCI completion code.
-pub fn xhci_ctrl_fail_code() -> u32 {
-    XHCI_CTRL_FAIL_CODE.load(Ordering::Relaxed)
-}
-/// wTotalLength (capped to 255) from first-pass config descriptor; 0 = not set yet.
-pub fn xhci_cfg_fetch() -> u8 {
-    XHCI_CFG_FETCH.load(Ordering::Relaxed)
-}
-pub fn xhci_pl2303_got_cfg() -> bool {
-    XHCI_PL2303_GOT_CFG.load(Ordering::Relaxed)
-}
-pub fn xhci_pl2303_got_eps() -> bool {
-    XHCI_PL2303_GOT_EPS.load(Ordering::Relaxed)
-}
-pub fn xhci_pl2303_set_cfg() -> bool {
-    XHCI_PL2303_SET_CFG.load(Ordering::Relaxed)
-}
-pub fn xhci_pl2303_cfg_eps() -> bool {
-    XHCI_PL2303_CFG_EPS.load(Ordering::Relaxed)
-}
-pub fn xhci_pl2303_init_seq() -> bool {
-    XHCI_PL2303_INIT_SEQ.load(Ordering::Relaxed)
-}
-
-/// 0 = not attempted, 1 = success, 2 = fail/timeout
-pub fn xhci_noop_result() -> u32 {
-    XHCI_NOOP_RESULT.load(Ordering::Relaxed)
-}
-pub fn xhci_bus_master_ok() -> bool {
-    XHCI_BUS_MASTER_OK.load(Ordering::Relaxed)
-}
-
-/// Returns the USBSTS value captured at the first Enable Slot timeout, if any.
-pub fn xhci_usbsts_on_fail() -> Option<u32> {
-    let v = XHCI_USBSTS_ON_SLOT_FAIL.load(Ordering::Relaxed);
-    if v == u32::MAX {
-        None
-    } else {
-        Some(v)
-    }
-}
-
-/// Write `data` to the CDC-ACM USB serial adapter if one has been configured.
-/// No-ops when CDC-ACM is unavailable; never blocks more than a USB bulk timeout.
-/// Skips silently on reentrant calls (e.g. log from within a CDC write path).
-pub fn xhci_usb_serial_puts(data: &str) {
-    let ptr = CDC_DEV_PTR.load(Ordering::Acquire);
-    if ptr == 0 {
-        CDC_SKIPPED_NO_DEV.fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-
-    // Try to acquire the spinlock; skip if already held (reentrancy guard).
-    if CDC_LOCK
-        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        CDC_SKIPPED_LOCKED.fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-
-    // SAFETY: CDC_DEV_PTR holds the address of an XhciDevice pinned inside an Arc
-    // that lives for the kernel's entire lifetime.  CDC_LOCK prevents aliased &mut.
-    let dev = unsafe { &mut *(ptr as *mut XhciDevice) };
-    let slot = CDC_SLOT.load(Ordering::Relaxed);
-    if dev.cdcacm_write(slot, data.as_bytes()).is_err() {
-        CDC_WRITE_ERR.fetch_add(1, Ordering::Relaxed);
-        // A failed bulk OUT leaves a pending TRB in the ring that would desynchronise
-        // all future poll_xfer_completion calls.  Try to recover the ring; only
-        // invalidate the pointer if recovery itself fails.
-        if dev.reset_bulk_out_ep(slot).is_err() {
-            CDC_DEV_PTR.store(0, Ordering::Release);
+impl From<XhciErr> for PCIeDeviceErr {
+    fn from(e: XhciErr) -> Self {
+        log::error!("xHCI: {e:?}");
+        match e {
+            XhciErr::Mmio => PCIeDeviceErr::BARFailure,
+            XhciErr::Timeout | XhciErr::Completion(_) => PCIeDeviceErr::CommandFailure,
+            _ => PCIeDeviceErr::InitFailure,
         }
-    } else {
-        CDC_WRITE_OK.fetch_add(1, Ordering::Relaxed);
     }
-
-    CDC_LOCK.store(false, Ordering::Release);
 }
 
 impl From<MmioErr> for XhciErr {
@@ -2073,58 +1859,34 @@ pub fn xhci_usb_serial_puts(data: &str) {
 pub(super) fn attach(
     mut info: PCIeInfo,
 ) -> Result<Arc<dyn PCIeDevice + Sync + Send>, PCIeDeviceErr> {
-    log::info!("xHCI: attaching {}", info);
+    log::info!("xHCI: attaching {info}");
 
-    // Map the MMIO region(s) declared in BARs.
     info.map_bar()
         .map_err(|_| PCIeDeviceErr::PageTableFailure)?;
     info.read_capability();
     info.disable_legacy_interrupt();
 
-    let cap_base = match info.get_bar(0) {
-        Some(BaseAddress::Mmio { addr, .. }) => VirtAddr::new(addr),
-        _ => {
-            log::error!("xHCI: BAR[0] not found or not MMIO");
-            return Err(PCIeDeviceErr::BARFailure);
-        }
-    };
+    let cap = Mmio::from_bar(info.get_bar(0)).map_err(|e| {
+        log::error!("xHCI: BAR[0] not usable: {e:?}");
+        PCIeDeviceErr::BARFailure
+    })?;
 
-    let mut dev = XhciDevice::new(cap_base, &info)?;
-
-    log::info!(
-        "xHCI: {}: HCIVERSION={:#06x} ports={} slots={} interrupters={}",
-        dev.name,
-        dev.hci_version,
-        dev.max_ports,
-        dev.max_slots,
-        dev.max_interrupters,
-    );
-    log::info!(
-        "xHCI: cmd_ring_phys={:#018x}  evt_seg_phys={:#018x}  erst_phys={:#018x}",
-        dev.cmd_ring.phys_base(),
-        dev.evt_ring.seg_phys(),
-        dev.evt_ring.erst_phys(),
-    );
-
-    // Phase 2: reset → program rings → MSI-X → start
-    dev.reset_controller()?;
-    // Re-enable Bus Master after HCRST — some controllers clear it during reset,
-    // and UEFI may have cleared it at ExitBootServices.  Must be set before
-    // start_controller() so the controller can DMA to the event ring.
+    let mut hc = Controller::new(cap, format!("{} xHCI", info.get_bdf()))?;
+    hc.reset()?;
+    // Bus Master may be cleared by HCRST or at ExitBootServices; the controller
+    // needs it to DMA into the event ring.
     info.enable_bus_master();
-    // Read back to verify BUS_MASTER actually stuck (some controllers reset it on HCRST).
-    if info
+    if !info
         .read_status_command()
-        .contains(super::super::registers::StatusCommand::BUS_MASTER)
+        .contains(StatusCommand::BUS_MASTER)
     {
-        XHCI_BUS_MASTER_OK.store(true, Ordering::Relaxed);
-        log::info!("xHCI: {}: BUS_MASTER confirmed set", dev.name);
-    } else {
-        log::error!("xHCI: {}: BUS_MASTER NOT set — DMA will fail!", dev.name);
+        log::error!("xHCI: {}: BUS_MASTER NOT set — DMA will fail", hc.name);
+        return Err(PCIeDeviceErr::InitFailure);
     }
-    dev.program_rings();
-    dev.init_scratchpad()
-        .map_err(|_| PCIeDeviceErr::InitFailure)?;
+    hc.program_rings()?;
+    hc.init_scratchpad()?;
+    hc.start()?;
+    hc.boot_enumerate()?;
 
     let serial = hc
         .serial_dev

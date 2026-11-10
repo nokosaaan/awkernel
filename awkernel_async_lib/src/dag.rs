@@ -987,8 +987,9 @@ pub fn get_all_dag_edges() -> Vec<(u32, u32, u32)> {
 
 /// Returns the absolute deadline of the DAG job that the node of `dag_info` processes next.
 /// A wake of the source node in any `state` except `State::Preempted` releases that job
-/// with `wake_time` plus the sink relative deadline, if it is not released yet. Any other wake
-/// before the release gets that value without a release.
+/// with its interval tick target plus the sink relative deadline, if it is not released yet.
+/// Any other wake before release gets `wake_time` plus the sink relative deadline. Shared by
+/// every DAG scheduler (GEDF, ClusteredEDF, the VP schedulers and DP-Wrap).
 ///
 /// Each job keeps its own deadline (see [`Dag::get_or_release_absolute_deadline`]), so two jobs
 /// of an arbitrary-deadline DAG (relative deadline `D` > period `T`) in flight at once do not
@@ -997,7 +998,7 @@ pub fn get_all_dag_edges() -> Vec<(u32, u32, u32)> {
 /// # Panics
 ///
 /// Panics if the DAG does not exist, has no node `dag_info.node_id`, or has no sink relative
-/// deadline.
+/// deadline, or the source releases a job without an interval tick target.
 pub fn calculate_and_update_dag_deadline(dag_info: &DagInfo, wake_time: u64, state: State) -> u64 {
     let dag_id = dag_info.dag_id;
     let dag = get_dag(dag_id).unwrap_or_else(|| panic!("DAG {dag_id} not found"));
@@ -1007,13 +1008,13 @@ pub fn calculate_and_update_dag_deadline(dag_info: &DagInfo, wake_time: u64, sta
     // source node finishes a job, it waits only for that tick, because it has no subscriber.
     let release = state != State::Preempted;
 
-    dag.get_or_release_absolute_deadline(to_node_index(dag_info.node_id), release, || {
+    dag.get_or_release_absolute_deadline(to_node_index(dag_info.node_id), release, |release_time| {
         // Microseconds, the unit of `awkernel_lib::delay::uptime()`.
         let relative_deadline_us = dag
             .get_sink_relative_deadline()
             .map(|deadline| deadline.as_micros() as u64)
             .unwrap_or_else(|| panic!("DAG {dag_id} has no sink relative deadline set"));
-        wake_time + relative_deadline_us
+        release_time.unwrap_or(wake_time) + relative_deadline_us
     })
 }
 
@@ -1513,7 +1514,6 @@ where
         // Looked up once here so the per-release path takes no lock.
         let job_ring = crate::dag_sched::job_table::job_ring(dag_info.dag_id);
 
-        let mut interval = interval(period, dag_info.dag_id);
         // Consume the first tick here to start the loop's main body without an initial delay.
         let release = interval.tick().await;
         crate::dag_sched::job_table::notify_job_release(
@@ -1568,13 +1568,13 @@ where
             #[cfg(feature = "perf")]
             periodic_measure();
 
+            dag.set_next_release_time(interval.next_tick_target());
             let release = interval.tick().await;
             crate::dag_sched::job_table::notify_job_release(
                 job_ring.as_deref(),
                 dag_info.dag_id,
                 release,
             );
-            dag.set_next_release_time(interval.next_tick_target());
         }
     };
 
@@ -1729,6 +1729,8 @@ mod tests {
         let dag = create_dag();
         let source = dag.add_node_with_topic_edges(&[], &["release_test_topic".into()]);
         let sink = dag.add_node_with_topic_edges(&["release_test_topic".into()], &[]);
+        // A release reads the source's next interval tick target.
+        dag.set_next_release_time(Instant::zero());
 
         // A non-source node and a preempted source node never release a job.
         assert!(!dag.is_job_release(sink, State::Runnable));
@@ -1736,7 +1738,7 @@ mod tests {
 
         // The source node releases job 0. A later wake in job 0 does not release it again.
         assert!(dag.is_job_release(source, State::Runnable));
-        dag.get_or_release_absolute_deadline(source, true, || 10);
+        dag.get_or_release_absolute_deadline(source, true, |_| 10);
         assert!(!dag.is_job_release(source, State::Runnable));
 
         // After the source node finishes job 0, its next wake releases job 1.
@@ -1818,7 +1820,6 @@ mod tests {
 
     #[test]
     fn gedf_deadline_uses_tick_target_when_source_releases_job() {
-        use crate::scheduler::gedf::calculate_and_update_dag_deadline;
         use crate::task::{DagInfo, State};
 
         let dag = create_dag();
@@ -1826,14 +1827,8 @@ mod tests {
         let sink = dag.add_node_with_topic_edges(&["gedf_release_time_topic".into()], &[]);
         dag.set_relative_deadline(sink, Duration::from_micros(50));
 
-        let source_info = DagInfo {
-            dag_id: dag.id,
-            node_id: source.index() as u32,
-        };
-        let sink_info = DagInfo {
-            dag_id: dag.id,
-            node_id: sink.index() as u32,
-        };
+        let source_info = DagInfo::new(dag.id, source.index() as u32);
+        let sink_info = DagInfo::new(dag.id, sink.index() as u32);
 
         // The timer wakes at 13 us, but the job was due at 10.999 us. The
         // scheduler uses microseconds, so the absolute deadline is 60 us.
