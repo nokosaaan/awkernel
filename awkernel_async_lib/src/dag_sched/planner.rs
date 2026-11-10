@@ -20,6 +20,16 @@
 //! that CPU would overlap. A release of one DAG therefore moves the other
 //! DAGs' switch points too.
 //!
+//! # Per-node slots (the `dagfluid_node` feature)
+//! By default a block of the wrap is one of a segment's `m_i,j` threads,
+//! and its slot goes to the DAG as a whole. With `dagfluid_node`, the
+//! threads are the segment's active nodes (`SegmentTemplate::active_nodes`,
+//! the nodes running in it on the infinite-processor timeline): each gets
+//! one block of length `theta_i,j`, and its slot names that node and the
+//! job it belongs to (`switch_table::NodeSlot`). A node active in several
+//! segments gets a block in each of them; DP-Wrap may place those blocks on
+//! different CPUs.
+//!
 //! # Spans (one plane each)
 //! Releases of different DAGs can fall close together, leaving windows of a
 //! few milliseconds. Since every release is known in advance, consecutive
@@ -69,7 +79,7 @@
 use super::job_table::{self, JobRing, SegmentTemplate};
 use crate::scheduler::dp_wrap::{
     dp_switch,
-    switch_table::{self, SwitchEntry, SwitchTableError, SWITCH_TABLE_CAPACITY},
+    switch_table::{self, NodeSlot, SwitchEntry, SwitchTableError, SWITCH_TABLE_CAPACITY},
     wrap_blocks,
 };
 use alloc::{borrow::Cow, sync::Arc, vec, vec::Vec};
@@ -83,6 +93,23 @@ const BOOTSTRAP_POLL: Duration = Duration::from_millis(1);
 /// Fractions this close to a chunk's end count as the end (`wrap_blocks`
 /// works in `f64`).
 const FRACTION_EPSILON: f64 = 1e-9;
+
+/// Whether slots go to single nodes (the `dagfluid_node` feature) rather
+/// than to whole DAGs. See the module doc.
+const PER_NODE: bool = cfg!(feature = "dagfluid_node");
+
+/// One active segment of one job inside a DP, as [`plan_dp`] lays it out.
+#[derive(Debug, Clone, Copy)]
+pub struct ActiveSegment<'a> {
+    pub dag_id: u32,
+    pub job: u64,
+    /// `m_i,j`: the number of threads, used when `nodes` is empty.
+    pub concurrency: u32,
+    /// `theta_i,j`: each thread's rate.
+    pub rate: f64,
+    /// The threads as nodes, for per-node slots; empty for per-DAG slots.
+    pub nodes: &'a [u32],
+}
 
 /// One DAG as the plan computation sees it.
 #[derive(Debug, Clone, Copy)]
@@ -153,6 +180,18 @@ pub fn plan_window(
     end: Instant,
     num_cpus: usize,
 ) -> Vec<Vec<SwitchEntry>> {
+    plan_window_with(dags, start, end, num_cpus, PER_NODE)
+}
+
+/// [`plan_window`] with the slot granularity given explicitly (per node if
+/// `per_node`, else per DAG).
+fn plan_window_with(
+    dags: &[PlanDag<'_>],
+    start: Instant,
+    end: Instant,
+    num_cpus: usize,
+    per_node: bool,
+) -> Vec<Vec<SwitchEntry>> {
     let mut plans: Vec<Vec<SwitchEntry>> = vec![Vec::new(); num_cpus];
     if end <= start || num_cpus == 0 {
         return plans;
@@ -179,7 +218,7 @@ pub fn plan_window(
     cuts.sort_unstable();
     cuts.dedup();
 
-    let mut active: Vec<(u32, u32, f64)> = Vec::new();
+    let mut active: Vec<ActiveSegment<'_>> = Vec::new();
     for dp in cuts.windows(2) {
         let (Some(&dp_start), Some(&dp_end)) = (dp.first(), dp.get(1)) else {
             continue;
@@ -199,7 +238,13 @@ pub fn plan_window(
                     let seg_start = release + segment.offset;
                     let seg_end = seg_start + segment.relative_deadline;
                     if seg_start <= dp_start && dp_start < seg_end {
-                        active.push((dag.dag_id, segment.concurrency, segment.rate));
+                        active.push(ActiveSegment {
+                            dag_id: dag.dag_id,
+                            job,
+                            concurrency: segment.concurrency,
+                            rate: segment.rate,
+                            nodes: if per_node { &segment.active_nodes } else { &[] },
+                        });
                     }
                 }
             }
@@ -210,12 +255,12 @@ pub fn plan_window(
 }
 
 /// Append each CPU's switch points for one DP `[dp_start, dp_end)` running
-/// `active` segments, given as `(dag_id, concurrency, rate)`, to `plans`
-/// (one per pool CPU): McNaughton's wrap of `concurrency` copies of each
-/// `rate`, scaled by the DP's length; trailing idle time is a switch to no
-/// DAG.
+/// the `active` segments to `plans` (one per pool CPU): McNaughton's wrap
+/// of one block of length `rate` per thread (each of `nodes`, or
+/// `concurrency` anonymous ones if `nodes` is empty), scaled by the DP's
+/// length; trailing idle time is a switch to no DAG.
 pub fn plan_dp(
-    active: &[(u32, u32, f64)],
+    active: &[ActiveSegment<'_>],
     dp_start: Instant,
     dp_end: Instant,
     plans: &mut [Vec<SwitchEntry>],
@@ -224,12 +269,26 @@ pub fn plan_dp(
     if dp_len.is_zero() {
         return;
     }
-    let mut owners: Vec<u32> = Vec::new();
+    // The owner of each block: its DAG, and its node slot if per node.
+    let mut owners: Vec<(u32, Option<NodeSlot>)> = Vec::new();
     let mut densities: Vec<(usize, f64)> = Vec::new();
-    for &(dag_id, concurrency, rate) in active {
-        for _ in 0..concurrency {
-            densities.push((owners.len(), rate));
-            owners.push(dag_id);
+    for segment in active {
+        if segment.nodes.is_empty() {
+            for _ in 0..segment.concurrency {
+                densities.push((owners.len(), segment.rate));
+                owners.push((segment.dag_id, None));
+            }
+        } else {
+            for &node_id in segment.nodes {
+                densities.push((owners.len(), segment.rate));
+                owners.push((
+                    segment.dag_id,
+                    Some(NodeSlot {
+                        node_id,
+                        job: segment.job,
+                    }),
+                ));
+            }
         }
     }
 
@@ -242,20 +301,18 @@ pub fn plan_dp(
     for (plan, chunk) in plans.iter_mut().zip(blocks.iter()) {
         let mut used = 0.0_f64;
         for &(owner, from, to) in chunk {
-            if let (Some(time), Some(&dag_id)) = (at(from), owners.get(owner)) {
+            if let (Some(time), Some(&(dag_id, node))) = (at(from), owners.get(owner)) {
                 plan.push(SwitchEntry {
                     at: time,
                     dag_id: Some(dag_id),
+                    node,
                 });
             }
             used = to;
         }
         if used < 1.0 - FRACTION_EPSILON {
             if let Some(time) = at(used) {
-                plan.push(SwitchEntry {
-                    at: time,
-                    dag_id: None,
-                });
+                plan.push(SwitchEntry::dag(time, None));
             }
         }
     }
@@ -315,6 +372,8 @@ fn anchor_of(ring: &JobRing) -> Option<Instant> {
 /// Start the planner task. Call once, after every DAG-Fluid DAG has been
 /// admitted.
 pub fn spawn_planner() {
+    // Per-node slots stop a node through a placeholder task per CPU.
+    crate::scheduler::dp_wrap::spawn_placeholders(super::resource::dagfluid_pool_cpu_set().iter());
     crate::task::spawn(
         "dag_fluid planner".into(),
         #[cfg(not(feature = "dagfluid_event"))]
@@ -549,7 +608,7 @@ async fn run_planner_event() -> Result<(), Cow<'static, str>> {
             .collect();
 
         // The active segment of every released, unfinished job.
-        let mut active: Vec<(u32, u32, f64)> = Vec::new();
+        let mut active: Vec<ActiveSegment<'_>> = Vec::new();
         let mut next_event = next_release_after(&dags, now);
         for (dag, first) in dags.iter().zip(first_open.iter_mut()) {
             let Some(last) = dag.first_job_after(now).and_then(|k| k.checked_sub(1)) else {
@@ -572,7 +631,13 @@ async fn run_planner_event() -> Result<(), Cow<'static, str>> {
                         segment, deadline, ..
                     } => {
                         if let Some(template) = dag.segments.get(segment) {
-                            active.push((dag.dag_id, template.concurrency, template.rate));
+                            active.push(ActiveSegment {
+                                dag_id: dag.dag_id,
+                                job,
+                                concurrency: template.concurrency,
+                                rate: template.rate,
+                                nodes: &[],
+                            });
                         }
                         if deadline > now {
                             next_event = Some(next_event.map_or(deadline, |t| t.min(deadline)));
@@ -677,9 +742,27 @@ mod tests {
     }
 
     fn e(at: u64, dag_id: Option<u32>) -> SwitchEntry {
-        SwitchEntry {
-            at: at_ms(at),
+        SwitchEntry::dag(at_ms(at), dag_id)
+    }
+
+    fn n(at: u64, dag_id: u32, node_id: u32, job: u64) -> SwitchEntry {
+        SwitchEntry::node(at_ms(at), dag_id, node_id, job)
+    }
+
+    fn seg_nodes(offset: u64, deadline: u64, rate: f64, nodes: &[u32]) -> SegmentTemplate {
+        SegmentTemplate {
+            active_nodes: nodes.to_vec(),
+            ..seg(offset, deadline, nodes.len() as u32, rate)
+        }
+    }
+
+    fn active(dag_id: u32, concurrency: u32, rate: f64) -> ActiveSegment<'static> {
+        ActiveSegment {
             dag_id,
+            job: 0,
+            concurrency,
+            rate,
+            nodes: &[],
         }
     }
 
@@ -838,13 +921,61 @@ mod tests {
     fn plan_dp_lays_out_one_partition() {
         let mut plans = vec![Vec::new(), Vec::new()];
         plan_dp(
-            &[(1, 1, 0.6), (2, 1, 0.6)],
+            &[active(1, 1, 0.6), active(2, 1, 0.6)],
             at_ms(0),
             at_ms(100),
             &mut plans,
         );
         assert_eq!(plans[0], vec![e(0, Some(1)), e(60, Some(2))]);
         assert_eq!(plans[1], vec![e(0, Some(2)), e(20, None)]);
+    }
+
+    /// Per-node slots: segment 0 `[0, 20)` has node 0 at rate 1; segment 1
+    /// `[20, 60)` has nodes 1 and 3 at rate 0.5 each, wrapped onto CPU 0
+    /// (node 1 for the first half of the DP, node 3 for the second).
+    #[test]
+    fn per_node_slots_name_each_thread() {
+        let s = [seg_nodes(0, 20, 1.0, &[0]), seg_nodes(20, 40, 0.5, &[1, 3])];
+        let dags = [dag(1, 100, &s, 0)];
+        let plans = plan_window_with(&dags, at_ms(0), at_ms(100), 2, true);
+        assert_eq!(
+            plans,
+            vec![
+                vec![n(0, 1, 0, 0), n(20, 1, 1, 0), n(40, 1, 3, 0), e(60, None)],
+                vec![e(0, None), e(20, None), e(60, None)],
+            ]
+        );
+        // Per DAG, the same layout names only the DAG.
+        let plans = plan_window_with(&dags, at_ms(0), at_ms(100), 2, false);
+        assert_eq!(
+            plans[0],
+            vec![e(0, Some(1)), e(20, Some(1)), e(40, Some(1)), e(60, None)]
+        );
+    }
+
+    /// Each node gets exactly `theta * DP length` of every DP its segment is
+    /// active in, summed over the CPUs it lands on, and slots carry the job.
+    #[test]
+    fn per_node_time_matches_the_rate_and_carries_the_job() {
+        // Fig. 1-like segment with three threads at rate 5/9 on 2 CPUs.
+        let s = [seg_nodes(0, 36, 5.0 / 9.0, &[2, 3, 4])];
+        let dags = [dag(1, 100, &s, 0)];
+        // Window of job 1 ([100, 200)).
+        let plans = plan_window_with(&dags, at_ms(100), at_ms(200), 2, true);
+        let mut per_node = [Duration::ZERO; 5];
+        for plan in &plans {
+            for pair in plan.windows(2) {
+                if let Some(slot) = pair[0].node {
+                    assert_eq!(slot.job, 1);
+                    per_node[slot.node_id as usize] +=
+                        pair[1].at.saturating_duration_since(pair[0].at);
+                }
+            }
+        }
+        for node in [2, 3, 4] {
+            let got = per_node[node].as_secs_f64();
+            assert!((got - 0.020).abs() < 1e-6, "node {node}: {got}");
+        }
     }
 
     #[test]

@@ -121,6 +121,11 @@ heap-wf-alloc = ["awkernel/heap-wf-alloc"]
 spinlock = ["awkernel/spinlock"]
 linux = ["awkernel/linux"]
 period-index-propagation = ["awkernel/period-index-propagation"]
+# Real-machine evaluation knobs (see kernel/Cargo.toml for each one's doc);
+# scripts/real_machine_trial.py passes smt_disable and fix_freq by default.
+smt_disable = ["awkernel/smt_disable"]
+fix_freq = ["awkernel/fix_freq"]
+fully_one_shot_timer = ["awkernel/fully_one_shot_timer"]
 
 # Evaluation applications
 rd_gen_to_dags = ["dep:rd_gen_to_dags"]

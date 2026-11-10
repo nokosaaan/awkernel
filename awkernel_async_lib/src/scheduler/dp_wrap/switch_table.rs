@@ -1,7 +1,7 @@
 //! Per-CPU, double-buffered switch tables for DAG-Fluid's per-core dispatch
 //! (方式B, Step 2).
 //!
-//! Each DAG-pool CPU gets its own table of `(time, dag_id)` switch points.
+//! Each DAG-pool CPU gets its own table of `(time, owner)` switch points.
 //! The planner (a task) writes the plan for the *next window* into the
 //! table's back plane and publishes it by bumping a generation number; the
 //! CPU itself reads only its own table, from its `DpSwitch` timer interrupt
@@ -19,12 +19,15 @@
 //! window. Any number of overlapping jobs (arbitrary deadlines) fit in one
 //! plane, because a plane is the merged schedule of the whole window.
 //!
-//! # Entries are per DAG
-//! An entry names a DAG, not a segment: a CPU entitled to a DAG may run any
-//! of that DAG's ready nodes (see `ENTITLEMENT` in the parent module for why
-//! per-segment tracking was ruled out). Consecutive entries for the same
-//! DAG would not change anything, so [`PerCpuSwitchTable::publish`] folds
-//! them before counting against [`SWITCH_TABLE_CAPACITY`].
+//! # What an entry names
+//! By default an entry names a DAG, not a segment: a CPU entitled to a DAG
+//! may run any of that DAG's ready nodes (see `ENTITLEMENT` in the parent
+//! module for why per-segment tracking was ruled out). With the
+//! `dagfluid_node` feature the planner also fills [`SwitchEntry::node`]:
+//! the slot then belongs to one node's thread of one job (a [`NodeSlot`]).
+//! Consecutive entries for the same owner (DAG, and node slot if any) would
+//! not change anything, so [`PerCpuSwitchTable::publish`] folds them before
+//! counting against [`SWITCH_TABLE_CAPACITY`].
 //!
 //! # Publication protocol (one writer, one reader per table)
 //! - `published_gen` is the newest generation the planner has published;
@@ -55,6 +58,9 @@ pub const SWITCH_TABLE_CAPACITY: usize = 128;
 /// Stored in place of a DAG id for "no DAG" (the CPU idles DP-Wrap-wise).
 const NO_DAG: u32 = u32::MAX;
 
+/// Stored in place of a node id for "no node slot" (a per-DAG entry).
+const NO_NODE: u32 = u32::MAX;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SwitchTableError {
     /// More entries than [`SWITCH_TABLE_CAPACITY`] after folding.
@@ -69,12 +75,47 @@ pub enum SwitchTableError {
     NoSuchCpu(usize),
 }
 
+/// The node thread a per-node slot belongs to (the `dagfluid_node`
+/// feature): node `node_id` of the DAG, working on job `job`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeSlot {
+    pub node_id: u32,
+    pub job: u64,
+}
+
 /// One switch point: from `at` on, the CPU is entitled to `dag_id` (`None`:
-/// to no DAG).
+/// to no DAG), and with `node` set, to that node's slot only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SwitchEntry {
     pub at: Instant,
     pub dag_id: Option<u32>,
+    /// `None` for a per-DAG entry (and always for no DAG).
+    pub node: Option<NodeSlot>,
+}
+
+impl SwitchEntry {
+    /// A per-DAG entry (`None`: no DAG).
+    pub const fn dag(at: Instant, dag_id: Option<u32>) -> Self {
+        Self {
+            at,
+            dag_id,
+            node: None,
+        }
+    }
+
+    /// A per-node entry: `dag_id`'s node `node_id`, job `job`.
+    pub const fn node(at: Instant, dag_id: u32, node_id: u32, job: u64) -> Self {
+        Self {
+            at,
+            dag_id: Some(dag_id),
+            node: Some(NodeSlot { node_id, job }),
+        }
+    }
+
+    /// Whether `self` and `other` hand the CPU to the same owner.
+    fn same_owner(&self, other: &Self) -> bool {
+        self.dag_id == other.dag_id && self.node == other.node
+    }
 }
 
 /// What [`PerCpuSwitchTable::poll`] found.
@@ -94,6 +135,8 @@ pub struct PollResult {
 struct Slot {
     at_ns: AtomicU64,
     dag_id: AtomicU32,
+    node_id: AtomicU32,
+    job: AtomicU64,
 }
 
 impl Slot {
@@ -101,7 +144,20 @@ impl Slot {
         Self {
             at_ns: AtomicU64::new(0),
             dag_id: AtomicU32::new(NO_DAG),
+            node_id: AtomicU32::new(NO_NODE),
+            job: AtomicU64::new(0),
         }
+    }
+
+    fn store(&self, at_ns: u64, entry: &SwitchEntry) {
+        self.at_ns.store(at_ns, Ordering::Relaxed);
+        self.dag_id
+            .store(entry.dag_id.unwrap_or(NO_DAG), Ordering::Relaxed);
+        let (node_id, job) = entry
+            .node
+            .map_or((NO_NODE, 0), |slot| (slot.node_id, slot.job));
+        self.node_id.store(node_id, Ordering::Relaxed);
+        self.job.store(job, Ordering::Relaxed);
     }
 
     fn load(&self) -> SwitchEntry {
@@ -110,7 +166,14 @@ impl Slot {
             NO_DAG => None,
             dag_id => Some(dag_id),
         };
-        SwitchEntry { at, dag_id }
+        let node = match self.node_id.load(Ordering::Relaxed) {
+            NO_NODE => None,
+            node_id => Some(NodeSlot {
+                node_id,
+                job: self.job.load(Ordering::Relaxed),
+            }),
+        };
+        SwitchEntry { at, dag_id, node }
     }
 }
 
@@ -175,7 +238,7 @@ impl PerCpuSwitchTable {
 
     /// Planner side: publish `entries` (one window, in time order) as the
     /// next generation and return that generation. Folds consecutive
-    /// entries for the same DAG. Never allocates.
+    /// entries for the same owner (DAG and node slot). Never allocates.
     pub fn publish(&self, entries: &[SwitchEntry]) -> Result<u64, SwitchTableError> {
         let published = self.published_gen.load(Ordering::Relaxed);
         let reader = self.reader_gen.load(Ordering::Acquire);
@@ -199,7 +262,7 @@ impl PerCpuSwitchTable {
                 if entry.at < prev.at {
                     return Err(SwitchTableError::Unsorted { index });
                 }
-                if entry.dag_id == prev.dag_id {
+                if entry.same_owner(&prev) {
                     continue;
                 }
             }
@@ -214,9 +277,9 @@ impl PerCpuSwitchTable {
 
         let plane = self.plane(next);
         let mut written = 0;
-        let mut last_dag: Option<Option<u32>> = None;
+        let mut last: Option<&SwitchEntry> = None;
         for entry in entries {
-            if last_dag == Some(entry.dag_id) {
+            if last.is_some_and(|prev| entry.same_owner(prev)) {
                 continue;
             }
             let Some(slot) = plane.slots.get(written) else {
@@ -224,10 +287,8 @@ impl PerCpuSwitchTable {
             };
             // Range-checked in the counting pass above.
             let at_ns = u64::try_from(entry.at.uptime().as_nanos()).unwrap_or(u64::MAX);
-            slot.at_ns.store(at_ns, Ordering::Relaxed);
-            slot.dag_id
-                .store(entry.dag_id.unwrap_or(NO_DAG), Ordering::Relaxed);
-            last_dag = Some(entry.dag_id);
+            slot.store(at_ns, entry);
+            last = Some(entry);
             written += 1;
         }
         plane.len.store(written, Ordering::Relaxed);
@@ -359,10 +420,11 @@ mod tests {
     }
 
     fn e(us: u64, dag_id: Option<u32>) -> SwitchEntry {
-        SwitchEntry {
-            at: at_us(us),
-            dag_id,
-        }
+        SwitchEntry::dag(at_us(us), dag_id)
+    }
+
+    fn n(us: u64, dag_id: u32, node_id: u32, job: u64) -> SwitchEntry {
+        SwitchEntry::node(at_us(us), dag_id, node_id, job)
     }
 
     #[test]
@@ -472,6 +534,51 @@ mod tests {
             now += 1;
         }
         assert_eq!(seen, [e(100, Some(1)), e(200, Some(2)), e(300, Some(1))]);
+    }
+
+    #[test]
+    fn node_slots_round_trip_and_fold_per_node_and_job() {
+        let t = PerCpuSwitchTable::new();
+        t.publish(&[
+            n(100, 1, 3, 0),
+            n(150, 1, 3, 0), // same node, same job: folded
+            n(200, 1, 4, 0), // another node of the same DAG
+            n(300, 1, 4, 1), // same node, next job
+            e(400, Some(1)), // a per-DAG entry differs from any node slot
+            e(500, None),
+        ])
+        .unwrap();
+        let mut seen = Vec::new();
+        let mut now = 0;
+        while let Some(next) = t.poll(at_us(now)).next_at {
+            now = next.uptime().as_micros() as u64;
+            seen.push(t.poll(at_us(now)).due.unwrap());
+            now += 1;
+        }
+        assert_eq!(
+            seen,
+            [
+                n(100, 1, 3, 0),
+                n(200, 1, 4, 0),
+                n(300, 1, 4, 1),
+                e(400, Some(1)),
+                e(500, None)
+            ]
+        );
+    }
+
+    #[test]
+    fn overwritten_slot_drops_a_stale_node() {
+        // A plane reused for a per-DAG entry must not keep the node slot
+        // written there two generations before.
+        let t = PerCpuSwitchTable::new();
+        t.publish(&[n(100, 1, 3, 7)]).unwrap();
+        t.publish(&[e(1_000, Some(2))]).unwrap();
+        t.poll(at_us(100));
+        assert_eq!(t.poll(at_us(100)).next_at, Some(at_us(1_000)));
+        t.publish(&[e(2_000, Some(1))]).unwrap();
+        t.poll(at_us(1_000));
+        assert_eq!(t.poll(at_us(2_000)).due, Some(e(2_000, Some(1))));
     }
 
     #[test]

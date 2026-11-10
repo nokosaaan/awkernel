@@ -284,11 +284,44 @@ fn init_interrupt() {
     awkernel_lib::interrupt::enable_irq(config::WAKEUP_IRQ);
 }
 
-#[cfg_attr(any(not(feature = "dvfs"), feature = "std"), allow(unused_variables))]
+/// Set up how fast this CPU executes, in this order:
+/// 1. DVFS (`dvfs`): upstream's per-CPU init, which requests the minimum
+///    frequency.
+/// 2. `fix_freq`: pin the CPU to its own HWP Guaranteed Performance. This
+///    runs after DVFS so the pin is the final frequency request.
+/// 3. Calibrate `busy_work` at the final frequency. rd_gen_to_dags realizes
+///    each node's execution time as a calibrated amount of work
+///    (`busy_work::spin_work`); without this, it falls back to a wall-clock
+///    wait that also counts time spent preempted.
 fn init_cpu_execution_speed(cpu_id: usize) {
     #[cfg(all(feature = "dvfs", not(feature = "std")))]
     match unsafe { awkernel_lib::dvfs::cpu_init(cpu_id) } {
         Ok(_) => log::info!("CPU#{cpu_id} Successfully initialized DVFS"),
         Err(e) => log::warn!("CPU#{cpu_id} Failed to initialize DVFS: {e:?}"),
+    }
+
+    #[cfg(all(feature = "fix_freq", target_arch = "x86_64", not(feature = "std")))]
+    {
+        use awkernel_lib::arch::x86_64::{dvfs, hwp};
+
+        match hwp::pin_to_guaranteed() {
+            Ok(levels) => {
+                // HWP transitions take tens of microseconds; settle before measuring.
+                awkernel_lib::delay::wait_millisec(1);
+                let mhz = dvfs::measure_freq_hz(10_000).map_or(0, |hz| hz / 1_000_000);
+                log::info!(
+                    "fix_freq: CPU#{cpu_id} pinned to HWP guaranteed={} (lowest={}, highest={}), measured {mhz} MHz",
+                    levels.guaranteed,
+                    levels.lowest,
+                    levels.highest,
+                );
+            }
+            Err(e) => log::warn!("fix_freq: CPU#{cpu_id} frequency not pinned: {e:?}"),
+        }
+    }
+
+    match awkernel_lib::busy_work::calibrate_current_cpu() {
+        Some(per_ms) => log::info!("busy_work: CPU#{cpu_id} calibrated at {per_ms} iterations/ms"),
+        None => log::warn!("busy_work: CPU#{cpu_id} could not be calibrated"),
     }
 }

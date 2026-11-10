@@ -21,6 +21,30 @@
 //!   entitled DAG must win even if its deadline is later -- the same kind
 //!   of exception the PrioritizedRR quantum already gets there.
 //!
+//! # Per-node slots (the `dagfluid_node` feature)
+//! A switch then stores the entry's node slot along with its DAG
+//! (`set_node_slot`), and the successor is that node only, if it is ready
+//! and on the slot's job (`DpWrapData::take_node`). Switching between two
+//! nodes of the same DAG preempts too. A node that becomes ready during its
+//! own slot is not dispatched by priority: `DpWrapScheduler::wake_task`
+//! calls [`nudge_cpu`] on the CPU holding the slot, which then takes the
+//! same path as a switch.
+//!
+//! When the slot's node is not ready (not woken yet, still on an earlier
+//! or already past this job, or running on another CPU) and another
+//! DAG-Fluid node runs on the CPU, that node is stopped and the slot is
+//! left empty: the successor is the CPU's placeholder task
+//! (`dp_wrap::spawn_placeholders`), which does nothing, so the CPU idles
+//! until the slot's node is woken (and nudged) or the next switch point.
+//! The stopped node goes back to the ready nodes when the placeholder's
+//! thread starts (`re_schedule`), and runs again in a later slot of its own.
+//!
+//! A node that has overrun (every slot of its job has passed, unfinished)
+//! runs only in no-DAG slots: there the CPU takes the overrun ready node
+//! with the earliest deadline (`DpWrapData::take_overrun`). A node still
+//! running when its CPU switches to a no-DAG slot keeps it only if it has
+//! overrun; otherwise it gives the CPU to an overrun node or is stopped.
+//!
 //! # Starting and restarting a CPU's plan
 //! A CPU arms its own timer (`timer::request_at` only arms the calling
 //! CPU), so the planner, which runs elsewhere, cannot. After publishing the
@@ -29,7 +53,7 @@
 //! not, and [`prepare_preemption_on_cpu`] then polls the table and arms the
 //! timer. From then on the CPU keeps itself armed.
 
-use super::{switch_table, ENTITLEMENT, NO_DAG};
+use super::{set_node_slot, switch_table, ENTITLEMENT, NODE_SLOTS, NO_DAG};
 use crate::task::{get_current_task, request_preemption};
 use alloc::boxed::Box;
 use array_macro::array;
@@ -68,7 +92,9 @@ enum SwitchAction {
     Preempt,
 }
 
-fn switch_action(old: Option<u32>, new: Option<u32>, running: bool) -> SwitchAction {
+/// `old`/`new` are the CPU's owner before and after (`None`: no DAG): the
+/// DAG, or with [`NODE_SLOTS`] the DAG and node slot.
+fn switch_action<T: PartialEq>(old: Option<T>, new: Option<T>, running: bool) -> SwitchAction {
     if old == new || new.is_none() {
         // With nothing newly entitled there is no successor to switch to;
         // a running node of the old DAG keeps the CPU until it yields.
@@ -80,16 +106,33 @@ fn switch_action(old: Option<u32>, new: Option<u32>, running: bool) -> SwitchAct
     }
 }
 
-/// Store `new` as `cpu_id`'s entitlement and return the previous one and
-/// what the change means. For [`SwitchAction::Preempt`] the CPU has been
-/// marked dirty.
-fn apply_due(cpu_id: usize, new: Option<u32>) -> (Option<u32>, SwitchAction) {
+/// Store `new` as `cpu_id`'s entitlement (with its node slot, if any) and
+/// return the previous DAG and what the change means. For
+/// [`SwitchAction::Preempt`] the CPU has been marked dirty.
+fn apply_due(
+    cpu_id: usize,
+    new: Option<u32>,
+    node: Option<switch_table::NodeSlot>,
+) -> (Option<u32>, SwitchAction) {
     let Some(slot) = ENTITLEMENT.get(cpu_id) else {
         return (None, SwitchAction::Nothing);
     };
+    let old_node = super::node_slot_of(cpu_id);
+    let node = if NODE_SLOTS { node } else { None };
+    set_node_slot(cpu_id, node);
     let old = slot.swap(new.unwrap_or(NO_DAG), Ordering::AcqRel);
     let old = (old != NO_DAG).then_some(old);
-    let action = switch_action(old, new, get_current_task(cpu_id).is_some());
+    let running = get_current_task(cpu_id).is_some();
+    let mut action = switch_action(
+        old.map(|dag_id| (dag_id, old_node)),
+        new.map(|dag_id| (dag_id, node)),
+        running,
+    );
+    if NODE_SLOTS && new.is_none() && old.is_some() && running {
+        // A no-DAG slot belongs to overrun nodes only: the IPI 255 path
+        // decides whether the running node may stay (`no_dag_successor`).
+        action = SwitchAction::Preempt;
+    }
     if action == SwitchAction::Preempt {
         if let Some(dirty) = ENTITLEMENT_DIRTY.get(cpu_id) {
             dirty.store(true, Ordering::Release);
@@ -108,7 +151,7 @@ fn service_switch_table(cpu_id: usize, now: Instant) -> bool {
     // Apply before arming: arming a time that has already passed fires the
     // callback again right here, and that later entry must win.
     let need_preemption = result.due.is_some_and(|due| {
-        let (old, action) = apply_due(cpu_id, due.dag_id);
+        let (old, action) = apply_due(cpu_id, due.dag_id, due.node);
         let path = match action {
             SwitchAction::Preempt => measure::PREEMPT,
             SwitchAction::PickUpWhenIdle => measure::IDLE,
@@ -116,6 +159,9 @@ fn service_switch_table(cpu_id: usize, now: Instant) -> bool {
             SwitchAction::Nothing => measure::SAME,
         };
         measure::begin(cpu_id, due.at, now, old, due.dag_id, path, result.skipped);
+        if NODE_SLOTS {
+            super::slot_measure::begin(cpu_id, due.at, due.dag_id, due.node, result.skipped);
+        }
         action == SwitchAction::Preempt
     });
     if let Some(next) = result.next_at {
@@ -172,7 +218,7 @@ pub(crate) mod measure {
         use crate::task::trace::{self, DpSwitchEvent};
         pub(crate) use crate::task::trace::{
             DPSW_IDLE as IDLE, DPSW_NO_SUCCESSOR as NO_SUCCESSOR, DPSW_PREEMPT as PREEMPT,
-            DPSW_SAME as SAME, DPSW_TO_NONE as TO_NONE,
+            DPSW_SAME as SAME, DPSW_STOP as STOP, DPSW_TO_NONE as TO_NONE,
         };
         use array_macro::array;
         use awkernel_lib::{cpu::NUM_MAX_CPU, interrupt::InterruptGuard, time::Instant};
@@ -321,6 +367,8 @@ pub(crate) mod measure {
         pub(crate) const TO_NONE: u8 = 3;
         #[cfg_attr(feature = "no_preempt", allow(dead_code))]
         pub(crate) const NO_SUCCESSOR: u8 = 4;
+        #[cfg_attr(feature = "no_preempt", allow(dead_code))]
+        pub(crate) const STOP: u8 = 5;
 
         #[allow(clippy::too_many_arguments)]
         pub(crate) fn begin(
@@ -341,6 +389,20 @@ pub(crate) mod measure {
     }
 }
 
+/// With [`NODE_SLOTS`]: `cpu_id`'s slot node just became ready while the
+/// CPU runs something else. Mark the CPU dirty and send it IPI 255, so it
+/// re-checks its own slot and switches to the node (the same path as a
+/// switch point). Callable from any CPU.
+pub(crate) fn nudge_cpu(cpu_id: usize) {
+    let Some(dirty) = ENTITLEMENT_DIRTY.get(cpu_id) else {
+        return;
+    };
+    dirty.store(true, Ordering::Release);
+    request_preemption(cpu_id);
+    let preempt_irq = awkernel_lib::interrupt::get_preempt_irq();
+    awkernel_lib::interrupt::send_ipi(preempt_irq, cpu_id as u32);
+}
+
 /// Planner side, event-driven (③): like [`kick_cpu`], but the CPU first
 /// replaces the rest of its current plane with the newest published one.
 pub fn kick_cpu_replace(cpu_id: usize) {
@@ -355,7 +417,7 @@ pub fn kick_cpu_replace(cpu_id: usize) {
 #[cfg(not(feature = "no_preempt"))]
 mod preemption_side {
     use super::{
-        super::{entitlement_of, DpWrapTask, SCHEDULER},
+        super::{entitlement_of, own_slot, placeholder_of, DpWrapTask, SCHEDULER},
         *,
     };
     use crate::{
@@ -379,6 +441,26 @@ mod preemption_side {
             SchedulerType::DpWrap(dag_id) => Some(dag_id),
             _ => None,
         }
+    }
+
+    /// The `(dag_id, node_id)` of a `DpWrap` task that is a DAG node.
+    fn dpwrap_node_of(task: &Task) -> Option<(u32, u32)> {
+        let mut node = MCSNode::new();
+        let info = task.info.lock(&mut node);
+        match info.scheduler_type {
+            SchedulerType::DpWrap(dag_id) => info.get_dag_info().map(|d| (dag_id, d.node_id)),
+            _ => None,
+        }
+    }
+
+    /// With [`NODE_SLOTS`]: take `dag_id`'s slot node if it is ready and on
+    /// the slot's job.
+    fn take_slot_node(dag_id: u32, slot: switch_table::NodeSlot) -> Option<Arc<Task>> {
+        let mut node = MCSNode::new();
+        let _guard = GLOBAL_WAKE_GET_MUTEX.lock(&mut node);
+        let mut node_inner = MCSNode::new();
+        let mut data = SCHEDULER.data.lock(&mut node_inner);
+        (*data).as_mut()?.take_node(dag_id, slot)
     }
 
     /// Pop the first runnable task of `dag_id`'s ready queue.
@@ -424,8 +506,13 @@ mod preemption_side {
         if !dirty {
             return;
         }
-        let Some(dag_id) = entitlement_of(cpu_id) else {
-            measure::finish(cpu_id, measure::TO_NONE);
+        let (dag_id, slot) = own_slot();
+        let Some(dag_id) = dag_id else {
+            if NODE_SLOTS {
+                no_dag_successor(cpu_id);
+            } else {
+                measure::finish(cpu_id, measure::TO_NONE);
+            }
             return;
         };
         let Some(current) = get_current_task(cpu_id).and_then(get_task) else {
@@ -433,13 +520,87 @@ mod preemption_side {
             measure::set_path(cpu_id, measure::IDLE);
             return;
         };
-        if dpwrap_dag_of(&current) == Some(dag_id) {
+        let slot = if NODE_SLOTS { slot } else { None };
+        let same = match slot {
+            Some(slot) => dpwrap_node_of(&current) == Some((dag_id, slot.node_id)),
+            None => dpwrap_dag_of(&current) == Some(dag_id),
+        };
+        if let Some(slot) = slot {
+            if same {
+                super::super::slot_measure::observe(
+                    cpu_id,
+                    dag_id,
+                    slot.node_id,
+                    crate::scheduler::dp_wrap::slot_measure::SLOT_RUNNING_HERE,
+                    current.id,
+                );
+            }
+        }
+        if same {
             measure::finish(cpu_id, measure::SAME);
             return;
         }
-        // No ready node of the entitled DAG: the running task keeps the CPU
-        // until one wakes up (`DpWrapScheduler::invoke_preemption`).
-        let Some(successor) = pop_successor(dag_id) else {
+        // No ready node of the entitled DAG (or the slot's node is not ready
+        // for the slot's job): the running task keeps the CPU until one
+        // wakes up (`DpWrapScheduler::wake_task`).
+        let successor = match slot {
+            Some(slot) => {
+                let taken = take_slot_node(dag_id, slot);
+                let (state, task_id) = match &taken {
+                    Some(task) => (crate::scheduler::dp_wrap::slot_measure::SLOT_READY, task.id),
+                    None => super::super::classify_slot_locked(dag_id, slot),
+                };
+                super::super::slot_measure::observe(cpu_id, dag_id, slot.node_id, state, task_id);
+                taken
+            }
+            .or_else(|| {
+                // The slot's node is not ready: stop the running node and
+                // leave the slot empty.
+                dpwrap_dag_of(&current)?;
+                if placeholder_of(cpu_id) == Some(current.id) {
+                    return None;
+                }
+                let placeholder = get_task(placeholder_of(cpu_id)?)?;
+                measure::set_path(cpu_id, measure::STOP);
+                Some(placeholder)
+            }),
+            None => pop_successor(dag_id),
+        };
+        let Some(successor) = successor else {
+            measure::finish(cpu_id, measure::NO_SUCCESSOR);
+            return;
+        };
+        measure::decided(cpu_id, successor.id);
+        if let Some(rotation) = ROTATION_TASK.get(cpu_id) {
+            rotation.store(successor.id, Ordering::Release);
+        }
+        push_preemption_pending(cpu_id, successor);
+    }
+
+    /// With [`NODE_SLOTS`], in a no-DAG slot: an overrun node keeps running;
+    /// any other running DAG-Fluid node gives the CPU to the overrun ready
+    /// node with the earliest deadline, or is stopped (placeholder) if there
+    /// is none.
+    fn no_dag_successor(cpu_id: usize) {
+        let Some(current) = get_current_task(cpu_id).and_then(get_task) else {
+            measure::set_path(cpu_id, measure::IDLE);
+            return;
+        };
+        if dpwrap_dag_of(&current).is_none()
+            || placeholder_of(cpu_id) == Some(current.id)
+            || super::super::task_overrun(&current)
+        {
+            measure::finish(cpu_id, measure::TO_NONE);
+            return;
+        }
+        let successor = match super::super::take_overrun_node() {
+            Some(task) => Some(task),
+            None => {
+                measure::set_path(cpu_id, measure::STOP);
+                placeholder_of(cpu_id).and_then(get_task)
+            }
+        };
+        let Some(successor) = successor else {
             measure::finish(cpu_id, measure::NO_SUCCESSOR);
             return;
         };
@@ -462,6 +623,11 @@ mod preemption_side {
             .is_err()
         {
             return false;
+        }
+        if NODE_SLOTS {
+            // `next` is the slot's node (checked when it was queued), and
+            // any other DAG-Fluid node gives way to it, of the same DAG or not.
+            return dpwrap_dag_of(current).is_some() && dpwrap_dag_of(next).is_some();
         }
         rotation_allowed(
             entitlement_of(cpu_id),
@@ -494,7 +660,10 @@ mod tests {
     #[test]
     fn same_dag_or_nothing_new_needs_no_switch() {
         assert_eq!(switch_action(Some(1), Some(1), true), SwitchAction::Nothing);
-        assert_eq!(switch_action(None, None, true), SwitchAction::Nothing);
+        assert_eq!(
+            switch_action::<u32>(None, None, true),
+            SwitchAction::Nothing
+        );
         // Losing the entitlement with nothing to switch to.
         assert_eq!(switch_action(Some(1), None, true), SwitchAction::Nothing);
         assert_eq!(switch_action(Some(1), None, false), SwitchAction::Nothing);
@@ -512,6 +681,18 @@ mod tests {
             switch_action(None, Some(2), false),
             SwitchAction::PickUpWhenIdle
         );
+    }
+
+    #[test]
+    fn another_node_of_the_same_dag_is_a_switch() {
+        use switch_table::NodeSlot;
+        let a = Some((1, Some(NodeSlot { node_id: 2, job: 0 })));
+        let b = Some((1, Some(NodeSlot { node_id: 3, job: 0 })));
+        let a_next_job = Some((1, Some(NodeSlot { node_id: 2, job: 1 })));
+        assert_eq!(switch_action(a, b, true), SwitchAction::Preempt);
+        assert_eq!(switch_action(a, a_next_job, true), SwitchAction::Preempt);
+        assert_eq!(switch_action(a, a, true), SwitchAction::Nothing);
+        assert_eq!(switch_action(a, None, true), SwitchAction::Nothing);
     }
 
     #[test]
@@ -536,15 +717,15 @@ mod tests {
         // on them in unit tests, so this exercises the idle side.
         let cpu = NUM_MAX_CPU - 1;
         assert_eq!(
-            apply_due(cpu, Some(7)),
+            apply_due(cpu, Some(7), None),
             (None, SwitchAction::PickUpWhenIdle)
         );
         assert_eq!(entitlement_of(cpu), Some(7));
         assert!(!ENTITLEMENT_DIRTY[cpu].load(Ordering::Acquire));
-        assert_eq!(apply_due(cpu, None), (Some(7), SwitchAction::Nothing));
+        assert_eq!(apply_due(cpu, None, None), (Some(7), SwitchAction::Nothing));
         assert_eq!(entitlement_of(cpu), None);
         assert_eq!(
-            apply_due(NUM_MAX_CPU, Some(1)),
+            apply_due(NUM_MAX_CPU, Some(1), None),
             (None, SwitchAction::Nothing),
             "out-of-range CPU is ignored"
         );

@@ -80,6 +80,10 @@ pub const DPSW_SAME: u8 = 2;
 pub const DPSW_TO_NONE: u8 = 3;
 /// The entitled DAG had no ready node, so the running task kept the CPU.
 pub const DPSW_NO_SUCCESSOR: u8 = 4;
+/// Per-node slots (`dagfluid_node`): the slot's node was not ready, so the
+/// running node was stopped (the CPU's placeholder task took over) and the
+/// slot is left empty.
+pub const DPSW_STOP: u8 = 5;
 
 fn dpsw_path_name(path: u8) -> &'static str {
     match path {
@@ -88,6 +92,7 @@ fn dpsw_path_name(path: u8) -> &'static str {
         DPSW_SAME => "same",
         DPSW_TO_NONE => "none",
         DPSW_NO_SUCCESSOR => "nosucc",
+        DPSW_STOP => "stop",
         _ => "?",
     }
 }
@@ -155,6 +160,75 @@ pub(crate) fn record_dag_event(event: DagJobEvent) {
     }
 }
 
+/// One DAG-Fluid slot as a CPU actually held it (per-node slots, the
+/// `dagfluid_node` feature; see `scheduler::dp_wrap::slot_measure`). Times
+/// are uptime nanoseconds, 0 for "none".
+#[derive(Clone, Copy, Default)]
+pub struct SlotEvent {
+    /// `u32::MAX` for a no-DAG slot.
+    pub dag_id: u32,
+    /// `u32::MAX` for a no-DAG slot.
+    pub node_id: u32,
+    pub job: u64,
+    /// The slot's start and end in the CPU's plan.
+    pub start_ns: u64,
+    pub end_ns: u64,
+    /// One of the `SLOT_*` states: the node's state when the CPU first
+    /// looked at the slot.
+    pub state: u8,
+    /// When the CPU first looked at the slot (the state was taken).
+    pub observed_ns: u64,
+    /// When the slot's node was woken during the slot.
+    pub ready_ns: u64,
+    /// When the slot's node started running on this CPU during the slot.
+    pub started_ns: u64,
+    /// Plan entries passed over just before this slot (the handler ran
+    /// late).
+    pub skipped: u32,
+}
+
+pub const SLOT_CAP: usize = 2048;
+pub use crate::scheduler::dp_wrap::slot_measure::{
+    SLOT_BEHIND, SLOT_DONE, SLOT_NOT_WOKEN, SLOT_NO_DAG, SLOT_READY, SLOT_RUNNING_ELSEWHERE,
+    SLOT_RUNNING_HERE, SLOT_UNOBSERVED,
+};
+
+fn slot_state_name(state: u8) -> &'static str {
+    match state {
+        SLOT_UNOBSERVED => "unobserved",
+        SLOT_READY => "ready",
+        SLOT_RUNNING_HERE => "running_here",
+        SLOT_NOT_WOKEN => "not_woken",
+        SLOT_DONE => "done",
+        SLOT_BEHIND => "behind",
+        SLOT_RUNNING_ELSEWHERE => "running_elsewhere",
+        SLOT_NO_DAG => "no_dag",
+        _ => "?",
+    }
+}
+
+static SLOT_IDX: [AtomicUsize; NUM_MAX_CPU] = array![_ => AtomicUsize::new(0); NUM_MAX_CPU];
+
+static mut SLOT_BUFS: [Option<Vec<SlotEvent>>; NUM_MAX_CPU] = [const { None }; NUM_MAX_CPU];
+
+/// Record one closed slot on the current CPU. Lock-free, like [`record`].
+pub(crate) fn record_slot(event: SlotEvent) {
+    if !ENABLED.load(Ordering::Acquire) {
+        return;
+    }
+    let cpu_id = awkernel_lib::cpu::cpu_id();
+    let i = SLOT_IDX[cpu_id].fetch_add(1, Ordering::Relaxed);
+    if i >= SLOT_CAP {
+        return;
+    }
+    unsafe {
+        let bufs = &mut *core::ptr::addr_of_mut!(SLOT_BUFS);
+        if let Some(slot) = bufs[cpu_id].as_mut().and_then(|buf| buf.get_mut(i)) {
+            *slot = event;
+        }
+    }
+}
+
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
 static IDX: [AtomicUsize; NUM_MAX_CPU] = array![_ => AtomicUsize::new(0); NUM_MAX_CPU];
@@ -202,6 +276,7 @@ pub(crate) fn record(task_id: u32, kind: u8, period_index: Option<u32>) {
 
     if kind == KIND_START {
         crate::scheduler::dp_wrap::dp_switch::measure::note_task_start(cpu_id, task_id);
+        crate::scheduler::dp_wrap::slot_measure::task_started(cpu_id, task_id);
     }
 
     unsafe {
@@ -272,6 +347,18 @@ pub fn start() {
         }
     }
     for idx in DPSW_IDX.iter().take(n) {
+        idx.store(0, Ordering::Relaxed);
+    }
+
+    unsafe {
+        let bufs = &mut *core::ptr::addr_of_mut!(SLOT_BUFS);
+        for buf in bufs.iter_mut().take(n) {
+            if buf.is_none() {
+                *buf = Some(alloc::vec![SlotEvent::default(); SLOT_CAP]);
+            }
+        }
+    }
+    for idx in SLOT_IDX.iter().take(n) {
         idx.store(0, Ordering::Relaxed);
     }
 
@@ -514,6 +601,47 @@ pub fn dump_to_console() {
         console::print(&out);
         if n > DPSW_CAP {
             console::print(&format!("TRACE_DPSW_DROPPED,{cpu_id},{}\r\n", n - DPSW_CAP));
+        }
+    }
+
+    // TRACE_SLOT,<cpu>,<dag|->,<node|->,<job|->,<start_ns>,<end_ns>,<state>,
+    //   <observed_ns|->,<ready_ns|->,<started_ns|->,<skipped>
+    // One per-node slot a CPU held (see `SlotEvent`).
+    for cpu_id in 0..awkernel_lib::cpu::num_cpu() {
+        let n = SLOT_IDX[cpu_id].load(Ordering::Relaxed);
+        let mut out = String::new();
+        unsafe {
+            let bufs = &*core::ptr::addr_of!(SLOT_BUFS);
+            if let Some(buf) = bufs[cpu_id].as_ref() {
+                for e in buf.iter().take(n.min(SLOT_CAP)) {
+                    let no_dag = e.dag_id == u32::MAX;
+                    out.push_str(&format!(
+                        "TRACE_SLOT,{cpu_id},{},{},{},{},{},{},{},{},{},{}\r\n",
+                        dag_or_dash(e.dag_id),
+                        dag_or_dash(e.node_id),
+                        if no_dag {
+                            "-".into()
+                        } else {
+                            format!("{}", e.job)
+                        },
+                        e.start_ns,
+                        e.end_ns,
+                        slot_state_name(e.state),
+                        ns_or_dash(e.observed_ns),
+                        ns_or_dash(e.ready_ns),
+                        ns_or_dash(e.started_ns),
+                        e.skipped,
+                    ));
+                    if out.len() > 4096 {
+                        console::print(&out);
+                        out.clear();
+                    }
+                }
+            }
+        }
+        console::print(&out);
+        if n > SLOT_CAP {
+            console::print(&format!("TRACE_SLOT_DROPPED,{cpu_id},{}\r\n", n - SLOT_CAP));
         }
     }
 
