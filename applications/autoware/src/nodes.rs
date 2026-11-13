@@ -10,12 +10,13 @@ use awkernel_lib::time::Instant;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::time::Duration;
 
+use common_types::transform::Transform;
 use constant_jerk_deceleration_controller::ControllerOutput;
 use ekf_localizer::{
     apply_twist_observability_gate, get_or_initialize_default_module, EKFOdometry, EKFParameters,
     Pose, PoseWithCovariance, PoseWithCovarianceStamped,
 };
-use imu_corrector::{ImuCorrector, ImuWithCovariance, Transform};
+use imu_corrector::{ImuCorrector, ImuWithCovariance};
 use imu_driver::{build_imu_msg_from_csv_row, ImuMsg, TamagawaImuParser};
 use localization_types::{
     AccelWithCovarianceStamped, ConstantJerkDecelerationTrigger, Control, GearCommand,
@@ -409,15 +410,12 @@ fn advance_ground_truth(vx: f64, wz: f64, dt: f64) {
 /// so without this the yaw rate has the wrong sign (dead reckoning turns the other way).
 #[cfg(awsim_input)]
 fn awsim_imu_to_base_link() -> Transform {
-    Transform {
-        translation: imu_driver::Vector3::new(0.0, 0.0, 0.0),
-        rotation: imu_driver::Quaternion {
-            x: 0.018_194_732,
-            y: 0.999_806_208,
-            z: -0.000_363_412,
-            w: -0.007_507_786,
-        },
-    }
+    // nalgebra order: Quaternion::new(w, x, y, z).
+    Transform::try_new(
+        common_types::Vector3::new(0.0, 0.0, 0.0),
+        common_types::Quaternion::new(-0.007_507_786, 0.018_194_732, 0.999_806_208, -0.000_363_412),
+    )
+    .unwrap_or_default()
 }
 
 pub fn imu_corrector(imu_msg: &ImuMsg) -> ImuWithCovariance {

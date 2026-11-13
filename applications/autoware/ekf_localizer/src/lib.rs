@@ -50,7 +50,7 @@ use nalgebra::{
     DMatrix, DVector, Matrix6, Quaternion as NQuaternion, Unit, UnitQuaternion, Vector3, Vector6,
 };
 
-pub use imu_corrector::Transform;
+pub use common_types::transform::Transform;
 pub use vehicle_velocity_converter::{TwistWithCovariance, TwistWithCovarianceStamped};
 
 use covariance::{
@@ -378,15 +378,19 @@ impl EKFModule {
     /// pose before seeding the filter. Looking up the transform itself is out of scope here
     /// (see `imu_corrector::TransformListener` for that half of the existing port pattern).
     pub fn initialize(&mut self, initial_pose: &PoseWithCovarianceStamped, transform: &Transform) {
+        let isometry = transform.to_isometry();
+        let translation = isometry.translation.vector;
+        let rotation = isometry.rotation;
+
         let mut x0 = StateVector::zeros();
-        x0[StateIndex::X as usize] = initial_pose.pose.pose.position.x + transform.translation.x;
-        x0[StateIndex::Y as usize] = initial_pose.pose.pose.position.y + transform.translation.y;
+        x0[StateIndex::X as usize] = initial_pose.pose.pose.position.x + translation.x;
+        x0[StateIndex::Y as usize] = initial_pose.pose.pose.position.y + translation.y;
 
         let transform_yaw = self.quaternion_to_yaw(Quaternion {
-            x: transform.rotation.x,
-            y: transform.rotation.y,
-            z: transform.rotation.z,
-            w: transform.rotation.w,
+            x: rotation.i,
+            y: rotation.j,
+            z: rotation.k,
+            w: rotation.w,
         });
         x0[StateIndex::Yaw as usize] =
             self.quaternion_to_yaw(initial_pose.pose.pose.orientation) + transform_yaw;
@@ -1032,11 +1036,16 @@ mod tests {
         pose.pose.covariance[POSE_COV_YAW_YAW] = 0.04;
 
         // A 90 degree yaw transform: w=cos(45deg), z=sin(45deg).
-        let mut transform = Transform::identity();
-        transform.translation.x = 10.0;
-        transform.translation.y = 20.0;
-        transform.rotation.z = core::f64::consts::FRAC_1_SQRT_2;
-        transform.rotation.w = core::f64::consts::FRAC_1_SQRT_2;
+        let transform = Transform::try_new(
+            common_types::Vector3::new(10.0, 20.0, 0.0),
+            common_types::Quaternion::new(
+                core::f64::consts::FRAC_1_SQRT_2,
+                0.0,
+                0.0,
+                core::f64::consts::FRAC_1_SQRT_2,
+            ),
+        )
+        .unwrap();
 
         ekf.initialize(&pose, &transform);
 
