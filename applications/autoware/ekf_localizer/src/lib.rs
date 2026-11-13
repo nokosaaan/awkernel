@@ -246,7 +246,7 @@ impl Simple1DFilter {
 
         let kalman_gain = self.var / (self.var + obs_var);
         self.x += kalman_gain * (obs - self.x);
-        self.var = (1.0 - kalman_gain) * self.var;
+        self.var *= 1.0 - kalman_gain;
     }
 
     pub fn set_proc_var(&mut self, proc_var: f64) {
@@ -376,7 +376,7 @@ impl EKFModule {
     /// `initial_pose.header.frame_id -> base_link` (or map -> odom, depending on wiring)
     /// transform, applied the same way upstream's `initialize()` does by adding it to the
     /// pose before seeding the filter. Looking up the transform itself is out of scope here
-    /// (see `imu_corrector::TransformListener` for that half of the existing port pattern).
+    /// (see `common_types::transform::TransformListener` for that half of the existing port pattern).
     pub fn initialize(&mut self, initial_pose: &PoseWithCovarianceStamped, transform: &Transform) {
         let isometry = transform.to_isometry();
         let translation = isometry.translation.vector;
@@ -1081,8 +1081,10 @@ mod tests {
     // [own test] no upstream equivalent.
     #[test]
     fn measurement_update_pose_rejects_excessive_delay() {
-        let mut params = EKFParameters::default();
-        params.extend_state_step = 3;
+        let params = EKFParameters {
+            extend_state_step: 3,
+            ..Default::default()
+        };
         let mut ekf = EKFModule::new(params);
         ekf.initialize(&identity_pose_stamped(0), &Transform::identity());
 

@@ -664,6 +664,7 @@ mod tests {
             *p_ex = p_tmp;
         }
 
+        #[allow(clippy::too_many_arguments)] // mirrors the upstream argument list
         pub fn update(
             x_ex: &mut DVector<f64>,
             p_ex: &mut DMatrix<f64>,
