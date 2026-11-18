@@ -1547,8 +1547,14 @@ where
     let dag = get_dag(dag_info.dag_id).unwrap();
     let node_idx = to_node_index(dag_info.node_id);
 
-    // Spawning wakes the source before its future is polled.
-    let mut interval = interval(period, dag_info.dag_id);
+    // Spawning wakes the source before its future is polled. With a common
+    // release origin (DAG-Fluid's offline table, `dag_sched::release_origin`)
+    // every DAG's job `k` is released at `t0 + k * period`; otherwise the
+    // first job is released now.
+    let mut interval = match crate::dag_sched::release_origin::t0() {
+        Some(t0) => crate::time_interval::interval_at(t0, period, dag_info.dag_id),
+        None => interval(period, dag_info.dag_id),
+    };
     dag.set_next_release_time(interval.next_tick_target());
 
     // TODO(sykwer): Improve mechanisms to more closely align performance behavior with the DAG scheduling model.

@@ -49,18 +49,71 @@ DEFAULT_STAGING_DIR = Path("/home/nokosan/ws/RD-Gen/test/awkernel_staged")
 # default that needs no extra feature. Threaded into the build via the
 # Makefile's EXTRA_FEATURES (see run_build).
 #
-# "dagfluid" wires DAG-Fluid's real DP-Wrap dispatch (scheduler::dp_wrap /
-# dag_sched::dp_partition) rather than a fresh policy -- see those modules'
-# own docs for its two known real-machine-only caveats: entitlement is
-# coarse-grained per DAG (not per segment/node), and the completion gate's
-# overrun latency (theory vs. actual completion) is exactly the number this
-# trial should be read for, not a pass/fail signal on its own.
+# DAG-Fluid (DP-Wrap dispatch, scheduler::dp_wrap / dag_sched::planner) in
+# three variants:
+#   "dagfluid"       time-driven, one slot per DAG (any ready node of the
+#                    DAG runs in it)
+#   "dagfluid_node"  time-driven, one slot per node (the segments' active
+#                    nodes; tau_seq keeps one DAG-level slot)
+#   "dagfluid_event" event-driven: a segment starts when the previous one
+#                    completes, planned at run time
+# The two time-driven variants dispatch from the offline switch table that
+# rd_gen_to_dags's build.rs plans at build time for the staged DAG set and
+# RD_GEN_FLUID_POOL_CPUS pool CPUs (see FLUID_TABLE_ALGORITHMS).
 ALGO_FEATURES = {
     "federated": None,
     "vfed": "rd_gen_vfed",
     "laxity": "rd_gen_laxity",
     "dagfluid": "rd_gen_dagfluid",
+    "dagfluid_node": "rd_gen_dagfluid_node",
+    "dagfluid_event": "rd_gen_dagfluid_event",
 }
+
+# Algorithms whose kernel carries a build-time switch table: the table is
+# planned for a fixed number of DAG-pool CPUs, and the kernel refuses (runs
+# no DAG) when that differs from the target's actual pool. The build gets
+# it as RD_GEN_FLUID_POOL_CPUS (see resolve_fluid_pool_cpus).
+FLUID_TABLE_ALGORITHMS = {"dagfluid", "dagfluid_node"}
+
+# The offline verdict for each algorithm in a theory_vs_reality.rs record
+# (tried in order; None: no offline test, e.g. Laxity). All DAG-Fluid
+# variants share DAG-Fluid's one admission test.
+OFFLINE_VERDICT_KEYS = {
+    "federated": ("accepted", "federated_accepted"),
+    "vfed": ("vfed_accepted",),
+    "laxity": None,
+    "dagfluid": ("dag_fluid_accepted",),
+    "dagfluid_node": ("dag_fluid_accepted",),
+    "dagfluid_event": ("dag_fluid_accepted",),
+}
+
+
+def offline_verdict(record, algorithm):
+    """`record`'s offline admission verdict for `algorithm` (True/False), or
+    None if the record has none for it."""
+    keys = OFFLINE_VERDICT_KEYS.get(algorithm)
+    if not keys:
+        return None
+    for key in keys:
+        if key in record:
+            return bool(record[key])
+    return None
+
+
+def resolve_fluid_pool_cpus(args, algorithm, trial_record):
+    """DAG-pool CPU count the build plans the switch table for: --fluid-pool-cpus,
+    else the manifest record's own real_cores (the core count its offline
+    verdict was computed for). None for algorithms without a table."""
+    if algorithm not in FLUID_TABLE_ALGORITHMS:
+        return None
+    if args.fluid_pool_cpus is not None:
+        return args.fluid_pool_cpus
+    if trial_record is not None and "real_cores" in trial_record:
+        return int(trial_record["real_cores"])
+    raise RuntimeError(
+        f"--algorithms {algorithm}: the DAG-pool CPU count for the switch table is unknown "
+        "(this record has no real_cores); pass --fluid-pool-cpus"
+    )
 
 # bcdedit's own field labels ("identifier"/"description") are localized to the
 # target's Windows display language, so we don't match on them -- only on the
@@ -257,7 +310,7 @@ def stage_dag(src, staging_dir):
     return dst
 
 
-def load_trials_jsonl(path, include_rejected=False):
+def load_trials_jsonl(path, include_rejected=False, algorithms=("federated",)):
     """Every record from a --trials-jsonl file (one per resampled trial),
     reordered round-robin across u_norm levels -- one trial from the lowest
     level, then one from the next, ... then back to the lowest level's next
@@ -280,6 +333,9 @@ def load_trials_jsonl(path, include_rejected=False):
     calls infeasible mostly just burns a trial slot -- pass
     `include_rejected=True` (`--include-rejected`) to keep REJECTed ones too,
     e.g. to spot-check that they really do fail admission on real hardware.
+    A record counts as ACCEPTed if any of `algorithms` (the --algorithms this
+    run boots) accepts it offline (see `offline_verdict`; an algorithm with
+    no offline test, e.g. Laxity, accepts every record).
 
     Each record's position in this reordering (0-based) is what
     `select_next_group`/the state file's "trials_jsonl_line" index by --
@@ -304,8 +360,8 @@ def load_trials_jsonl(path, include_rejected=False):
                     "timing not in the YAML); use theory_vs_reality.rs's manifest"
                 )
             if not include_rejected:
-                accepted = record.get("accepted", record.get("federated_accepted", True))
-                if not accepted:
+                verdicts = [offline_verdict(record, a) for a in algorithms]
+                if not any(v is None or v for v in verdicts):
                     continue
             by_u_norm.setdefault(record["u_norm"], []).append(record)
 
@@ -357,7 +413,8 @@ def stage_group(dags_dir, dag_names, staging_dir):
     return staged
 
 
-def run_build(awkernel_dir, staging_dir, dry_run, algorithm="federated", smt_disable=True, fix_freq=True):
+def run_build(awkernel_dir, staging_dir, dry_run, algorithm="federated", smt_disable=True, fix_freq=True,
+              fluid_pool_cpus=None):
     make_args = ["make", "x86_64", "RELEASE=1"]
     features = []
     algo_feature = ALGO_FEATURES[algorithm]
@@ -374,15 +431,19 @@ def run_build(awkernel_dir, staging_dir, dry_run, algorithm="federated", smt_dis
         features.append("fix_freq")
     if features:
         make_args.append(f"EXTRA_FEATURES=--features {','.join(features)}")
-    print(f"[build] RD_GEN_DAGS_DIR={staging_dir} {' '.join(make_args)}")
+    env = {**os.environ, "RD_GEN_DAGS_DIR": str(staging_dir)}
+    env_desc = f"RD_GEN_DAGS_DIR={staging_dir}"
+    if fluid_pool_cpus is not None:
+        env["RD_GEN_FLUID_POOL_CPUS"] = str(fluid_pool_cpus)
+        env_desc += f" RD_GEN_FLUID_POOL_CPUS={fluid_pool_cpus}"
+    else:
+        # Never let a value from the caller's shell leak into a build that
+        # did not ask for one.
+        env.pop("RD_GEN_FLUID_POOL_CPUS", None)
+    print(f"[build] {env_desc} {' '.join(make_args)}")
     if dry_run:
         return
-    subprocess.run(
-        make_args,
-        cwd=awkernel_dir,
-        env={**os.environ, "RD_GEN_DAGS_DIR": str(staging_dir)},
-        check=True,
-    )
+    subprocess.run(make_args, cwd=awkernel_dir, env=env, check=True)
 
 
 class MinicomHandle:
@@ -493,7 +554,8 @@ def next_trial_id(state):
     return max((r["trial"] for r in state), default=0) + 1
 
 
-def run_trial_for_algorithm(args, state, boot_cache_path, batch_id, algorithm, selection_info):
+def run_trial_for_algorithm(args, state, boot_cache_path, batch_id, algorithm, selection_info,
+                            trial_record=None):
     """One build+boot+capture cycle against the already-staged DAG(s), under
     one admission-policy algorithm. `selection_info` (the DAG selection, made
     once per batch by `run_trial`) is copied into this trial's own state
@@ -512,7 +574,11 @@ def run_trial_for_algorithm(args, state, boot_cache_path, batch_id, algorithm, s
     trial_id = next_trial_id(state)
     print(f"--- trial {batch_id} (algorithm={algorithm}, smt_disable={args.smt_disable}, fix_freq={args.fix_freq}) ---")
 
-    run_build(args.awkernel_dir, args.staging_dir, args.dry_run, algorithm, args.smt_disable, args.fix_freq)
+    fluid_pool_cpus = resolve_fluid_pool_cpus(args, algorithm, trial_record)
+    run_build(
+        args.awkernel_dir, args.staging_dir, args.dry_run, algorithm, args.smt_disable, args.fix_freq,
+        fluid_pool_cpus,
+    )
 
     log_path = args.log_dir / f"{args.log_prefix}{batch_id}_{algorithm}.log"
     minicom_handle = start_minicom(args.serial_device, args.baud, log_path, args.sudo_minicom, args.dry_run)
@@ -540,7 +606,13 @@ def run_trial_for_algorithm(args, state, boot_cache_path, batch_id, algorithm, s
         "algorithm": algorithm,
         "smt_disable": args.smt_disable,
         "fix_freq": args.fix_freq,
+        "fluid_pool_cpus": fluid_pool_cpus,
         **selection_info,
+        # This algorithm's own offline verdict for the staged set (the
+        # shared "offline_accepted" in selection_info is Federated's).
+        "offline_accepted_algorithm": (
+            offline_verdict(trial_record, algorithm) if trial_record is not None else None
+        ),
         "log_file": str(log_path),
         "boot_entry": boot_entry,
         "marker_found": marker_found,
@@ -586,13 +658,16 @@ def run_trial(args, state, boot_cache_path, trials_jsonl):
             "offline_accepted": trial_record.get("accepted", trial_record.get("federated_accepted")),
         }
     else:
+        trial_record = None
         dag_src = select_next_dag(args.pool_dir, {r["dag_file"] for r in state if "dag_file" in r})
         stage_dag(dag_src, args.staging_dir)
         print(f"[dag] selected {dag_src.name}")
         selection_info = {"dag_file": dag_src.name, "dag_pool_path": str(dag_src)}
 
     for i, algorithm in enumerate(args.algorithms):
-        run_trial_for_algorithm(args, state, boot_cache_path, batch_id, algorithm, selection_info)
+        run_trial_for_algorithm(
+            args, state, boot_cache_path, batch_id, algorithm, selection_info, trial_record,
+        )
         is_last = i == len(args.algorithms) - 1
         if not args.dry_run and not is_last and args.trial_interval_secs > 0:
             print(f"[wait] pausing {args.trial_interval_secs}s before the next algorithm")
@@ -651,6 +726,13 @@ def parse_args():
                     help="--trials-jsonl mode only: also boot REJECTed records (default: ACCEPTed "
                          "only), e.g. to spot-check that a REJECTed set really fails admission "
                          "on real hardware too")
+    p.add_argument("--fluid-pool-cpus", type=int, default=None,
+                    help="dagfluid/dagfluid_node only: DAG-pool CPU count the build-time switch "
+                         "table is planned for (RD_GEN_FLUID_POOL_CPUS) -- the target's worker "
+                         "CPUs minus the regular-pool CPU, e.g. 14 on 16 CPUs. Default: the "
+                         "--trials-jsonl record's real_cores; required in single-DAG mode. A "
+                         "value that differs from the target's actual pool makes the kernel "
+                         "run no DAG")
     p.add_argument("--no-smt-disable", action="store_true",
                     help="build without the kernel's smt_disable feature, i.e. leave HT sibling "
                          "APs woken (default: smt_disable is on -- the target's BIOS has no HT "
@@ -670,6 +752,11 @@ def parse_args():
         p.error(f"--algorithms: unknown algorithm(s) {unknown}; choices: {', '.join(ALGO_FEATURES)}")
     if not args.algorithms:
         p.error("--algorithms: must list at least one algorithm")
+    if args.fluid_pool_cpus is not None and args.fluid_pool_cpus < 1:
+        p.error("--fluid-pool-cpus: must be at least 1")
+    if (args.trials_jsonl is None and args.fluid_pool_cpus is None
+            and FLUID_TABLE_ALGORITHMS.intersection(args.algorithms)):
+        p.error("--algorithms dagfluid/dagfluid_node without --trials-jsonl needs --fluid-pool-cpus")
     return args
 
 
@@ -679,7 +766,7 @@ def main():
     boot_cache_path = args.log_dir / "real_machine_boot_entry.json"
     state = load_json(state_path, [])
     trials_jsonl = (
-        load_trials_jsonl(args.trials_jsonl, args.include_rejected)
+        load_trials_jsonl(args.trials_jsonl, args.include_rejected, args.algorithms)
         if args.trials_jsonl is not None
         else None
     )

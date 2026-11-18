@@ -1,7 +1,20 @@
 //! DAG-Fluid's planner for the per-core dispatch (方式B, Step 4): a task that
-//! wakes at the start of every span, lays out the DP-Wrap plan of the
-//! *next* span, and publishes each DAG-pool CPU's share of it to that CPU's
-//! switch table (`scheduler::dp_wrap::switch_table`).
+//! wakes at the start of every span and publishes each DAG-pool CPU's share
+//! of the *next* span to that CPU's switch table
+//! (`scheduler::dp_wrap::switch_table`).
+//!
+//! # Time-driven ①: the offline table
+//! The time-driven plan depends only on the task set, so it is not computed
+//! at run time: `dag_sched::fluid_table::build` lays out one hyperperiod of
+//! it ahead of time (on the host, from the application's build script),
+//! with the functions below ([`plan_window_with`], the window/DP/span rules
+//! described next), and every DAG is released at a common origin `t0`
+//! (`dag_sched::release_origin`). At run time this task only adds
+//! `t0 + n * H` to each span of the table and publishes it, then sleeps
+//! until that span starts. `τ_seq` DAGs are in the table too, as one
+//! segment of rate `C/D*` (without a node list: a DAG-level slot). The
+//! "Before the first release" section below applies to the event-driven
+//! variant only.
 //!
 //! # Windows and Deadline Partitions
 //! Releases are strictly periodic (`job_table`): job `k` of a DAG is
@@ -57,7 +70,7 @@
 //! running past its deadline keeps its rate until it completes (the
 //! papers leave this open); such overruns are counted and logged.
 //!
-//! # Before the first release (bootstrap)
+//! # Before the first release (bootstrap, event-driven ③)
 //! A source node is a DP-Wrap task too, so it cannot release its first job
 //! before its DAG is entitled to some CPU. Until a DAG's first release shows
 //! up in its ring, the planner assumes it was released when the planner
@@ -76,13 +89,17 @@
 //! is logged; the CPU then runs out of plan and is recovered the same way
 //! at the next wake.
 
-use super::job_table::{self, JobRing, SegmentTemplate};
+use super::job_table::SegmentTemplate;
+#[cfg(feature = "dagfluid_event")]
+use super::job_table::{self, JobRing};
 use crate::scheduler::dp_wrap::{
     dp_switch,
     switch_table::{self, NodeSlot, SwitchEntry, SwitchTableError, SWITCH_TABLE_CAPACITY},
     wrap_blocks,
 };
-use alloc::{borrow::Cow, sync::Arc, vec, vec::Vec};
+#[cfg(feature = "dagfluid_event")]
+use alloc::sync::Arc;
+use alloc::{borrow::Cow, vec, vec::Vec};
 use awkernel_lib::time::Instant;
 use core::time::Duration;
 
@@ -109,6 +126,10 @@ pub struct ActiveSegment<'a> {
     pub rate: f64,
     /// The threads as nodes, for per-node slots; empty for per-DAG slots.
     pub nodes: &'a [u32],
+    /// With an empty `nodes`: give the threads per-node slots of
+    /// [`switch_table::ANY_NODE`] (per-node mode, a segment without its own
+    /// node list, i.e. `τ_seq`) instead of per-DAG slots.
+    pub any_node: bool,
 }
 
 /// One DAG as the plan computation sees it.
@@ -184,8 +205,9 @@ pub fn plan_window(
 }
 
 /// [`plan_window`] with the slot granularity given explicitly (per node if
-/// `per_node`, else per DAG).
-fn plan_window_with(
+/// `per_node`, else per DAG). The offline table builder
+/// (`dag_sched::fluid_table`) calls it on the host.
+pub fn plan_window_with(
     dags: &[PlanDag<'_>],
     start: Instant,
     end: Instant,
@@ -244,6 +266,7 @@ fn plan_window_with(
                             concurrency: segment.concurrency,
                             rate: segment.rate,
                             nodes: if per_node { &segment.active_nodes } else { &[] },
+                            any_node: per_node && segment.active_nodes.is_empty(),
                         });
                     }
                 }
@@ -274,9 +297,13 @@ pub fn plan_dp(
     let mut densities: Vec<(usize, f64)> = Vec::new();
     for segment in active {
         if segment.nodes.is_empty() {
+            let slot = segment.any_node.then_some(NodeSlot {
+                node_id: switch_table::ANY_NODE,
+                job: segment.job,
+            });
             for _ in 0..segment.concurrency {
                 densities.push((owners.len(), segment.rate));
-                owners.push((segment.dag_id, None));
+                owners.push((segment.dag_id, slot));
             }
         } else {
             for &node_id in segment.nodes {
@@ -360,6 +387,7 @@ pub fn plan_span(
 }
 
 /// Where a DAG's job 0 was released, from its newest recorded release.
+#[cfg(feature = "dagfluid_event")]
 fn anchor_of(ring: &JobRing) -> Option<Instant> {
     let latest = ring.latest().ok()??;
     let back = ring
@@ -384,132 +412,97 @@ pub fn spawn_planner() {
     );
 }
 
+/// How long the planner waits for a CPU to take its current plane before
+/// trying to publish the next one again (`ReaderBehind`).
+#[cfg(not(feature = "dagfluid_event"))]
+const PUBLISH_RETRY: Duration = Duration::from_micros(50);
+
+/// Time-driven ①: publish the offline table (`dag_sched::fluid_table`),
+/// span by span, at `t0 + n * H` (`dag_sched::release_origin`). See the
+/// module doc.
 #[cfg(not(feature = "dagfluid_event"))]
 async fn run_planner() -> Result<(), Cow<'static, str>> {
-    let rings: Vec<(u32, Arc<JobRing>)> = job_table::registered_rings();
+    use super::{fluid_table, release_origin};
+
+    let Some((table, dag_ids)) = fluid_table::registered() else {
+        log::warn!("dag_fluid planner: no offline table registered; nothing to plan");
+        return Ok(());
+    };
     let pool: Vec<usize> = super::resource::dagfluid_pool_cpu_set().iter().collect();
-    if rings.is_empty() || pool.is_empty() {
-        log::warn!(
-            "dag_fluid planner: nothing to plan ({} DAGs, {} pool CPUs)",
-            rings.len(),
+    if pool.len() != table.cpus {
+        log::error!(
+            "dag_fluid planner: the offline table was planned for {} pool CPUs, but the pool has {} ({pool:?}); not dispatching",
+            table.cpus,
             pool.len()
         );
-        return Ok(());
+        return Err("offline table does not match the pool".into());
     }
+    let Some(t0) = release_origin::t0() else {
+        log::error!("dag_fluid planner: no release origin t0 set; not dispatching");
+        return Err("no release origin".into());
+    };
     log::info!(
-        "dag_fluid planner: {} DAGs on pool CPUs {pool:?}",
-        rings.len()
+        "dag_fluid planner: offline table, DAGs {dag_ids:?} on pool CPUs {pool:?}, hyperperiod {} ns in {} spans, t0 = {} us",
+        table.hyperperiod_ns,
+        table.spans.len(),
+        t0.uptime().as_micros()
     );
 
-    let boot = Instant::now();
-    let mut anchors: Vec<Option<Instant>> = vec![None; rings.len()];
-    // Start and end of the newest span published to every CPU.
-    let mut newest: Option<(Instant, Instant)> = None;
-
+    let hyperperiod = Duration::from_nanos(table.hyperperiod_ns);
+    let mut entries: Vec<SwitchEntry> = Vec::with_capacity(SWITCH_TABLE_CAPACITY);
+    let mut n: u64 = 0;
     loop {
-        let now = Instant::now();
-        for (anchor, (_, ring)) in anchors.iter_mut().zip(rings.iter()) {
-            if let Some(real) = anchor_of(ring) {
-                *anchor = Some(real);
-            }
-        }
-        let all_released = anchors.iter().all(Option::is_some);
-        let dags: Vec<PlanDag<'_>> = rings
-            .iter()
-            .zip(anchors.iter())
-            .map(|((dag_id, ring), anchor)| PlanDag {
-                dag_id: *dag_id,
-                period: ring.template().period(),
-                virtual_deadline: ring.template().virtual_deadline(),
-                segments: ring.template().segments(),
-                anchor: anchor.unwrap_or(boot),
-            })
-            .collect();
-        let min_len = min_span(&dags);
-
-        let starved: Vec<bool> = pool
-            .iter()
-            .map(|&cpu_id| switch_table::take_cpu_starved(cpu_id).unwrap_or(false))
-            .collect();
-
-        // Everything up to the end of the newest published span is already
-        // in the CPUs' tables, unless that end has passed (or nothing was
-        // published yet): new plans start there.
-        let frontier = match newest {
-            Some((_, end)) if end > now => end,
-            _ => now,
+        let Some(base) = u32::try_from(n)
+            .ok()
+            .and_then(|k| hyperperiod.checked_mul(k))
+            .map(|offset| t0 + offset)
+        else {
+            return Err("hyperperiod count overflow".into());
         };
-        // Publish the span after the newest one once the CPUs have reached
-        // the newest one (see the module doc's "Waking"), or right away if
-        // there is none ahead of them.
-        let due = newest.is_none_or(|(start, end)| start <= now || end <= now);
-        if !due && !starved.contains(&true) {
-            let wake = newest.map_or(now, |(start, _)| start);
-            crate::sleep_until(if all_released {
-                wake
-            } else {
-                wake.min(now + BOOTSTRAP_POLL)
-            })
-            .await;
-            continue;
-        }
-
-        // A new span goes to every CPU only when due; a starved CPU always
-        // gets what is left up to the frontier (what the others already
-        // hold), plus the new span when one is made.
-        let span = if due {
-            let Some(span) = plan_span(&dags, frontier, min_len, pool.len()) else {
-                log::warn!("dag_fluid planner: no future release; stopping");
-                return Ok(());
-            };
-            Some(span)
-        } else {
-            None
-        };
-        let rest = plan_window(&dags, now, frontier, pool.len());
-
-        for (p, &cpu_id) in pool.iter().enumerate() {
-            let plan = span.as_ref().and_then(|(_, plans)| plans.get(p));
-            let (Some(rest), Some(&starved)) = (rest.get(p), starved.get(p)) else {
-                continue;
-            };
-            if starved {
-                // Nothing left to read: the rest of the current span (and
-                // the next one) in one plane, then make the CPU arm its
-                // timer.
-                let mut entries = rest.clone();
-                if let Some(plan) = plan {
-                    entries.extend_from_slice(plan);
+        for span in table.spans {
+            let span_start = base + Duration::from_nanos(span.start_ns);
+            for (p, &cpu_id) in pool.iter().enumerate() {
+                entries.clear();
+                if let Some(list) = span.cpus.get(p) {
+                    entries.extend(
+                        list.iter()
+                            .map(|entry| table.switch_entry(entry, base, n, &dag_ids)),
+                    );
                 }
-                match switch_table::publish_cpu_plan(cpu_id, &entries) {
-                    Ok(_) => dp_switch::kick_cpu(cpu_id),
-                    // A plane was published after the CPU ran out but it
-                    // never polled again (its timer is off): the kick makes
-                    // it move on to that plane and arm its timer.
-                    Err(e @ SwitchTableError::ReaderBehind { .. }) => {
-                        log_publish_error(cpu_id, e);
-                        dp_switch::kick_cpu(cpu_id);
+                // The CPU moves to its newest plane as soon as it has used up
+                // the current one, at the latest at the previous span's
+                // start; retry until then, then give up on this span.
+                let published = loop {
+                    match switch_table::publish_cpu_plan(cpu_id, &entries) {
+                        Err(SwitchTableError::ReaderBehind { .. })
+                            if Instant::now() < span_start =>
+                        {
+                            crate::sleep(PUBLISH_RETRY).await;
+                        }
+                        result => break result,
                     }
-                    Err(e) => log_publish_error(cpu_id, e),
-                }
-            } else if let Some(plan) = plan {
-                if let Err(e) = switch_table::publish_cpu_plan(cpu_id, plan) {
-                    log_publish_error(cpu_id, e);
+                };
+                // True before the CPU's first plan, and after it ran out.
+                let starved = switch_table::take_cpu_starved(cpu_id).unwrap_or(false);
+                match published {
+                    Ok(_) => {
+                        if starved {
+                            dp_switch::kick_cpu(cpu_id);
+                        }
+                    }
+                    Err(e) => {
+                        log_publish_error(cpu_id, e);
+                        if starved {
+                            dp_switch::kick_cpu(cpu_id);
+                        }
+                    }
                 }
             }
+            // Once the CPUs are on this span's plane, the other plane is free
+            // for the next span.
+            crate::sleep_until(span_start).await;
         }
-        if let Some((span_end, _)) = span {
-            newest = Some((frontier, span_end));
-        }
-
-        // Wake when the CPUs reach the newest span published.
-        let wake = newest.map_or(now, |(start, _)| start);
-        crate::sleep_until(if all_released {
-            wake
-        } else {
-            wake.min(now + BOOTSTRAP_POLL)
-        })
-        .await;
+        n += 1;
     }
 }
 
@@ -637,6 +630,7 @@ async fn run_planner_event() -> Result<(), Cow<'static, str>> {
                                 concurrency: template.concurrency,
                                 rate: template.rate,
                                 nodes: &[],
+                                any_node: false,
                             });
                         }
                         if deadline > now {
@@ -763,6 +757,7 @@ mod tests {
             concurrency,
             rate,
             nodes: &[],
+            any_node: false,
         }
     }
 
@@ -780,7 +775,7 @@ mod tests {
     fn single_segment_runs_then_idles() {
         let s = [seg(0, 40, 1, 1.0)];
         let dags = [dag(1, 100, &s, 0)];
-        let plans = plan_window(&dags, at_ms(0), at_ms(100), 1);
+        let plans = plan_window_with(&dags, at_ms(0), at_ms(100), 1, false);
         assert_eq!(plans, vec![vec![e(0, Some(1)), e(40, None)]]);
     }
 
@@ -791,7 +786,7 @@ mod tests {
         let a = [seg(0, 100, 1, 0.5)];
         let b = [seg(0, 100, 1, 0.5)];
         let dags = [dag(1, 100, &a, 0), dag(2, 100, &b, 0)];
-        let plans = plan_window(&dags, at_ms(0), at_ms(100), 1);
+        let plans = plan_window_with(&dags, at_ms(0), at_ms(100), 1, false);
         assert_eq!(plans, vec![vec![e(0, Some(1)), e(50, Some(2))]]);
     }
 
@@ -801,7 +796,7 @@ mod tests {
         // two threads at rate 0.5 each, wrapped onto CPU 0 only.
         let s = [seg(0, 20, 1, 1.0), seg(20, 40, 2, 0.5)];
         let dags = [dag(1, 100, &s, 0)];
-        let plans = plan_window(&dags, at_ms(0), at_ms(100), 2);
+        let plans = plan_window_with(&dags, at_ms(0), at_ms(100), 2, false);
         assert_eq!(
             plans,
             vec![
@@ -818,7 +813,7 @@ mod tests {
         let a = [seg(0, 100, 1, 0.6)];
         let b = [seg(0, 100, 1, 0.6)];
         let dags = [dag(1, 100, &a, 0), dag(2, 100, &b, 0)];
-        let plans = plan_window(&dags, at_ms(0), at_ms(100), 2);
+        let plans = plan_window_with(&dags, at_ms(0), at_ms(100), 2, false);
         assert_eq!(plans[0], vec![e(0, Some(1)), e(60, Some(2))]);
         assert_eq!(plans[1], vec![e(0, Some(2)), e(20, None)]);
     }
@@ -831,7 +826,7 @@ mod tests {
         let dags = [dag(1, 100, &s, 0)];
         let d = &dags[0];
         assert_eq!(d.jobs_overlapping(at_ms(100), at_ms(150)), 0..2);
-        let plans = plan_window(&dags, at_ms(100), at_ms(200), 2);
+        let plans = plan_window_with(&dags, at_ms(100), at_ms(200), 2, false);
         assert_eq!(plans[0], vec![e(100, Some(1)), e(150, Some(1))]);
         assert_eq!(plans[1], vec![e(100, Some(1)), e(150, None)]);
     }
@@ -982,7 +977,7 @@ mod tests {
     fn nothing_alive_means_idle() {
         let s = [seg(0, 10, 1, 1.0)];
         let dags = [dag(1, 100, &s, 1_000)];
-        let plans = plan_window(&dags, at_ms(0), at_ms(100), 2);
+        let plans = plan_window_with(&dags, at_ms(0), at_ms(100), 2, false);
         assert_eq!(plans, vec![vec![e(0, None)], vec![e(0, None)]]);
     }
 

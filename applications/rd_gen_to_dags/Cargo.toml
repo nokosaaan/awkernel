@@ -19,6 +19,17 @@ default-features = false
 [dev-dependencies]
 rand = "0.9"
 
+# `build.rs` plans DAG-Fluid's offline switch table on the host with the
+# kernel's own admission and planning code (see `build.rs`).
+[build-dependencies]
+serde = { version = "1.0.219", default-features = false, features = ["derive"] }
+yaml-peg = { version = "1.0.8", default-features = false, features = ["serde"] }
+
+[build-dependencies.awkernel_async_lib]
+path = "../../awkernel_async_lib"
+default-features = false
+features = ["std"]
+
 [features]
 default = ["milliseconds"]
 

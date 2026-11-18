@@ -177,7 +177,7 @@ impl SchedulerType {
 
     /// True if this is a clustered scheduler, i.e. one whose tasks carry a
     /// CPU affinity set. Update this function when adding a new clustered
-    /// scheduler; it is the single source of truth for the clustered prefix
+    /// scheduler; it is the single source of truth for the clustered block
     /// of `PRIORITY_LIST`.
     pub const fn is_clustered(&self) -> bool {
         matches!(
@@ -193,8 +193,7 @@ impl SchedulerType {
     /// to a CPU set (DAG-Fluid's `DpWrap`; DAG nodes under `EDF` carry the
     /// DAG-pool set themselves). Update this function when adding a further
     /// DAG-oriented global scheduler; it is the single source of truth for
-    /// the DAG-pool slice of `PRIORITY_LIST` immediately following the
-    /// clustered prefix (see `pool::is_dag_pool_core`).
+    /// the DAG-pool prefix of `PRIORITY_LIST` (see `pool::is_dag_pool_core`).
     pub const fn is_dag_pool_scheduler(&self) -> bool {
         matches!(self, SchedulerType::DpWrap(_))
     }
@@ -205,104 +204,86 @@ impl SchedulerType {
 /// `priority()` returns the priority of the scheduler for preemption.
 ///
 /// - The highest priority.
-///   - Active-VP scheduler (V-Fed).
+///   - DAG-Fluid's `DpWrap` scheduler (the DAG-pool prefix, see
+///     `is_dag_pool_scheduler`). Highest so that no other task can take a
+///     core away from a DP-Wrap slot: the fluid schedule hands out exact
+///     amounts of CPU time per slot, and any task that preempts a slot's
+///     node eats into time the plan already gave to that node.
 /// - The second highest priority.
+///   - Active-VP scheduler (V-Fed).
+/// - The third highest priority.
 ///   - Mixed active+passive-VP scheduler (V-Fed, Theorem 4). Below
 ///     `ActiveVp` so a mixed task can never preempt a core's *true*
 ///     active-VP owner when running there as a mere borrower; above
-///     everything else because on its own (possibly partial) active-VP
-///     cores it is servicing the same heavy-DAG obligation `ActiveVp`
-///     does. Relative order versus `EDF`/`PassiveVp` below has no live
-///     scenario to matter for: a specific core is claimed by at most one
-///     active-VP owner and lent to at most one passive/mixed borrower at a
-///     time (see `dag_sched::policy::vfed`'s pool semantics), so those
-///     tiers never actually contend with `MixedVp` for a core — this
-///     ordering is chosen for its own sake, not forced by any such
-///     contention.
-/// - The third highest priority.
-///   - EDF scheduler (clustered, partitioned, and global over a set).
+///     the rest because on its own (possibly partial) active-VP cores it is
+///     servicing the same heavy-DAG obligation `ActiveVp` does. Relative
+///     order versus `EDF`/`PassiveVp` below has no live scenario to matter
+///     for: a specific core is claimed by at most one active-VP owner and
+///     lent to at most one passive/mixed borrower at a time (see
+///     `dag_sched::policy::vfed`'s pool semantics).
 /// - The fourth highest priority.
+///   - EDF scheduler (clustered, partitioned, and global over a set).
+/// - The fifth highest priority.
 ///   - Passive-VP scheduler (V-Fed). Below `EDF` because a passive-VP's
 ///     whole premise is "leftover capacity", lower priority than any
-///     exclusive cluster reservation elsewhere; Federated and V-Fed are
-///     alternative policies rarely live in the same run, so this relative
-///     ordering mostly matters for `PriorityInfo`'s packed cross-tier
-///     comparisons, not for any scenario where they actually contend for
-///     the same core.
-/// - The fifth highest priority.
-///   - DAG-Fluid's `DpWrap` scheduler (the DAG-pool slice, see
-///     `is_dag_pool_scheduler`). DAG-Fluid and the EDF-based policies
-///     (Federated/Laxity) never run in the same build (mutually exclusive
-///     Cargo features), so its ordering against `EDF` has no live
-///     contention scenario to matter for.
+///     exclusive cluster reservation elsewhere.
 /// - The sixth highest priority.
 ///   - Prioritized FIFO scheduler.
 /// - The seventh highest priority.
 ///   - Prioritized Round-Robin scheduler.
 /// - The lowest priority.
 ///   - Panicked scheduler.
+///
+/// The list is laid out as the DAG-pool prefix, then the clustered block,
+/// then the regular-pool tail; `get_next_task` relies on that layout (checked
+/// at compile time below).
 static PRIORITY_LIST: [SchedulerType; 8] = [
+    SchedulerType::DpWrap(0),
     SchedulerType::ActiveVp(CpuSet::empty(), 0),
     SchedulerType::MixedVp(CpuSet::empty(), 0, CpuSet::empty()),
     SchedulerType::EDF(0, CpuSet::empty()),
     SchedulerType::PassiveVp(CpuSet::empty()),
-    SchedulerType::DpWrap(0),
     SchedulerType::PrioritizedFIFO(0),
     SchedulerType::PrioritizedRR(0),
     SchedulerType::Panicked,
 ];
 
-/// Return the number of clustered schedulers in `PRIORITY_LIST`.
-const fn get_num_clustered_schedulers() -> usize {
-    let mut count = 0;
-    while count < PRIORITY_LIST.len() {
-        if PRIORITY_LIST[count].is_clustered() {
-            count += 1;
-        } else {
-            break;
-        }
-    }
-    count
-}
-
-// `get_next_task` relies on the clustered schedulers forming a strict prefix
-// of `PRIORITY_LIST`. Reject any reorder at compile time.
-const _: () = {
-    let mut i = get_num_clustered_schedulers();
-    while i < PRIORITY_LIST.len() {
-        assert!(
-            !PRIORITY_LIST[i].is_clustered(),
-            "clustered schedulers must form a strict prefix of PRIORITY_LIST"
-        );
-        i += 1;
-    }
-};
-
-/// Return the number of DAG-pool schedulers (currently just `DpWrap`)
-/// immediately following the clustered prefix of `PRIORITY_LIST`.
+/// Return the number of DAG-pool schedulers (currently just `DpWrap`) at the
+/// head of `PRIORITY_LIST`.
 const fn get_num_dag_pool_schedulers() -> usize {
     let mut count = 0;
-    let start = get_num_clustered_schedulers();
-    while start + count < PRIORITY_LIST.len() {
-        if PRIORITY_LIST[start + count].is_dag_pool_scheduler() {
-            count += 1;
-        } else {
-            break;
-        }
+    while count < PRIORITY_LIST.len() && PRIORITY_LIST[count].is_dag_pool_scheduler() {
+        count += 1;
     }
     count
 }
 
-// `get_next_task`'s DAG-pool/regular-pool split relies on the DAG-pool
-// schedulers forming a strict prefix of PRIORITY_LIST's non-clustered tail.
-// Reject any reorder at compile time, mirroring the clustered-prefix check
-// above.
+/// Return the number of clustered schedulers, which follow the DAG-pool
+/// prefix of `PRIORITY_LIST`.
+const fn get_num_clustered_schedulers() -> usize {
+    let start = get_num_dag_pool_schedulers();
+    let mut count = 0;
+    while start + count < PRIORITY_LIST.len() && PRIORITY_LIST[start + count].is_clustered() {
+        count += 1;
+    }
+    count
+}
+
+/// The clustered block of `PRIORITY_LIST`.
+fn clustered_schedulers() -> &'static [SchedulerType] {
+    let start = get_num_dag_pool_schedulers();
+    &PRIORITY_LIST[start..start + get_num_clustered_schedulers()]
+}
+
+// `get_next_task` relies on `PRIORITY_LIST` being the DAG-pool prefix, then
+// the clustered block, then a tail of neither. Reject any reorder at compile
+// time.
 const _: () = {
-    let mut i = get_num_clustered_schedulers() + get_num_dag_pool_schedulers();
+    let mut i = get_num_dag_pool_schedulers() + get_num_clustered_schedulers();
     while i < PRIORITY_LIST.len() {
         assert!(
-            !PRIORITY_LIST[i].is_dag_pool_scheduler(),
-            "DAG-pool schedulers must form a strict prefix of PRIORITY_LIST immediately after the clustered prefix"
+            !PRIORITY_LIST[i].is_clustered() && !PRIORITY_LIST[i].is_dag_pool_scheduler(),
+            "PRIORITY_LIST must be the DAG-pool prefix, then the clustered block, then the rest"
         );
         i += 1;
     }
@@ -327,7 +308,7 @@ static GLOBAL_WAKE_GET_MUTEX: Mutex<()> = Mutex::new(());
 ///    `NUM_CLUSTERED_TASKS_IN_QUEUE` is kept consistent.
 /// 2. Implement [`Scheduler::queued_cpu_mask`] to report the exact set of
 ///    CPUs its queued tasks are runnable on (`wake_workers` relies on it).
-/// 3. Be placed in the clustered prefix of `PRIORITY_LIST` and be matched by
+/// 3. Be placed in the clustered block of `PRIORITY_LIST` and be matched by
 ///    `SchedulerType::is_clustered` (checked at compile time).
 pub(crate) trait Scheduler {
     /// Enqueue an executable task.
@@ -355,7 +336,7 @@ pub(crate) trait Scheduler {
 /// schedulers: the exact set of CPUs for which a clustered task is queued.
 pub(crate) fn clustered_queued_cpu_mask() -> CpuSet {
     let mut mask = CpuSet::empty();
-    for scheduler_type in &PRIORITY_LIST[..get_num_clustered_schedulers()] {
+    for scheduler_type in clustered_schedulers() {
         mask = mask.union(get_scheduler(scheduler_type).queued_cpu_mask());
     }
     mask
@@ -367,13 +348,40 @@ pub(crate) fn get_next_task(execution_ensured: bool) -> Option<Arc<Task>> {
     let mut node = MCSNode::new();
     let _guard = GLOBAL_WAKE_GET_MUTEX.lock(&mut node);
 
+    let cpu_id = awkernel_lib::cpu::cpu_id();
+
+    // A CPU reserved by a clustered task's cpu_set (see
+    // `task::NUM_CLUSTERED_TASKS_ALIVE`/`task::is_cpu_reserved`) — e.g. a
+    // Federated heavy DAG's exclusive cluster — must never run a
+    // global-policy (DpWrap/PrioritizedFIFO/PrioritizedRR/Panicked) task, even
+    // while its clustered queue is momentarily empty. Otherwise unrelated
+    // traffic could occupy a core another DAG's schedulability analysis
+    // already counted on being exclusive.
+    let reserved = crate::task::is_cpu_reserved(cpu_id);
+
+    // The DAG pool (`DpWrap`, the highest priority) first, on a DAG-pool
+    // core (see `pool::is_dag_pool_core`). Its own queue counter
+    // (`task::NUM_DAG_POOL_TASK_IN_QUEUE`) skips the lookup in builds and
+    // moments without a ready DAG-Fluid node.
+    if !reserved
+        && pool::is_dag_pool_core(cpu_id)
+        && crate::task::NUM_DAG_POOL_TASK_IN_QUEUE.load(Ordering::Relaxed) > 0
+    {
+        let task = PRIORITY_LIST[..get_num_dag_pool_schedulers()]
+            .iter()
+            .find_map(|scheduler_type| get_scheduler(scheduler_type).get_next(execution_ensured));
+        if task.is_some() {
+            return task;
+        }
+    }
+
     let num_clustered_tasks = crate::task::NUM_CLUSTERED_TASKS_IN_QUEUE.load(Ordering::Relaxed);
 
     // The counter is global: it may be non-zero even when no queued clustered
     // task is runnable on this CPU. That is fine because the run queues fail
     // fast (`pop_for_cpu` checks the root affinity mask in O(1)).
     if num_clustered_tasks > 0 {
-        let task = PRIORITY_LIST[..get_num_clustered_schedulers()]
+        let task = clustered_schedulers()
             .iter()
             .find_map(|scheduler_type| get_scheduler(scheduler_type).get_next(execution_ensured));
 
@@ -384,52 +392,18 @@ pub(crate) fn get_next_task(execution_ensured: bool) -> Option<Arc<Task>> {
         }
     }
 
-    // A CPU reserved by a clustered task's cpu_set (see
-    // `task::NUM_CLUSTERED_TASKS_ALIVE`/`task::is_cpu_reserved`) — e.g. a
-    // Federated heavy DAG's exclusive cluster — must never run a
-    // global-policy (DpWrap/PrioritizedFIFO/PrioritizedRR/Panicked) task, even
-    // while its clustered queue is momentarily empty. Otherwise unrelated
-    // traffic could occupy a core another DAG's schedulability analysis
-    // already counted on being exclusive. Global-policy tasks therefore run
-    // only on the complement of every reserved core.
-    let cpu_id = awkernel_lib::cpu::cpu_id();
-    if crate::task::is_cpu_reserved(cpu_id) {
+    if reserved || !pool::is_regular_pool_core(cpu_id) {
         return None;
     }
 
-    // Skip the clustered prefix: it was either just tried above and returned
-    // None (the queue state cannot change in between because both `wake_task`
-    // and `get_next_task` hold `GLOBAL_WAKE_GET_MUTEX`), or the counter was 0
-    // and its queues are empty.
-    //
-    // Within that remainder, the DAG pool (`DpWrap`) and the regular pool
-    // (PrioritizedFIFO/RR/Panicked) are further split by cpu_id (see
-    // `pool::is_dag_pool_core`/`is_regular_pool_core`): a DAG-pool core
-    // may only serve DAG-pool entries, a regular-pool core only regular-pool
-    // entries. While the split is inactive (too few workers), both
-    // predicates are true everywhere, so every entry is tried on every core
-    // — identical to the pre-split behavior. Each scheduler keeps its own
-    // queue counter (`task::NUM_DAG_POOL_TASK_IN_QUEUE` for `DpWrap`,
-    // `task::NUM_TASK_IN_QUEUE` for the regular pool) at push and pop.
-    let dag_pool_start = get_num_clustered_schedulers();
-    let dag_pool_end = dag_pool_start + get_num_dag_pool_schedulers();
-    let may_run_dag_pool = pool::is_dag_pool_core(cpu_id);
-    let may_run_regular_pool = pool::is_regular_pool_core(cpu_id);
-
-    PRIORITY_LIST[dag_pool_start..]
+    // The regular pool (PrioritizedFIFO/RR/Panicked), on a regular-pool core.
+    // While the pool split is inactive (too few workers), every worker is
+    // both a DAG-pool and a regular-pool core — identical to the pre-split
+    // behavior. These schedulers count `task::NUM_TASK_IN_QUEUE` at push and
+    // pop.
+    PRIORITY_LIST[get_num_dag_pool_schedulers() + get_num_clustered_schedulers()..]
         .iter()
-        .enumerate()
-        .find_map(|(offset, scheduler_type)| {
-            let is_dag_pool_entry = dag_pool_start + offset < dag_pool_end;
-            if is_dag_pool_entry {
-                if !may_run_dag_pool {
-                    return None;
-                }
-            } else if !may_run_regular_pool {
-                return None;
-            }
-            get_scheduler(scheduler_type).get_next(execution_ensured)
-        })
+        .find_map(|scheduler_type| get_scheduler(scheduler_type).get_next(execution_ensured))
 }
 
 /// Get a scheduler.

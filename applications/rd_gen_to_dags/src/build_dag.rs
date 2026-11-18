@@ -17,7 +17,7 @@ use awkernel_async_lib::dag_sched::{
     precondition::{self, Policy},
 };
 use awkernel_async_lib::{
-    dag::{create_dag, record_build_failure, Dag, DagError},
+    dag::{Dag, DagError, create_dag, record_build_failure},
     dag_sched::admission::AdmissionError,
     scheduler::SchedulerType,
 };
@@ -217,8 +217,12 @@ async fn register_source_node(
         4 => register_source!(dag, node_data, sched_type, u64, u64, u64, u64),
         5 => register_source!(dag, node_data, sched_type, u64, u64, u64, u64, u64),
         6 => register_source!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64),
-        7 => register_source!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64),
-        8 => register_source!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64),
+        7 => register_source!(
+            dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64
+        ),
+        8 => register_source!(
+            dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64
+        ),
         9 => register_source!(
             dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64
         ),
@@ -300,10 +304,16 @@ async fn register_sink_node(
         4 => register_sink!(dag, node_data, sched_type, u64, u64, u64, u64),
         5 => register_sink!(dag, node_data, sched_type, u64, u64, u64, u64, u64),
         6 => register_sink!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64),
-        7 => register_sink!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64),
-        8 => register_sink!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64),
+        7 => register_sink!(
+            dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64
+        ),
+        8 => register_sink!(
+            dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64
+        ),
         9 => {
-            register_sink!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64)
+            register_sink!(
+                dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64
+            )
         }
         10 => register_sink!(
             dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64
@@ -1352,116 +1362,48 @@ async fn build_dag_impl(
     // `dag_fluid.rs` module doc.
     #[cfg(feature = "dagfluid")]
     let sched_type = {
-        let graph = crate::dag_graph(&dag_data).map_err(|e| {
-            log::warn!("DAG#{dag_id}: cannot build its graph for DAG-Fluid: {e}");
-            AdmissionError::NoFeasibleAllocation
-        })?;
-        let segments = awkernel_async_lib::dag_sched::policy::dag_fluid::decompose_segments(&graph);
-        let required = awkernel_async_lib::dag_sched::policy::dag_fluid::required_capacity(
-            stats.volume,
-            period,
-            stats.critical_path,
-            relative_deadline,
-            &segments,
-        )
-        // `L > D` was rejected by the precondition above, so `None` here is
-        // a degenerate segment decomposition (see `required_capacity`).
-        .ok_or(AdmissionError::NoFeasibleAllocation)?;
-        resource::reserve_dagfluid_capacity(required)?;
+        // The same preparation the offline switch table generation runs on
+        // the host (`build.rs`), so both admit the same DAGs with the same
+        // segments (see `fluid_offline`).
+        let fluid = crate::fluid_offline::fluid_dag(&dag_data, crate::time_unit::convert_duration_f64)
+            .map_err(|e| {
+                log::warn!("DAG#{dag_id}: cannot prepare it for DAG-Fluid: {e:?}");
+                AdmissionError::NoFeasibleAllocation
+            })?;
+        resource::reserve_dagfluid_capacity(fluid.required)?;
 
-        // Real dispatch (`scheduler::dp_wrap` / `dag_sched::planner`):
-        // compute the Section 8 Step 1 thread-list conversion (Algorithm 1
-        // lines 16-21, see `dag_fluid::assign_segment_deadlines`'s own
-        // doc) and this task's own completion gates
-        // (`dag_fluid::segment_completion_gates`), and register each
-        // segment as this DAG's job template (`dag_sched::job_table`). Only
-        // meaningful for a task actually decomposed into segments
-        // (`stats.volume > d_star`, i.e. the `τ_paral` case, Section 4.1)
-        // -- a `τ_seq` task (whole DAG stretched into one sequential unit)
-        // has no segments to convert or register, and keeps the plain
-        // global-EDF placeholder dispatch DAG-Fluid's static-only Phase 0 used
-        // (formerly `GEDF`, now `EDF` over the DAG pool: fine for a task DP-Wrap
-        // would reduce to trivially anyway with no segment boundaries to
-        // track).
-        let d_star = awkernel_async_lib::dag_sched::policy::dag_fluid::virtual_deadline(period, relative_deadline, stats.critical_path);
-        let schedule = if stats.volume > d_star {
-            awkernel_async_lib::dag_sched::policy::dag_fluid::assign_segment_deadlines(&segments, stats.volume, d_star)
-        } else {
-            None
-        };
-
-        let sched_type = if schedule.is_some() {
-            SchedulerType::DpWrap(dag_id)
-        } else {
-            SchedulerType::EDF(
-                relative_deadline,
-                awkernel_async_lib::scheduler::global_dag_cpu_set(),
-            )
-        };
+        // Every admitted DAG, `τ_seq` included, runs under DP-Wrap
+        // (`scheduler::dp_wrap` / `dag_sched::planner`): a `τ_seq` is one
+        // segment of rate `C/D*` without a node list (TC 2020/2022 Sect. 8).
+        let sched_type = SchedulerType::DpWrap(dag_id);
         log::info!(
-            "DAG#{dag_id}: admitted (dagfluid, shared pool) required_capacity={required:.3} -> {sched_type:?}"
+            "DAG#{dag_id}: admitted (dagfluid, shared pool) required_capacity={:.3} {} -> {sched_type:?}",
+            fluid.required,
+            if fluid.is_seq { "tau_seq" } else { "tau_paral" }
         );
+        for (j, seg) in fluid.segments.iter().enumerate() {
+            log::info!(
+                "DAG#{dag_id}: segment[{j}] m={} r={:?} d={:?} theta={:.3} nodes={:?}",
+                seg.concurrency,
+                seg.offset,
+                seg.relative_deadline,
+                seg.rate,
+                seg.active_nodes
+            );
+        }
 
-        if let Some(schedule) = schedule {
-            let offsets = awkernel_async_lib::dag_sched::policy::dag_fluid::segment_release_offsets(&schedule);
-            // Gates come back as graph indices; templates keep node ids.
-            let node_ids = crate::sorted_node_ids(&dag_data);
-            let gates: Vec<Vec<u32>> =
-                awkernel_async_lib::dag_sched::policy::dag_fluid::segment_completion_gates(&graph)
-                    .into_iter()
-                    .map(|gate| gate.iter().filter_map(|&v| node_ids.get(v).copied()).collect())
-                    .collect();
-            // Each segment's threads, as node ids (the per-node dispatch,
-            // `dagfluid_node`, gives each its own slot).
-            let active: Vec<Vec<u32>> =
-                awkernel_async_lib::dag_sched::policy::dag_fluid::segment_active_nodes(&graph)
-                    .into_iter()
-                    .map(|nodes| nodes.iter().filter_map(|&v| node_ids.get(v).copied()).collect())
-                    .collect();
-            // Convert every value from this build's time unit once, here, so
-            // `job_table` and the planner only ever see `Duration`s.
-            let mut templates = Vec::with_capacity(schedule.len());
-            for (j, (seg, offset)) in schedule.iter().zip(offsets.iter()).enumerate() {
-                log::info!(
-                    "DAG#{dag_id}: segment[{j}] l={} m={} r={offset:.3} d={:.3} theta={:.3}",
-                    seg.duration,
-                    seg.concurrency,
-                    seg.relative_deadline,
-                    seg.rate
-                );
-                let (Some(offset), Some(relative_deadline)) = (
-                    crate::time_unit::convert_duration_f64(*offset),
-                    crate::time_unit::convert_duration_f64(seg.relative_deadline),
-                ) else {
-                    log::warn!(
-                        "DAG#{dag_id}: segment[{j}] offset {offset} or deadline {} is not a valid duration",
-                        seg.relative_deadline
-                    );
-                    return Err(AdmissionError::NoFeasibleAllocation.into());
-                };
-                templates.push(awkernel_async_lib::dag_sched::job_table::SegmentTemplate {
-                    offset,
-                    relative_deadline,
-                    concurrency: seg.concurrency,
-                    rate: seg.rate,
-                    gate_nodes: gates.get(j).cloned().unwrap_or_default(),
-                    active_nodes: active.get(j).cloned().unwrap_or_default(),
-                });
-            }
-
-            // Per-job releases for the per-core dispatch (方式B): the
-            // source node records each real release into this DAG's ring.
-            let registered = awkernel_async_lib::dag_sched::job_table::DagTemplate::new(
-                convert_duration(period),
-                templates,
-            )
-            .and_then(|template| {
-                awkernel_async_lib::dag_sched::job_table::register_dag_template(dag_id, template)
-            });
-            if let Err(e) = registered {
-                log::warn!("DAG#{dag_id}: cannot register its DAG-Fluid job template: {e:?}");
-                return Err(AdmissionError::NoFeasibleAllocation.into());
-            }
+        // Per-job releases for the per-core dispatch (方式B): the source node
+        // records each real release into this DAG's ring.
+        let registered = awkernel_async_lib::dag_sched::job_table::DagTemplate::new(
+            fluid.period,
+            fluid.segments,
+        )
+        .and_then(|template| {
+            awkernel_async_lib::dag_sched::job_table::register_dag_template(dag_id, template)
+        });
+        if let Err(e) = registered {
+            log::warn!("DAG#{dag_id}: cannot register its DAG-Fluid job template: {e:?}");
+            return Err(AdmissionError::NoFeasibleAllocation.into());
         }
         sched_type
     };

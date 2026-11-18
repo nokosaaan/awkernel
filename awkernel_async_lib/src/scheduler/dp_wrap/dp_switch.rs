@@ -523,6 +523,9 @@ mod preemption_side {
         };
         let slot = if NODE_SLOTS { slot } else { None };
         let same = match slot {
+            Some(slot) if slot.node_id == switch_table::ANY_NODE => {
+                dpwrap_dag_of(&current) == Some(dag_id)
+            }
             Some(slot) => dpwrap_node_of(&current) == Some((dag_id, slot.node_id)),
             None => dpwrap_dag_of(&current) == Some(dag_id),
         };

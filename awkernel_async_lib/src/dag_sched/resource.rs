@@ -68,7 +68,7 @@ impl core::fmt::Display for ResourceError {
 /// `1_000_000`. `pub(crate)` so other admission policies needing the same
 /// scaled representation (e.g. `policy::vfed`'s partitioned-EDF density
 /// bin-packing) share one scale factor instead of each picking their own.
-pub(crate) const UTILIZATION_SCALE: u64 = 1_000_000;
+pub const UTILIZATION_SCALE: u64 = 1_000_000;
 
 /// `volume / window`, scaled. `window` is whatever interval the caller wants
 /// `volume`'s demand spread over for the purpose of this bound — the period

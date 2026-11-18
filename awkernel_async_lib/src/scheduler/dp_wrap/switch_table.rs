@@ -75,8 +75,14 @@ pub enum SwitchTableError {
     NoSuchCpu(usize),
 }
 
+/// `NodeSlot::node_id` of a DAG-level slot in per-node mode: any ready node
+/// of the DAG on the slot's job may take it. DAG-Fluid's `τ_seq` (the whole
+/// DAG run as one sequential thread) gets these slots.
+pub const ANY_NODE: u32 = u32::MAX - 1;
+
 /// The node thread a per-node slot belongs to (the `dagfluid_node`
-/// feature): node `node_id` of the DAG, working on job `job`.
+/// feature): node `node_id` of the DAG (or [`ANY_NODE`]), working on job
+/// `job`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodeSlot {
     pub node_id: u32,

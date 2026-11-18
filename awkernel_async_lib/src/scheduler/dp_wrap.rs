@@ -260,7 +260,10 @@ fn node_overrun(dag_id: u32, node_id: u32, now: awkernel_lib::time::Instant) -> 
     let Some(last_end) = template
         .segments()
         .iter()
-        .filter(|segment| segment.active_nodes.contains(&node_id))
+        // A segment without a node list (`τ_seq`) runs every node.
+        .filter(|segment| {
+            segment.active_nodes.is_empty() || segment.active_nodes.contains(&node_id)
+        })
         .map(|segment| segment.offset + segment.relative_deadline)
         .max()
     else {
@@ -412,8 +415,29 @@ impl DpWrapData {
     }
 
     /// Take `dag_id`'s node `slot.node_id` if it is ready and working on
-    /// `slot.job`. A terminated entry is dropped.
+    /// `slot.job`. A terminated entry is dropped. A DAG-level slot
+    /// ([`switch_table::ANY_NODE`], `τ_seq`) takes the ready node of the DAG
+    /// on `slot.job` with the earliest deadline.
     fn take_node(&mut self, dag_id: u32, slot: NodeSlot) -> Option<Arc<Task>> {
+        if slot.node_id == switch_table::ANY_NODE {
+            let finished: Vec<(u32, u32)> = self
+                .ready_nodes
+                .range((dag_id, 0)..=(dag_id, u32::MAX))
+                .filter(|(_, entry)| is_finished(&entry.task))
+                .map(|(&key, _)| key)
+                .collect();
+            for key in finished {
+                self.remove_node(key);
+            }
+            let key = self
+                .ready_nodes
+                .range((dag_id, 0)..=(dag_id, u32::MAX))
+                .filter(|(&(_, node_id), _)| node_on_job(dag_id, node_id, slot.job))
+                // `DpWrapTask`'s order puts the earliest deadline last.
+                .max_by(|(_, a), (_, b)| a.cmp(b))
+                .map(|(&key, _)| key)?;
+            return self.remove_node(key);
+        }
         let key = (dag_id, slot.node_id);
         let entry = self.ready_nodes.get(&key)?;
         if is_finished(&entry.task) {
@@ -527,10 +551,21 @@ impl Scheduler for DpWrapScheduler {
             // read here may be in the middle of a switch); an idle one is
             // woken up so its run loop picks the node up now.
             for cpu in 1..awkernel_lib::cpu::num_cpu() {
-                if entitlement_of(cpu) == Some(dag_id)
-                    && node_slot_of(cpu).is_some_and(|slot| slot.node_id == node_id)
+                if entitlement_of(cpu) != Some(dag_id) {
+                    continue;
+                }
+                // The slot's own node, or a DAG-level slot (`τ_seq`).
+                let Some(slot_node) =
+                    node_slot_of(cpu)
+                        .map(|slot| slot.node_id)
+                        .filter(|&slot_node| {
+                            slot_node == node_id || slot_node == switch_table::ANY_NODE
+                        })
+                else {
+                    continue;
+                };
                 {
-                    slot_measure::ready(cpu, dag_id, node_id, task_id);
+                    slot_measure::ready(cpu, dag_id, slot_node, task_id);
                     if get_task_running(cpu).task_id != 0 {
                         dp_switch::nudge_cpu(cpu);
                     } else {

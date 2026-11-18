@@ -30,6 +30,7 @@
 //!   DAG-Fluid's per-core dispatch planner; see its own module doc.
 pub mod admission;
 pub mod event_driven;
+pub mod fluid_table;
 pub mod graph;
 pub mod job_table;
 pub mod metrics;
@@ -38,4 +39,5 @@ pub mod partition;
 pub mod planner;
 pub mod policy;
 pub mod precondition;
+pub mod release_origin;
 pub mod resource;
