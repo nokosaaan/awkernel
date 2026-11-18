@@ -1,5 +1,5 @@
 //! Same DAG shape as `test_dag`, but every node is spawned with
-//! `SchedulerType::ClusteredEDF` sharing one `CpuSet` instead of `GEDF`.
+//! `SchedulerType::EDF` sharing one `CpuSet` instead of the whole DAG pool.
 //!
 //! This exists to check three things for the Federated Scheduling gap list
 //! (item 6, static-CpuSet variant: dynamic CpuSet reassignment is out of
@@ -22,7 +22,7 @@ const LOG_ENABLE: bool = false;
 
 /// All nodes of this DAG are confined to this cluster of cores.
 fn cluster() -> CpuSet {
-    CpuSet::empty().insert(1).insert(2).insert(3)
+    CpuSet::empty().with(1).with(2).with(3)
 }
 
 /// Log whether the current core is inside `cluster()`, tagged with the
@@ -64,7 +64,7 @@ pub async fn run() {
             (number,)
         },
         vec![Cow::from("c_topic0")],
-        SchedulerType::ClusteredEDF(5, set),
+        SchedulerType::EDF(5, set),
         period,
     )
     .await;
@@ -81,7 +81,7 @@ pub async fn run() {
         },
         vec![Cow::from("c_topic0")],
         vec![Cow::from("c_topic1"), Cow::from("c_topic2")],
-        SchedulerType::ClusteredEDF(10, set),
+        SchedulerType::EDF(10, set),
     )
     .await;
 
@@ -97,7 +97,7 @@ pub async fn run() {
         },
         vec![Cow::from("c_topic1")],
         vec![Cow::from("c_topic3")],
-        SchedulerType::ClusteredEDF(10, set),
+        SchedulerType::EDF(10, set),
     )
     .await;
 
@@ -113,7 +113,7 @@ pub async fn run() {
         },
         vec![Cow::from("c_topic2")],
         vec![Cow::from("c_topic4")],
-        SchedulerType::ClusteredEDF(10, set),
+        SchedulerType::EDF(10, set),
     )
     .await;
 
@@ -127,7 +127,7 @@ pub async fn run() {
             }
         },
         vec![Cow::from("c_topic3"), Cow::from("c_topic4")],
-        SchedulerType::ClusteredEDF(10, set),
+        SchedulerType::EDF(10, set),
         Duration::from_secs(1),
     )
     .await;

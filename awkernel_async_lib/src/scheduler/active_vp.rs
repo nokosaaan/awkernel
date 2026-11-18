@@ -1,11 +1,11 @@
 //! V-Fed's active-VP scheduler ([`crate::dag_sched::policy::vfed`]): the
 //! highest-priority tier, one exclusive slot per core in a heavy DAG's
-//! active-VP group. Reuses [`super::clustered_edf`]'s cpu_set-restricted
+//! active-VP group. Reuses [`super::edf`]'s cpu_set-restricted
 //! affinity queue and `invoke_preemption` pattern verbatim for the actual
 //! dispatch/migration/preemption mechanics (an active-VP group behaves
-//! exactly like a `ClusteredEDF` cluster there — greedy, work-conserving,
+//! exactly like a `EDF` cluster there — greedy, work-conserving,
 //! preemption and migration freely allowed among the group's own cores),
-//! and adds two things `ClusteredEDF` does not need:
+//! and adds two things `EDF` does not need:
 //!
 //! - A strict preference for the group's *leading* core (the paper's rule:
 //!   a non-leading core may only take active-VP work while the leading
@@ -270,7 +270,7 @@ pub(crate) fn tick_budget(cpu_id: usize) {
 }
 
 /// The run queue for non-leading active-VP cores: same key/ordering as
-/// `ClusteredEDF` (see that module), reused verbatim — ordering among one
+/// `EDF` (see that module), reused verbatim — ordering among one
 /// task's own vertices does not affect correctness here (the paper does
 /// not restrict it), but reusing the identical key avoids a second,
 /// pointlessly-different comparator.
@@ -343,7 +343,7 @@ impl Scheduler for ActiveVpScheduler {
         // instead — see `get_next` — because only that side can
         // race-freely observe "is leading busy right now", per the
         // `GLOBAL_WAKE_GET_MUTEX` this function and `get_next` share).
-        // Otherwise identical to `ClusteredEDF::wake_task`: prefer an
+        // Otherwise identical to `EDF::wake_task`: prefer an
         // immediate targeted preemption over enqueuing when one is needed
         // (e.g. a passive-VP is currently using a now-eligible core; V-Fed
         // active-VPs always outrank it via `PriorityInfo`'s packed
@@ -357,6 +357,12 @@ impl Scheduler for ActiveVpScheduler {
                 cpu_set,
                 ClusteredTask::new(task.clone()),
             );
+            drop(data);
+
+            // Every enqueue goes through this function, including the re-wakes
+            // that bypass `ArcWake::wake`, so notify the primary CPU here to
+            // wake an idle worker in the set (same as `EDFScheduler`).
+            awkernel_lib::cpu::wake_cpu(0);
         }
     }
 
@@ -426,7 +432,7 @@ pub static SCHEDULER: ActiveVpScheduler = ActiveVpScheduler {
 };
 
 impl ActiveVpScheduler {
-    /// Identical in structure to `ClusteredEDFScheduler::invoke_preemption`
+    /// Identical in structure to `EDFScheduler::invoke_preemption`
     /// (see that module): find the lowest-priority running-or-pending
     /// victim across `task`'s cpu_set and preempt it if `task` outranks it.
     /// Active-VP tasks always outrank whatever this can find in practice —

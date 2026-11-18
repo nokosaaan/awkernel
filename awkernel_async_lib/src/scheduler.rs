@@ -20,13 +20,13 @@ use awkernel_lib::{
 use alloc::boxed::Box;
 
 pub(crate) mod active_vp;
-mod clustered_edf;
 pub mod dp_wrap;
-pub mod gedf;
+mod edf;
 pub(crate) mod mixed_vp;
 pub(super) mod panicked;
 pub(crate) mod passive_vp;
 pub(crate) mod pool;
+pub use pool::global_dag_cpu_set;
 mod prioritized_fifo;
 mod prioritized_rr;
 
@@ -83,7 +83,7 @@ pub enum SchedulerType {
     /// V-Fed active-VP scheduling: `(cpu_set, leading_cpu)` (see
     /// `dag_sched::policy::vfed` and `scheduler::active_vp`). `cpu_set` is
     /// a heavy DAG's dedicated active-VP group, normalized the same way as
-    /// `ClusteredEDF`'s; `leading_cpu` (a member of `cpu_set`) is the one
+    /// `EDF`'s; `leading_cpu` (a member of `cpu_set`) is the one
     /// core privileged to be tried first for any eligible vertex. Each
     /// core's replenishable per-job execution budget is tracked separately
     /// (`active_vp::set_initial_budget`), not carried here.
@@ -98,7 +98,7 @@ pub enum SchedulerType {
     /// normalized and gated exactly like `PassiveVp`'s. Disjoint from
     /// `active_set` by construction (a DAG never borrows its own cores).
     MixedVp(CpuSet, usize, CpuSet),
-    /// Clustered EDF: `(relative_deadline, cpu_set)`.
+    /// EDF: `(relative_deadline, cpu_set)`.
     ///
     /// `cpu_set` is the set of cores the task may run on. It is normalized at
     /// spawn time: CPU 0 (the primary core) and any out-of-range bits are
@@ -106,18 +106,22 @@ pub enum SchedulerType {
     /// one naming only CPU 0 or out-of-range cores — the task is **not**
     /// rejected; it falls back to all worker cores (`1..num_cpu()`) with a
     /// warning.
-    ClusteredEDF(u64, CpuSet),
+    ///
+    /// `CpuSet::all()` gives global EDF, and a one-core set gives
+    /// partitioned EDF. DAG nodes that used to run under the former GEDF
+    /// (global over the DAG pool) use the DAG-pool set instead
+    /// (`pool::global_dag_cpu_set`).
+    EDF(u64, CpuSet),
     /// V-Fed passive-VP scheduling: `cpu_set` (see
     /// `dag_sched::policy::vfed` and `scheduler::passive_vp`) — the set of
     /// other DAGs' leftover active-VP cores this task draws on. Normalized
-    /// the same way as `ClusteredEDF`'s. No leading/budget concept: dispatch
+    /// the same way as `EDF`'s. No leading/budget concept: dispatch
     /// is gated purely by whether each core's active-VP owner is currently
     /// executing there (`passive_vp::active_vp_is_busy`).
     PassiveVp(CpuSet),
-    GEDF(u64), // relative deadline
     /// DAG-Fluid's real dispatch (`dag_sched::planner` /
     /// `scheduler::dp_wrap`): `dag_id`, the DAG this node belongs to. Unlike
-    /// `ClusteredEDF`/`ActiveVp`, the CPU set a `DpWrap` task may run on is
+    /// `EDF`/`ActiveVp`, the CPU set a `DpWrap` task may run on is
     /// **not** carried here — it is looked up dynamically at dispatch time
     /// from `scheduler::dp_wrap`'s own per-CPU entitlement table, which
     /// changes at every DP-Wrap switch point (see that module's
@@ -138,12 +142,8 @@ impl SchedulerType {
                     SchedulerType::MixedVp(_, _, _),
                     SchedulerType::MixedVp(_, _, _)
                 )
-                | (SchedulerType::GEDF(_), SchedulerType::GEDF(_))
                 | (SchedulerType::DpWrap(_), SchedulerType::DpWrap(_))
-                | (
-                    SchedulerType::ClusteredEDF(_, _),
-                    SchedulerType::ClusteredEDF(_, _)
-                )
+                | (SchedulerType::EDF(_, _), SchedulerType::EDF(_, _))
                 | (SchedulerType::PassiveVp(_), SchedulerType::PassiveVp(_))
                 | (
                     SchedulerType::PrioritizedFIFO(_),
@@ -157,7 +157,7 @@ impl SchedulerType {
         )
     }
 
-    /// Return the CPU affinity set if this is a [`SchedulerType::ClusteredEDF`],
+    /// Return the CPU affinity set if this is a [`SchedulerType::EDF`],
     /// [`SchedulerType::ActiveVp`], [`SchedulerType::PassiveVp`], or
     /// [`SchedulerType::MixedVp`] scheduler.
     ///
@@ -165,7 +165,7 @@ impl SchedulerType {
     /// may run on. Returns `None` for all other scheduler variants.
     pub const fn cpu_set(&self) -> Option<CpuSet> {
         match self {
-            SchedulerType::ClusteredEDF(_, set) => Some(*set),
+            SchedulerType::EDF(_, set) => Some(*set),
             SchedulerType::ActiveVp(set, _) => Some(*set),
             SchedulerType::PassiveVp(set) => Some(*set),
             SchedulerType::MixedVp(active_set, _, passive_set) => {
@@ -184,18 +184,19 @@ impl SchedulerType {
             self,
             SchedulerType::ActiveVp(_, _)
                 | SchedulerType::MixedVp(_, _, _)
-                | SchedulerType::ClusteredEDF(_, _)
+                | SchedulerType::EDF(_, _)
                 | SchedulerType::PassiveVp(_)
         )
     }
 
-    /// True if this scheduler carries DAG light-pool work (GEDF, and
-    /// DAG-Fluid's `DpWrap`). Update this function when adding a further
+    /// True if this scheduler carries DAG light-pool work that is not bound
+    /// to a CPU set (DAG-Fluid's `DpWrap`; DAG nodes under `EDF` carry the
+    /// DAG-pool set themselves). Update this function when adding a further
     /// DAG-oriented global scheduler; it is the single source of truth for
     /// the DAG-pool slice of `PRIORITY_LIST` immediately following the
     /// clustered prefix (see `pool::is_dag_pool_core`).
     pub const fn is_dag_pool_scheduler(&self) -> bool {
-        matches!(self, SchedulerType::GEDF(_) | SchedulerType::DpWrap(_))
+        matches!(self, SchedulerType::DpWrap(_))
     }
 }
 
@@ -211,44 +212,40 @@ impl SchedulerType {
 ///     active-VP owner when running there as a mere borrower; above
 ///     everything else because on its own (possibly partial) active-VP
 ///     cores it is servicing the same heavy-DAG obligation `ActiveVp`
-///     does. Relative order versus `ClusteredEDF`/`PassiveVp`/`GEDF` below
-///     has no live scenario to matter for: a specific core is claimed by at
-///     most one active-VP owner and lent to at most one passive/mixed
-///     borrower at a time (see `dag_sched::policy::vfed`'s pool semantics),
-///     so those tiers never actually contend with `MixedVp` for a core —
-///     this ordering is chosen for its own sake, not forced by any such
+///     does. Relative order versus `EDF`/`PassiveVp` below has no live
+///     scenario to matter for: a specific core is claimed by at most one
+///     active-VP owner and lent to at most one passive/mixed borrower at a
+///     time (see `dag_sched::policy::vfed`'s pool semantics), so those
+///     tiers never actually contend with `MixedVp` for a core — this
+///     ordering is chosen for its own sake, not forced by any such
 ///     contention.
 /// - The third highest priority.
-///   - Clustered EDF scheduler.
+///   - EDF scheduler (clustered, partitioned, and global over a set).
 /// - The fourth highest priority.
-///   - Passive-VP scheduler (V-Fed). Below `ClusteredEDF` because a
-///     passive-VP's whole premise is "leftover capacity", lower priority
-///     than any exclusive cluster reservation elsewhere; Federated and
-///     V-Fed are alternative policies rarely live in the same run, so this
-///     relative ordering mostly matters for `PriorityInfo`'s packed
-///     cross-tier comparisons, not for any scenario where they actually
-///     contend for the same core.
+///   - Passive-VP scheduler (V-Fed). Below `EDF` because a passive-VP's
+///     whole premise is "leftover capacity", lower priority than any
+///     exclusive cluster reservation elsewhere; Federated and V-Fed are
+///     alternative policies rarely live in the same run, so this relative
+///     ordering mostly matters for `PriorityInfo`'s packed cross-tier
+///     comparisons, not for any scenario where they actually contend for
+///     the same core.
 /// - The fifth highest priority.
-///   - GEDF scheduler.
+///   - DAG-Fluid's `DpWrap` scheduler (the DAG-pool slice, see
+///     `is_dag_pool_scheduler`). DAG-Fluid and the EDF-based policies
+///     (Federated/Laxity) never run in the same build (mutually exclusive
+///     Cargo features), so its ordering against `EDF` has no live
+///     contention scenario to matter for.
 /// - The sixth highest priority.
-///   - DAG-Fluid's `DpWrap` scheduler. Below `GEDF` (both DAG-pool
-///     schedulers, see `is_dag_pool_scheduler`) for the same reason
-///     `PassiveVp` sits below `ClusteredEDF`: Federated/Laxity (`GEDF`) and
-///     DAG-Fluid (`DpWrap`) are alternative policies that never run in the
-///     same build (mutually exclusive Cargo features), so this relative
-///     ordering has no live contention scenario to matter for.
-/// - The seventh highest priority.
 ///   - Prioritized FIFO scheduler.
-/// - The eighth highest priority.
+/// - The seventh highest priority.
 ///   - Prioritized Round-Robin scheduler.
 /// - The lowest priority.
 ///   - Panicked scheduler.
-static PRIORITY_LIST: [SchedulerType; 9] = [
+static PRIORITY_LIST: [SchedulerType; 8] = [
     SchedulerType::ActiveVp(CpuSet::empty(), 0),
     SchedulerType::MixedVp(CpuSet::empty(), 0, CpuSet::empty()),
-    SchedulerType::ClusteredEDF(0, CpuSet::empty()),
+    SchedulerType::EDF(0, CpuSet::empty()),
     SchedulerType::PassiveVp(CpuSet::empty()),
-    SchedulerType::GEDF(0),
     SchedulerType::DpWrap(0),
     SchedulerType::PrioritizedFIFO(0),
     SchedulerType::PrioritizedRR(0),
@@ -268,9 +265,8 @@ const fn get_num_clustered_schedulers() -> usize {
     count
 }
 
-// `get_next_task` and its per-pool queue-counter accounting rely on the
-// clustered schedulers forming a strict prefix of `PRIORITY_LIST`. Reject
-// any reorder at compile time.
+// `get_next_task` relies on the clustered schedulers forming a strict prefix
+// of `PRIORITY_LIST`. Reject any reorder at compile time.
 const _: () = {
     let mut i = get_num_clustered_schedulers();
     while i < PRIORITY_LIST.len() {
@@ -282,7 +278,7 @@ const _: () = {
     }
 };
 
-/// Return the number of DAG-pool schedulers (currently just GEDF)
+/// Return the number of DAG-pool schedulers (currently just `DpWrap`)
 /// immediately following the clustered prefix of `PRIORITY_LIST`.
 const fn get_num_dag_pool_schedulers() -> usize {
     let mut count = 0;
@@ -391,7 +387,7 @@ pub(crate) fn get_next_task(execution_ensured: bool) -> Option<Arc<Task>> {
     // A CPU reserved by a clustered task's cpu_set (see
     // `task::NUM_CLUSTERED_TASKS_ALIVE`/`task::is_cpu_reserved`) — e.g. a
     // Federated heavy DAG's exclusive cluster — must never run a
-    // global-policy (GEDF/PrioritizedFIFO/PrioritizedRR/Panicked) task, even
+    // global-policy (DpWrap/PrioritizedFIFO/PrioritizedRR/Panicked) task, even
     // while its clustered queue is momentarily empty. Otherwise unrelated
     // traffic could occupy a core another DAG's schedulability analysis
     // already counted on being exclusive. Global-policy tasks therefore run
@@ -404,17 +400,17 @@ pub(crate) fn get_next_task(execution_ensured: bool) -> Option<Arc<Task>> {
     // Skip the clustered prefix: it was either just tried above and returned
     // None (the queue state cannot change in between because both `wake_task`
     // and `get_next_task` hold `GLOBAL_WAKE_GET_MUTEX`), or the counter was 0
-    // and its queues are empty. This also structurally guarantees that the
-    // per-pool decrements below never apply to a clustered task, which is
-    // counted by `NUM_CLUSTERED_TASKS_IN_QUEUE` instead.
+    // and its queues are empty.
     //
-    // Within that remainder, the DAG pool (GEDF) and the regular pool
+    // Within that remainder, the DAG pool (`DpWrap`) and the regular pool
     // (PrioritizedFIFO/RR/Panicked) are further split by cpu_id (see
     // `pool::is_dag_pool_core`/`is_regular_pool_core`): a DAG-pool core
     // may only serve DAG-pool entries, a regular-pool core only regular-pool
     // entries. While the split is inactive (too few workers), both
     // predicates are true everywhere, so every entry is tried on every core
-    // — identical to the pre-split behavior.
+    // — identical to the pre-split behavior. Each scheduler keeps its own
+    // queue counter (`task::NUM_DAG_POOL_TASK_IN_QUEUE` for `DpWrap`,
+    // `task::NUM_TASK_IN_QUEUE` for the regular pool) at push and pop.
     let dag_pool_start = get_num_clustered_schedulers();
     let dag_pool_end = dag_pool_start + get_num_dag_pool_schedulers();
     let may_run_dag_pool = pool::is_dag_pool_core(cpu_id);
@@ -432,18 +428,7 @@ pub(crate) fn get_next_task(execution_ensured: bool) -> Option<Arc<Task>> {
             } else if !may_run_regular_pool {
                 return None;
             }
-
-            let task = get_scheduler(scheduler_type).get_next(execution_ensured)?;
-
-            // Decrement whichever counter this task was queued under (see
-            // `Task::wake`), matching the pool it just came from.
-            if is_dag_pool_entry {
-                crate::task::NUM_DAG_POOL_TASK_IN_QUEUE.fetch_sub(1, Ordering::Relaxed);
-            } else {
-                crate::task::NUM_REGULAR_POOL_TASK_IN_QUEUE.fetch_sub(1, Ordering::Relaxed);
-            }
-
-            Some(task)
+            get_scheduler(scheduler_type).get_next(execution_ensured)
         })
 }
 
@@ -456,9 +441,8 @@ pub(crate) fn get_scheduler(sched_type: &SchedulerType) -> &'static dyn Schedule
     match sched_type {
         SchedulerType::PrioritizedFIFO(_) => &prioritized_fifo::SCHEDULER,
         SchedulerType::PrioritizedRR(_) => &prioritized_rr::SCHEDULER,
-        SchedulerType::GEDF(_) => &gedf::SCHEDULER,
+        SchedulerType::EDF(_, _) => &edf::SCHEDULER,
         SchedulerType::DpWrap(_) => &dp_wrap::SCHEDULER,
-        SchedulerType::ClusteredEDF(_, _) => &clustered_edf::SCHEDULER,
         SchedulerType::ActiveVp(_, _) => &active_vp::SCHEDULER,
         SchedulerType::MixedVp(_, _, _) => &mixed_vp::SCHEDULER,
         SchedulerType::PassiveVp(_) => &passive_vp::SCHEDULER,

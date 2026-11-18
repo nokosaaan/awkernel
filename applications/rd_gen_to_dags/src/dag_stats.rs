@@ -3,7 +3,7 @@
 //! Computes per-DAG statistics (total WCET volume and critical-path length)
 //! from the fully-known node/edge topology that `parse_yaml::DagData` already
 //! holds before any reactor is registered. This does not depend on which
-//! `SchedulerType` the DAG will eventually use (ClusteredEDF, GEDF,
+//! `SchedulerType` the DAG will eventually use (EDF,
 //! PrioritizedFIFO, or a future Federated scheduler); it is shared groundwork
 //! for all of them.
 

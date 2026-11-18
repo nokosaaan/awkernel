@@ -38,9 +38,6 @@ pub async fn run() -> Result<(), Cow<'static, str>> {
     #[cfg(feature = "test_async_mutex")]
     test_async_mutex::run().await; // test for async_mutex
 
-    #[cfg(feature = "test_gedf")]
-    test_gedf::run().await; // test for Global Earliest Deadline First scheduler
-
     #[cfg(feature = "test_measure_channel")]
     test_measure_channel::run().await; // measure channel
 
@@ -59,11 +56,11 @@ pub async fn run() -> Result<(), Cow<'static, str>> {
     #[cfg(feature = "test_voluntary_preemption")]
     test_voluntary_preemption::run().await; // test for voluntary preemption
 
-    #[cfg(feature = "test_clustered_edf")]
-    test_clustered_edf::run().await; // test for Clustered EDF scheduler
+    #[cfg(feature = "test_edf")]
+    test_edf::run().await; // test for EDF scheduler
 
     #[cfg(feature = "test_clustered_dag")]
-    test_clustered_dag::run().await; // test_dag's DAG shape, pinned to one CpuSet via ClusteredEDF
+    test_clustered_dag::run().await; // test_dag's DAG shape, pinned to one CpuSet via EDF
 
     #[cfg(feature = "test_active_vp")]
     test_active_vp::run().await; // smoke test for V-Fed's pure active-VP scheduling path

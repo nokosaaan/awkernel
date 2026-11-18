@@ -20,7 +20,7 @@
 //! queue entry per wake, with `affinity = active_set ∪ passive_set`:
 //! [`affinity_btree_queue::AffinityBTreeQueue`] already guarantees an entry
 //! is popped by at most one cpu among its affinity set — the same primitive
-//! `ClusteredEDF`'s own multi-core clusters already rely on — so no new
+//! `EDF`'s own multi-core clusters already rely on — so no new
 //! claim/invalidate bookkeeping is needed for that part.
 //!
 //! What *is* new: which gate applies depends on which side of the union
@@ -143,6 +143,12 @@ impl Scheduler for MixedVpScheduler {
                 cpu_set,
                 ClusteredTask::new(task.clone()),
             );
+            drop(data);
+
+            // Every enqueue goes through this function, including the re-wakes
+            // that bypass `ArcWake::wake`, so notify the primary CPU here to
+            // wake an idle worker in the set (same as `EDFScheduler`).
+            awkernel_lib::cpu::wake_cpu(0);
         }
     }
 
@@ -237,7 +243,7 @@ pub static SCHEDULER: MixedVpScheduler = MixedVpScheduler {
 };
 
 impl MixedVpScheduler {
-    /// Identical in structure to `ClusteredEDFScheduler::invoke_preemption`
+    /// Identical in structure to `EDFScheduler::invoke_preemption`
     /// (see that module): find the lowest-priority running-or-pending
     /// victim across `task`'s cpu_set (here, `active_set ∪ passive_set`)
     /// and preempt it if `task` outranks it. Safe to reuse verbatim across

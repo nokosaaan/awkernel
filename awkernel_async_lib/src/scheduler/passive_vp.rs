@@ -3,7 +3,7 @@
 //! assigned to one or more *other* DAGs' leftover active-VP capacity
 //! (Theorem 2/4's passive-VPs).
 //!
-//! Structurally almost identical to [`super::clustered_edf`] (same
+//! Structurally almost identical to [`super::edf`] (same
 //! cpu_set-restricted affinity queue, same `invoke_preemption` pattern,
 //! copied rather than shared because it is a separate, independently
 //! reasoned-about priority tier — see `crate::scheduler::SchedulerType`'s
@@ -21,7 +21,7 @@
 //! `PriorityInfo` packs `(scheduler_class_priority, task_priority)` and
 //! `ActiveVp` sits above `PassiveVp` in `PRIORITY_LIST`, the generic
 //! `task.preempts(&target_task)` comparison [`PassiveVpScheduler::invoke_preemption`]
-//! reuses from `ClusteredEDF` is *never* true when `target_task` is the
+//! reuses from `EDF` is *never* true when `target_task` is the
 //! active-VP owner — no special case needed, the packed comparison already
 //! rules it out.
 //!
@@ -30,7 +30,7 @@
 //! - O(1): one atomic load (`get_task_running`) plus one bounded lookup
 //!   (`get_scheduler_type_by_task_id`, itself a `BTreeMap` lookup bounded
 //!   by the live task count) and one info-lock acquisition — the same cost
-//!   `ClusteredEDF`/`GEDF`'s existing `invoke_preemption` already pays per
+//!   `EDF`'s existing `invoke_preemption` already pays per
 //!   candidate cpu, not a new class of expense.
 //! - Never panics.
 
@@ -80,7 +80,7 @@ pub(crate) fn active_vp_is_busy(cpu_id: usize) -> bool {
     }
 }
 
-/// Same key/ordering as `ClusteredEDF`/`ActiveVp` (see those modules):
+/// Same key/ordering as `EDF`/`ActiveVp` (see those modules):
 /// reused verbatim rather than redesigned, since nothing about the
 /// passive-VP role changes what a reasonable dispatch order looks like.
 type PassiveVpQueue = AffinityBTreeQueue<
@@ -138,6 +138,12 @@ impl Scheduler for PassiveVpScheduler {
                 cpu_set,
                 ClusteredTask::new(task.clone()),
             );
+            drop(data);
+
+            // Every enqueue goes through this function, including the re-wakes
+            // that bypass `ArcWake::wake`, so notify the primary CPU here to
+            // wake an idle worker in the set (same as `EDFScheduler`).
+            awkernel_lib::cpu::wake_cpu(0);
         }
     }
 
@@ -201,7 +207,7 @@ pub static SCHEDULER: PassiveVpScheduler = PassiveVpScheduler {
 };
 
 impl PassiveVpScheduler {
-    /// Identical in structure to `ClusteredEDFScheduler::invoke_preemption`
+    /// Identical in structure to `EDFScheduler::invoke_preemption`
     /// (see that module and this module's doc for why it is safe to reuse
     /// verbatim: the packed `PriorityInfo` comparison already prevents this
     /// from ever displacing an active-VP owner).

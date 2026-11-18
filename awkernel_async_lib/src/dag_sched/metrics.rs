@@ -40,7 +40,7 @@ pub struct DagMetrics {
     pub period: u64,
     /// `D`: relative deadline. In the same time unit as
     /// `volume`/`critical_path`/`period`, and as
-    /// [`crate::scheduler::SchedulerType::GEDF`]/[`crate::scheduler::SchedulerType::ClusteredEDF`]'s
+    /// [`crate::scheduler::SchedulerType::EDF`]'s
     /// own `relative_deadline` parameter (the scheduler layer treats it as
     /// an opaque `u64`; callers must stay consistent, exactly as those two
     /// variants already require).

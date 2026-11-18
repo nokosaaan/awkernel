@@ -1,6 +1,7 @@
-//! A Clustered EDF scheduler.
+//! An EDF scheduler.
 //!
 //! Each task carries a [`CpuSet`] describing the CPU cores it may run on.
+//! A one-core set gives partitioned EDF, and `CpuSet::all()` gives global EDF.
 //! Runnable tasks are kept in a single affinity-aware priority queue
 //! ([`AffinityBTreeQueue`]); `get_next` on CPU `c` pops the earliest-deadline
 //! task whose `cpu_set` contains `c`.
@@ -42,21 +43,21 @@ type EDFQueue = AffinityBTreeQueue<
     CPU_SET_WORDS,
 >;
 
-pub struct ClusteredEDFScheduler {
+pub struct EDFScheduler {
     // `AffinityBTreeQueue::new` is not a const fn, so the queue is lazily
     // initialized with `num_cpu()` on first use.
     data: Mutex<Option<EDFQueue>>,
     priority: u8,
 }
 
-impl Scheduler for ClusteredEDFScheduler {
+impl Scheduler for EDFScheduler {
     fn wake_task(&self, task: Arc<Task>) {
         let (wake_time, absolute_deadline, node_priority) = {
             let mut node_inner = MCSNode::new();
             let mut info = task.info.lock(&mut node_inner);
             let dag_info = info.get_dag_info();
             match info.scheduler_type {
-                SchedulerType::ClusteredEDF(relative_deadline, _) => {
+                SchedulerType::EDF(relative_deadline, _) => {
                     let wake_time = awkernel_lib::delay::uptime();
                     let (absolute_deadline, node_priority) = if let Some(ref dag_info) = dag_info {
                         (
@@ -83,9 +84,9 @@ impl Scheduler for ClusteredEDFScheduler {
         // set (masking to worker cores, falling back to all workers when empty).
         // Reaching here with an invalid set means that invariant was violated
         // internally, so fail loud rather than enqueue an unrunnable task.
-        let cpu_set = task.cpu_set.expect("ClusteredEDF task has no CPU set");
+        let cpu_set = task.cpu_set.expect("EDF task has no CPU set");
         if cpu_set.is_empty() || masked_workers(cpu_set, num_cpu()) != cpu_set {
-            unreachable!("ClusteredEDF: cpu_set {cpu_set:?} was not normalized by spawn");
+            unreachable!("EDF: cpu_set {cpu_set:?} was not normalized by spawn");
         }
 
         let mut node = MCSNode::new();
@@ -98,9 +99,15 @@ impl Scheduler for ClusteredEDFScheduler {
                 .push(
                     (absolute_deadline, u64::MAX - node_priority, wake_time),
                     cpu_set,
-                    ClusteredTask::new(task.clone()),
+                    ClusteredTask::new(task),
                 )
-                .expect("ClusteredEDF: failed to push a task");
+                .expect("EDF: failed to push a task");
+            drop(data);
+
+            // Every enqueue goes through this function, including the re-wakes
+            // that bypass `ArcWake::wake`, so notify the primary CPU here to
+            // wake an idle worker in the set.
+            awkernel_lib::cpu::wake_cpu(0);
         }
     }
 
@@ -144,7 +151,7 @@ impl Scheduler for ClusteredEDFScheduler {
     }
 
     fn scheduler_name(&self) -> SchedulerType {
-        SchedulerType::ClusteredEDF(0, CpuSet::empty())
+        SchedulerType::EDF(0, CpuSet::empty())
     }
 
     fn priority(&self) -> u8 {
@@ -164,12 +171,12 @@ impl Scheduler for ClusteredEDFScheduler {
     }
 }
 
-pub static SCHEDULER: ClusteredEDFScheduler = ClusteredEDFScheduler {
+pub static SCHEDULER: EDFScheduler = EDFScheduler {
     data: Mutex::new(None),
-    priority: get_priority(&SchedulerType::ClusteredEDF(0, CpuSet::empty())),
+    priority: get_priority(&SchedulerType::EDF(0, CpuSet::empty())),
 };
 
-impl ClusteredEDFScheduler {
+impl EDFScheduler {
     fn invoke_preemption(&self, task: Arc<Task>) -> bool {
         if !PREEMPTION_ENABLED {
             return false;
@@ -178,7 +185,7 @@ impl ClusteredEDFScheduler {
         let cpu_set = task.cpu_set.expect("Task has no CPU set");
 
         // Find the CPU whose target (running or pending-preemption) task has
-        // the lowest priority among the set.
+        // the lowest priority among the busy CPUs of the set.
         let mut victim: Option<(usize, Arc<Task>)> = None;
 
         for cpu_id in cpu_set.iter() {
@@ -189,19 +196,27 @@ impl ClusteredEDFScheduler {
                 return false;
             }
 
-            // An idle CPU in the set will pick the task up; no preemption needed.
+            // An idle CPU does not stop the preemption. A task queued before
+            // or after this one can take the idle CPU first, and a sleeping
+            // CPU runs a queued task only after the primary CPU wakes it. So
+            // this task can preempt the lowest-priority busy CPU even if the
+            // set has an idle CPU. The cost is that the preemption can be
+            // unneeded, and the victim waits for the primary CPU to wake a
+            // sleeping CPU. If the set of the victim holds no idle CPU, the
+            // victim waits for its own CPU while the idle CPU stays idle.
             if task_running.task_id == 0 {
-                return false;
+                continue;
             }
 
-            let task_running = get_task(task_running.task_id);
-            let task_pending = peek_preemption_pending(cpu_id);
+            // A running task that is missing from the task table finished
+            // after the read above, so this CPU counts as idle too.
+            let Some(task_running) = get_task(task_running.task_id) else {
+                continue;
+            };
 
-            let target_task = match (task_running, task_pending) {
-                (Some(running), Some(pending)) => running.max(pending),
-                (Some(running), None) => running,
-                (None, Some(pending)) => pending,
-                (None, None) => return false,
+            let target_task = match peek_preemption_pending(cpu_id) {
+                Some(pending) => task_running.max(pending),
+                None => task_running,
             };
 
             match victim {
@@ -220,21 +235,18 @@ impl ClusteredEDFScheduler {
             set_need_preemption(target_task.id, victim_cpu);
             awkernel_lib::interrupt::send_ipi(preempt_irq, victim_cpu as u32);
 
-            // NOTE(atsushi421): Currently, preemption is requested regardless of the number of idle CPUs.
-            // While this implementation easily prevents priority inversion, it may also cause unnecessary preemption.
-            // Therefore, a more sophisticated implementation will be considered in the future.
-
             // NOTE: The task is now pinned to `victim_cpu`'s preemption-pending
             // heap and is not in the affinity queue, so it is invisible to the
             // other CPUs in its `cpu_set` (neither `pop_for_cpu`, the clustered
             // task counter, nor `queued_cpu_mask` sees it). If another CPU in
-            // the set becomes idle while the IPI is in flight, it cannot pick
+            // the set is or becomes idle while the IPI is in flight, it cannot pick
             // the task up and may go to sleep — a latency window bounded by the
             // IPI delivery plus the victim's interrupt-disabled sections. This
             // is not a lost wakeup: the task is eventually run either by the
             // victim's preemption handler (`do_preemption`), or re-woken by the
             // victim's `run_main` if its running task finishes first, in which
-            // case the idle check above routes it to the queue. Future work:
+            // case this function decides again. `run_main` checks the pending
+            // heap again before the victim sleeps. Future work:
             // an enqueue-instead-of-pin strategy (push to the affinity queue
             // and treat the IPI as a hint) would close this window, but it
             // requires redesigning the duplicate-IPI suppression that the

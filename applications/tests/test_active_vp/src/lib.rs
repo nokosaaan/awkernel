@@ -4,7 +4,7 @@
 //! configs via `dag_sched::policy::vfed::admit_one`, converts the resulting
 //! `VFedAssignment` into a `SchedulerType` via `into_scheduler_type`, and
 //! spawns tasks with it directly (mirroring how `test_clustered_edf`
-//! exercises `ClusteredEDF` without a full DAG/rd_gen pipeline) to observe
+//! exercises `EDF` without a full DAG/rd_gen pipeline) to observe
 //! real dispatch behavior under QEMU.
 //!
 //! [`test_mixed_vp_group`] is the main scenario: a donor DAG gets a pure
@@ -66,10 +66,10 @@ pub async fn run() {
     wait_microsec(100_000_000);
 }
 
-/// Control experiment using the pre-existing, unmodified `ClusteredEDF`
+/// Control experiment using the pre-existing, unmodified `EDF`
 /// scheduler (no V-Fed code involved at all): two plain tasks, no
 /// `DagInfo`, sharing one 2-core cpu_set. With no `DagInfo` each wake
-/// computes `absolute_deadline = wake_time` (see `ClusteredEDFScheduler::wake_task`'s
+/// computes `absolute_deadline = wake_time` (see `EDFScheduler::wake_task`'s
 /// fallback), so whichever task woke most recently always looks most
 /// urgent, causing the two tasks to repeatedly preempt each other for the
 /// same core — isolates whether a stall under that churn is specific to
@@ -97,7 +97,7 @@ async fn test_control_clustered_edf_same_priority_churn() {
                 }
                 log::info!("test_active_vp: CONTROL {name} finished [OK]");
             },
-            SchedulerType::ClusteredEDF(1_000_000, cluster),
+            SchedulerType::EDF(1_000_000, cluster),
         )
         .await;
     }

@@ -56,17 +56,21 @@ pub type TaskResult = Result<(), Cow<'static, str>>;
 static TASKS: Mutex<Tasks> = Mutex::new(Tasks::new()); // Set of tasks.
 static RUNNING: [AtomicU32; NUM_MAX_CPU] = array![_ => AtomicU32::new(0); NUM_MAX_CPU]; // IDs of running tasks.
 pub(crate) static MAX_TASK_PRIORITY: u64 = (1 << 56) - 1; // Maximum task priority.
-                                                          // Split by DAG-pool/regular-pool membership (see
-                                                          // `scheduler::pool::is_dag_pool_core`/`is_regular_pool_core`) instead of
-                                                          // one combined counter, so `wake_workers` can budget wakeups per pool: a
-                                                          // woken DAG-pool core can only ever dequeue a DAG-pool (GEDF) task, so
-                                                          // counting it against a combined budget could exhaust the budget on cores
-                                                          // that can't actually serve a pending regular-pool (FIFO/RR/Panicked) task,
-                                                          // leaving the one core that could serve it never woken.
-#[cfg(target_pointer_width = "64")]
+
+/// Total number of tasks in the queues of the regular-pool schedulers
+/// (PrioritizedFIFO/RR/Panicked). Each of these schedulers increments it when
+/// it pushes a task to its queue and decrements it when it pops one, so it
+/// counts every path that calls `wake_task`, including the re-wakes that
+/// bypass `ArcWake::wake`.
+pub(crate) static NUM_TASK_IN_QUEUE: AtomicU32 = AtomicU32::new(0);
+
+/// Total number of tasks in the queue of the DAG-pool scheduler (`DpWrap`),
+/// counted at push and pop the same way as [`NUM_TASK_IN_QUEUE`]. Kept
+/// separate so `wake_workers` can budget wakeups per pool: a woken DAG-pool
+/// core can only ever dequeue a DAG-pool task, so counting it against a
+/// combined budget could exhaust the budget on cores that cannot serve a
+/// pending regular-pool task (see `scheduler::pool`).
 pub(crate) static NUM_DAG_POOL_TASK_IN_QUEUE: AtomicU32 = AtomicU32::new(0);
-#[cfg(target_pointer_width = "64")]
-pub(crate) static NUM_REGULAR_POOL_TASK_IN_QUEUE: AtomicU32 = AtomicU32::new(0);
 
 /// Total number of tasks in the clustered schedulers' queues.
 /// Which CPUs those tasks are runnable on is tracked exactly by the run
@@ -104,16 +108,23 @@ pub(crate) fn reserve_cpu(cpu_id: usize) {
     NUM_CLUSTERED_TASKS_ALIVE[cpu_id].fetch_add(1, Ordering::Relaxed);
 }
 
+/// Whether a clustered task running on `set` under `sched` reserves those
+/// cores while it is alive (see [`NUM_CLUSTERED_TASKS_ALIVE`]). `EDF` tasks
+/// do not: an `EDF` set is just as often a global one (`CpuSet::all()`, or
+/// the DAG pool via `scheduler::pool::global_dag_cpu_set`), and reserving it
+/// would shut the regular-pool tasks or DAG-Fluid's `DpWrap` out of those
+/// cores. An exclusive `EDF` cluster (Federated, V-Fed's partitioned light
+/// DAGs) is reserved at admission instead, by
+/// `dag_sched::resource::allocate_cluster` ([`reserve_cpu`]).
+fn reserves_cpus(sched: &SchedulerType, _set: CpuSet) -> bool {
+    !matches!(sched, SchedulerType::EDF(_, _))
+}
+
 /// Undo one [`reserve_cpu`] call.
 #[inline(always)]
 pub(crate) fn release_cpu(cpu_id: usize) {
     NUM_CLUSTERED_TASKS_ALIVE[cpu_id].fetch_sub(1, Ordering::Relaxed);
 }
-
-#[cfg(target_pointer_width = "32")]
-pub(crate) static NUM_DAG_POOL_TASK_IN_QUEUE: AtomicU32 = AtomicU32::new(0);
-#[cfg(target_pointer_width = "32")]
-pub(crate) static NUM_REGULAR_POOL_TASK_IN_QUEUE: AtomicU32 = AtomicU32::new(0);
 
 static PREEMPTION_REQUEST: [AtomicBool; NUM_MAX_CPU] =
     array![_ => AtomicBool::new(false); NUM_MAX_CPU];
@@ -154,7 +165,7 @@ impl Task {
     /// priority (scheduler priority, then task priority; see `PriorityInfo`).
     ///
     /// Equal priorities never preempt. Within a priority level the schedulers
-    /// are FIFO (PrioritizedFIFO, ClusteredEDF/GEDF on equal deadlines) or
+    /// are FIFO (PrioritizedFIFO, EDF on equal deadlines) or
     /// rotate by their own time quantum (PrioritizedRR), so a task woken while
     /// an equal-priority task is running waits in the run queue instead of
     /// displacing it.
@@ -234,29 +245,11 @@ impl ArcWake for Task {
             panicked = info.panicked;
         }
 
-        // Panicked tasks go to the global panicked scheduler (regular pool).
-        // Non-panicked clustered tasks: counters are managed inside clustered_edf::wake_task.
-        // Non-panicked non-clustered tasks: increment the DAG-pool or
-        // regular-pool counter here, matching which pool their scheduler
-        // belongs to (see `scheduler::SchedulerType::is_dag_pool_scheduler`).
-        if panicked {
-            NUM_REGULAR_POOL_TASK_IN_QUEUE.fetch_add(1, Ordering::Release);
-        } else if self.cpu_set.is_none() {
-            if self.scheduler_name().is_dag_pool_scheduler() {
-                NUM_DAG_POOL_TASK_IN_QUEUE.fetch_add(1, Ordering::Release);
-            } else {
-                NUM_REGULAR_POOL_TASK_IN_QUEUE.fetch_add(1, Ordering::Release);
-            }
-        }
-
         if panicked {
             scheduler::panicked::SCHEDULER.wake_task(self);
         } else {
             self.scheduler.wake_task(self);
         }
-
-        // Notify the primary CPU to wake up workers.
-        awkernel_lib::cpu::wake_cpu(0);
     }
 }
 
@@ -424,7 +417,7 @@ impl Tasks {
             if let btree_map::Entry::Vacant(e) = self.id_to_task.entry(id) {
                 // Validate and normalise the CPU set before creating TaskInfo so that
                 // info.scheduler_type and task.cpu_set stay in sync.
-                let cpu_set = if let SchedulerType::ClusteredEDF(deadline, set) = scheduler_type {
+                let cpu_set = if let SchedulerType::EDF(deadline, set) = scheduler_type {
                     // CPU 0 is the primary core and cannot run clustered tasks.
                     let masked = masked_workers(set, num_cpu());
                     let normalized = if masked.is_empty() {
@@ -439,10 +432,10 @@ impl Tasks {
                     } else {
                         masked
                     };
-                    scheduler_type = SchedulerType::ClusteredEDF(deadline, normalized);
+                    scheduler_type = SchedulerType::EDF(deadline, normalized);
                     Some(normalized)
                 } else if let SchedulerType::ActiveVp(set, leading_cpu) = scheduler_type {
-                    // Same normalization as ClusteredEDF above; ActiveVp
+                    // Same normalization as EDF above; ActiveVp
                     // additionally carries a distinguished leading core, so
                     // re-derive it if normalization changed the set (only
                     // possible if the caller passed an invalid set to begin
@@ -471,7 +464,7 @@ impl Tasks {
                     scheduler_type = SchedulerType::ActiveVp(normalized, normalized_leading);
                     Some(normalized)
                 } else if let SchedulerType::PassiveVp(set) = scheduler_type {
-                    // Same normalization as ClusteredEDF/ActiveVp above; no
+                    // Same normalization as EDF/ActiveVp above; no
                     // leading core to re-derive.
                     let masked = masked_workers(set, num_cpu());
                     let normalized = if masked.is_empty() {
@@ -563,7 +556,7 @@ impl Tasks {
 
                 // Reserve the cluster's CPUs for clustered scheduling until
                 // this task terminates (released in `Tasks::remove`).
-                if let Some(set) = cpu_set {
+                if let Some(set) = cpu_set.filter(|set| reserves_cpus(&scheduler_type, *set)) {
                     for cpu_id in set.iter() {
                         NUM_CLUSTERED_TASKS_ALIVE[cpu_id].fetch_add(1, Ordering::Relaxed);
                     }
@@ -596,7 +589,15 @@ impl Tasks {
     fn remove(&mut self, id: u32) {
         if let Some(task) = self.id_to_task.remove(&id) {
             // Release the CPU reservation taken in `Tasks::spawn`.
-            if let Some(set) = task.cpu_set {
+            let scheduler_type = {
+                let mut node = MCSNode::new();
+                let info = task.info.lock(&mut node);
+                info.scheduler_type
+            };
+            if let Some(set) = task
+                .cpu_set
+                .filter(|set| reserves_cpus(&scheduler_type, *set))
+            {
                 for cpu_id in set.iter() {
                     NUM_CLUSTERED_TASKS_ALIVE[cpu_id].fetch_sub(1, Ordering::Relaxed);
                 }
@@ -629,12 +630,13 @@ pub fn spawn(
 
 /// Spawn a detached task with DAG information.
 /// This function is similar to `spawn` but automatically sets DAG information
-/// for the task, which is useful for DAG-based schedulers like GEDF.
+/// for the task, which is useful for DAG-based schedulers like EDF.
 ///
 /// # Example
 ///
 /// ```ignore
 /// use awkernel_async_lib::{scheduler::SchedulerType, task, dag::{create_dag, add_node_with_topic_edges_public, set_relative_deadline_public}};
+/// use awkernel_lib::cpu::CpuSet;
 /// use core::time::Duration;
 /// let dag = create_dag();
 /// let sink_node_idx = add_node_with_topic_edges_public(&dag, &[], &[]);
@@ -643,7 +645,7 @@ pub fn spawn(
 /// let task_id = task::spawn_with_dag_info(
 ///     "dag task".into(),
 ///     async { Ok(()) },
-///     SchedulerType::GEDF(0),
+///     SchedulerType::EDF(0, CpuSet::all()),
 ///     DagInfo { dag_id: 1, node_id: 0 }
 /// );
 /// ```
@@ -1782,6 +1784,16 @@ pub fn run_main() {
                 }
             }
         } else {
+            // A waker that read this CPU as busy can pin a task here after the
+            // re-wake at the top of the loop. While this CPU runs no task, the
+            // preemption IPI can leave that task pinned, so re-wake it instead
+            // of sleeping. `get_next_task` took `GLOBAL_WAKE_GET_MUTEX`, so this
+            // check sees the pin of every such waker.
+            if scheduler::PREEMPTION_ENABLED && scheduler::peek_preemption_pending(cpu_id).is_some()
+            {
+                continue;
+            }
+
             #[cfg(feature = "perf")]
             perf::start_idle();
 
@@ -2042,7 +2054,7 @@ impl Ord for PriorityInfo {
 pub fn wake_workers() {
     let num_cpus = awkernel_lib::cpu::num_cpu();
     let mut num_dag_pool_tasks = NUM_DAG_POOL_TASK_IN_QUEUE.load(Ordering::Relaxed);
-    let mut num_regular_pool_tasks = NUM_REGULAR_POOL_TASK_IN_QUEUE.load(Ordering::Relaxed);
+    let mut num_regular_pool_tasks = NUM_TASK_IN_QUEUE.load(Ordering::Relaxed);
 
     // The exact set of CPUs for which a clustered task is queued, read from
     // the clustered schedulers' run queues.

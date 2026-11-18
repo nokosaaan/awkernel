@@ -51,6 +51,7 @@ use super::{
     get_priority, peek_preemption_pending, push_preemption_pending, Scheduler, SchedulerType, Task,
     GLOBAL_WAKE_GET_MUTEX, PREEMPTION_ENABLED,
 };
+use crate::task::NUM_DAG_POOL_TASK_IN_QUEUE;
 use crate::{
     dag::calculate_and_update_dag_deadline,
     task::{
@@ -116,7 +117,7 @@ pub fn wrap_blocks(densities: &[(usize, f64)], m: usize) -> Vec<Vec<(usize, f64,
 }
 
 /// DAG-Fluid's real dispatch (`SchedulerType::DpWrap`): a task's own CPU
-/// affinity is not fixed at spawn time (unlike `ClusteredEDF`/`ActiveVp`)
+/// affinity is not fixed at spawn time (unlike `EDF`/`ActiveVp`)
 /// -- it is *which DAG a CPU is currently entitled to*, set by
 /// [`dp_switch`] at each switch point of the CPU's own switch table. Once
 /// a CPU is entitled to `dag_id`, any of that DAG's
@@ -177,8 +178,6 @@ pub fn spawn_placeholders(cpus: impl Iterator<Item = usize>) {
             core::future::pending(),
             SchedulerType::DpWrap(PLACEHOLDER_DAG),
         );
-        // `Task::wake` counted the spawn's wake, but `wake_task` drops it.
-        crate::task::NUM_DAG_POOL_TASK_IN_QUEUE.fetch_sub(1, Ordering::Relaxed);
         slot.store(id, Ordering::Release);
     }
 }
@@ -351,7 +350,7 @@ fn in_dagfluid_pool(cpu_id: usize) -> bool {
 }
 
 /// One ready DAG-Fluid node, queued under its own `dag_id` (see
-/// [`DpWrapData`]). Ordering is identical to `gedf::GEDFTask`'s (same
+/// [`DpWrapData`]). Ordering is identical to `edf.rs`'s run-queue key's (same
 /// `(absolute_deadline, node_priority, wake_time)` key, smaller
 /// `absolute_deadline` first) -- reused verbatim rather than re-derived,
 /// since within one DAG's own ready pool the tie-break rationale is the
@@ -392,7 +391,7 @@ impl Ord for DpWrapTask {
 impl Eq for DpWrapTask {}
 
 /// One ready-queue per `dag_id`, rather than one global queue (GEDF) or one
-/// queue per fixed `CpuSet` (ClusteredEDF): the entitled CPU set for a
+/// queue per fixed `CpuSet` (EDF): the entitled CPU set for a
 /// given `dag_id` changes over time (see [`ENTITLEMENT`]), but the queue of
 /// *that DAG's own* ready nodes does not need to move when it does.
 struct DpWrapData {
@@ -418,20 +417,30 @@ impl DpWrapData {
         let key = (dag_id, slot.node_id);
         let entry = self.ready_nodes.get(&key)?;
         if is_finished(&entry.task) {
-            self.ready_nodes.remove(&key);
+            self.remove_node(key);
             return None;
         }
         if !node_on_job(dag_id, slot.node_id, slot.job) {
             return None;
         }
-        self.ready_nodes.remove(&key).map(|entry| entry.task)
+        self.remove_node(key)
+    }
+
+    /// Remove a ready node, keeping [`NUM_DAG_POOL_TASK_IN_QUEUE`] in step.
+    fn remove_node(&mut self, key: (u32, u32)) -> Option<Arc<Task>> {
+        let entry = self.ready_nodes.remove(&key)?;
+        NUM_DAG_POOL_TASK_IN_QUEUE.fetch_sub(1, Ordering::Relaxed);
+        Some(entry.task)
     }
 
     /// For a no-DAG slot: take the overrun ready node (see
     /// [`node_overrun`]) with the earliest deadline, if any.
     fn take_overrun(&mut self, now: awkernel_lib::time::Instant) -> Option<Arc<Task>> {
+        let before = self.ready_nodes.len();
         self.ready_nodes
             .retain(|_, entry| !is_finished(&entry.task));
+        let dropped = before - self.ready_nodes.len();
+        NUM_DAG_POOL_TASK_IN_QUEUE.fetch_sub(dropped as u32, Ordering::Relaxed);
         let key = self
             .ready_nodes
             .iter()
@@ -439,7 +448,7 @@ impl DpWrapData {
             // `DpWrapTask`'s order puts the earliest deadline last.
             .max_by(|(_, a), (_, b)| a.cmp(b))
             .map(|(&key, _)| key)?;
-        self.ready_nodes.remove(&key).map(|entry| entry.task)
+        self.remove_node(key)
     }
 }
 
@@ -508,9 +517,9 @@ impl Scheduler for DpWrapScheduler {
                         wake_time,
                     },
                 );
-                if replaced.is_some() {
-                    // Counted once by `Task::wake` per wake, but queued once.
-                    crate::task::NUM_DAG_POOL_TASK_IN_QUEUE.fetch_sub(1, Ordering::Relaxed);
+                if replaced.is_none() {
+                    // A node is one task, queued at most once.
+                    NUM_DAG_POOL_TASK_IN_QUEUE.fetch_add(1, Ordering::Relaxed);
                 }
             }
             // Ready in the middle of its own slot: the CPU holding the slot
@@ -555,6 +564,13 @@ impl Scheduler for DpWrapScheduler {
                     node_priority,
                     wake_time,
                 });
+            NUM_DAG_POOL_TASK_IN_QUEUE.fetch_add(1, Ordering::Relaxed);
+            drop(data);
+
+            // Every enqueue goes through this function, including the re-wakes
+            // that bypass `ArcWake::wake`, so notify the primary CPU here to
+            // wake an idle worker.
+            awkernel_lib::cpu::wake_cpu(0);
         }
     }
 
@@ -603,6 +619,7 @@ impl Scheduler for DpWrapScheduler {
 
         loop {
             let task = queue.pop()?;
+            NUM_DAG_POOL_TASK_IN_QUEUE.fetch_sub(1, Ordering::Relaxed);
 
             {
                 let mut node = MCSNode::new();
@@ -643,7 +660,7 @@ pub static SCHEDULER: DpWrapScheduler = DpWrapScheduler {
 };
 
 impl DpWrapScheduler {
-    /// Same shape as `gedf::GEDFScheduler::invoke_preemption`, restricted to
+    /// Same shape as `EDFScheduler::invoke_preemption`, restricted to
     /// CPUs currently entitled to `dag_id` (see [`ENTITLEMENT`]) rather than
     /// every running CPU -- a `DpWrap` task must never preempt a CPU that
     /// some *other* DAG currently owns the entitlement for.

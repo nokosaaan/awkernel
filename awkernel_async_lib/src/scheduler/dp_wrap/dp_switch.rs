@@ -472,6 +472,7 @@ mod preemption_side {
         let queue = (*data).as_mut()?.queues.get_mut(&dag_id)?;
         loop {
             let DpWrapTask { task, .. } = queue.pop()?;
+            crate::task::NUM_DAG_POOL_TASK_IN_QUEUE.fetch_sub(1, Ordering::Relaxed);
             let mut node = MCSNode::new();
             let state = task.info.lock(&mut node).state;
             if !matches!(state, State::Terminated | State::Panicked) {

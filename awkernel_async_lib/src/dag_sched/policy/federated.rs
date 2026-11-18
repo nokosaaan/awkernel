@@ -56,11 +56,11 @@
 //! reduces `min(D, T)` back to `T`.
 //!
 //! This module is admission-time only. It does not add a new run queue or a
-//! new [`crate::scheduler::Scheduler`] impl: [`SchedulerType::ClusteredEDF`]
+//! new [`crate::scheduler::Scheduler`] impl: [`SchedulerType::EDF`]
 //! already implements "EDF restricted to a `CpuSet`" (cluster reservation,
-//! preemption, the lot), so a heavy DAG's cluster is simply a `ClusteredEDF`
-//! cpu_set; a light DAG uses [`SchedulerType::ClusteredEDF`] on its partition's
-//! single core under [`admit_batch`] (or plain [`SchedulerType::GEDF`] under
+//! preemption, the lot), so a heavy DAG's cluster is simply a `EDF`
+//! cpu_set; a light DAG uses [`SchedulerType::EDF`] on its partition's
+//! single core under [`admit_batch`] (or [`SchedulerType::EDF`] over the whole DAG pool, the former GEDF, under
 //! the legacy [`admit_dag`]). Both already compute a
 //! per-job-instance absolute deadline for every node of a DAG via
 //! [`crate::dag::calculate_and_update_dag_deadline`], so this module does
@@ -168,7 +168,10 @@ pub fn admit_dag(config: DagMetrics) -> Result<FederatedAssignment, AdmissionErr
                 resource::reserve_light_utilization(config.volume, density_window(&config))?;
             Ok(FederatedAssignment {
                 class: TaskClass::Light,
-                scheduler_type: SchedulerType::GEDF(config.relative_deadline),
+                scheduler_type: SchedulerType::EDF(
+                    config.relative_deadline,
+                    crate::scheduler::global_dag_cpu_set(),
+                ),
                 source: config.source,
             })
         }
@@ -176,7 +179,7 @@ pub fn admit_dag(config: DagMetrics) -> Result<FederatedAssignment, AdmissionErr
             let cores = resource::allocate_cluster(required_cores)?;
             Ok(FederatedAssignment {
                 class: TaskClass::Heavy { required_cores },
-                scheduler_type: SchedulerType::ClusteredEDF(config.relative_deadline, cores),
+                scheduler_type: SchedulerType::EDF(config.relative_deadline, cores),
                 source: config.source,
             })
         }
@@ -449,7 +452,7 @@ pub fn is_batch_feasible(tasks: &[FedTask<'_>], m: u16) -> bool {
 /// at least one low-density DAG.
 ///
 /// Run-time mapping: a high-density DAG runs EDF restricted to its own
-/// cluster ([`SchedulerType::ClusteredEDF`]), a low-density DAG
+/// cluster ([`SchedulerType::EDF`]), a low-density DAG
 /// uniprocessor EDF on its partition's single core (the same scheduler on a
 /// one-core set). For Li et al. and for IPDPS 2015's `D > T` case that is
 /// the papers' own run-time rule (any greedy scheduler / EDF). For
@@ -498,7 +501,7 @@ pub fn admit_batch(
         };
         out.push(FederatedAssignment {
             class,
-            scheduler_type: SchedulerType::ClusteredEDF(c.relative_deadline, cores),
+            scheduler_type: SchedulerType::EDF(c.relative_deadline, cores),
             source: c.source,
         });
     }
@@ -679,13 +682,13 @@ mod tests {
         let heavy_c = resource::allocate_cluster(3).unwrap();
         assert!(heavy_c.iter().all(|cpu| !heavy_b.contains(cpu)));
 
-        // admit_dag end-to-end: Light gets GEDF, Heavy gets a fresh cluster.
+        // admit_dag end-to-end: Light gets global EDF over the DAG pool, Heavy gets a fresh cluster.
         // density_window = min(D=50, T=100) = 50, so admit_dag reserves
         // utilization against 50, not 100 — release must match.
         let light = admit_dag(DagMetrics::from_static(10, 5, 100, 50)).unwrap();
         assert_eq!(light.class, TaskClass::Light);
         assert_eq!(light.source, MetricsSource::Static);
-        assert!(matches!(light.scheduler_type, SchedulerType::GEDF(50)));
+        assert!(matches!(light.scheduler_type, SchedulerType::EDF(50, _)));
         resource::release_light_utilization(10, 50); // undo admit_dag's reservation before the next scenario
 
         resource::release_cluster(heavy_b);

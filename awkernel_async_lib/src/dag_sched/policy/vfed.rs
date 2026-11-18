@@ -718,7 +718,7 @@ impl VFedAssignment {
     /// [`SchedulerType::MixedVp`] (`scheduler::mixed_vp`); a pure active-VP
     /// group (`passive` empty) becomes [`SchedulerType::ActiveVp`]; a pure
     /// passive-VP or partitioned-EDF light DAG becomes
-    /// [`SchedulerType::PassiveVp`]/[`SchedulerType::ClusteredEDF`]
+    /// [`SchedulerType::PassiveVp`]/[`SchedulerType::EDF`]
     /// respectively.
     pub fn into_scheduler_type(&self, relative_deadline: u64) -> Option<SchedulerType> {
         match self {
@@ -748,7 +748,7 @@ impl VFedAssignment {
                     .fold(CpuSet::empty(), |set, p| set.with(p.cpu));
                 Some(SchedulerType::PassiveVp(cpu_set))
             }
-            VFedAssignment::LightPartitioned { cpu } => Some(SchedulerType::ClusteredEDF(
+            VFedAssignment::LightPartitioned { cpu } => Some(SchedulerType::EDF(
                 relative_deadline,
                 CpuSet::empty().with(*cpu),
             )),
@@ -1510,12 +1510,12 @@ mod tests {
         let assignment = VFedAssignment::LightPartitioned { cpu: 7 };
         let sched = assignment.into_scheduler_type(50).unwrap();
         match sched {
-            SchedulerType::ClusteredEDF(deadline, cpu_set) => {
+            SchedulerType::EDF(deadline, cpu_set) => {
                 assert_eq!(deadline, 50);
                 assert!(cpu_set.contains(7));
                 assert_eq!(cpu_set.iter().count(), 1);
             }
-            other => panic!("expected ClusteredEDF, got {other:?}"),
+            other => panic!("expected EDF, got {other:?}"),
         }
     }
 

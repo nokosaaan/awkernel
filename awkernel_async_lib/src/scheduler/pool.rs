@@ -1,20 +1,21 @@
 //! The DAG-pool / regular-pool worker CPU split.
 //!
 //! One worker core is carved out for regular (non-DAG) tasks — the shell,
-//! driver services, and the like — so that a DAG-side scheduler (currently
-//! GEDF) is never delayed by interference its admission math has no way to
-//! account for, and conversely so that shell/service latency is never at the
-//! mercy of DAG-to-DAG contention.
+//! driver services, and the like — so that a DAG-side scheduler (`EDF` over
+//! [`global_dag_cpu_set`], or DAG-Fluid's `DpWrap`) is never delayed by
+//! interference its admission math has no way to account for, and conversely
+//! so that shell/service latency is never at the mercy of DAG-to-DAG
+//! contention.
 //!
 //! This is pure CPU-id arithmetic: it holds no shared state and does not
 //! depend on which admission policy (Federated or otherwise) is deciding
 //! `SchedulerType`s. It used to live in `federated.rs`, but every DAG
 //! scheduler needs it regardless of admission policy, and `scheduler.rs`
-//! (dispatch) / `gedf.rs`, `prioritized_fifo.rs`, `prioritized_rr.rs`
+//! (dispatch) / `dp_wrap.rs`, `prioritized_fifo.rs`, `prioritized_rr.rs`
 //! (preemption target filtering) all need to call it without depending on a
 //! specific admission policy module.
 
-use awkernel_lib::cpu::num_cpu;
+use awkernel_lib::cpu::{num_cpu, CpuSet};
 
 /// Whether the DAG pool / regular pool split (see [`is_dag_pool_core`] /
 /// [`is_regular_pool_core`]) is in effect. Splitting off one core needs at
@@ -25,15 +26,14 @@ pub(crate) fn dag_pool_split_active() -> bool {
     num_cpu() >= 3
 }
 
-/// True if `cpu_id` may run DAG-pool (GEDF) work.
+/// True if `cpu_id` may run DAG-pool work.
 ///
 /// The last worker core is carved out for regular (non-DAG) tasks — the
 /// shell, driver services, and the like — so that a DAG's admission math
 /// (e.g. Federated's `u = C/T`) is never invalidated by interference it has
 /// no way to model, since none of that analysis accounts for shell/service
 /// load. See [`super::get_next_task`] for where this gates dispatch, and
-/// [`crate::dag::calculate_and_update_dag_deadline`]'s callers (`gedf.rs`'s
-/// `invoke_preemption`) for where it gates preemption targets.
+/// [`global_dag_cpu_set`] for the CPU set DAG nodes under `EDF` carry.
 pub(crate) fn is_dag_pool_core(cpu_id: usize) -> bool {
     cpu_id != 0 && (!dag_pool_split_active() || cpu_id != num_cpu() - 1)
 }
@@ -43,6 +43,31 @@ pub(crate) fn is_dag_pool_core(cpu_id: usize) -> bool {
 /// (like it) true everywhere while the split is inactive.
 pub(crate) fn is_regular_pool_core(cpu_id: usize) -> bool {
     cpu_id != 0 && (!dag_pool_split_active() || cpu_id == num_cpu() - 1)
+}
+
+/// The CPU set for DAG nodes that run under global EDF over the DAG pool
+/// (what the former GEDF scheduler did): every DAG-pool core
+/// ([`is_dag_pool_core`]) not reserved by an exclusive cluster
+/// (`task::is_cpu_reserved`, e.g. a Federated heavy DAG claimed at
+/// admission). Read it when spawning the nodes, after admission has claimed
+/// its clusters. If every DAG-pool core is reserved, falls back to the whole
+/// DAG pool with a warning rather than handing out an empty set.
+pub fn global_dag_cpu_set() -> CpuSet {
+    let mut pool = CpuSet::empty();
+    let mut free = CpuSet::empty();
+    for cpu in (1..num_cpu()).filter(|&cpu| is_dag_pool_core(cpu)) {
+        pool.insert(cpu);
+        if !crate::task::is_cpu_reserved(cpu) {
+            free.insert(cpu);
+        }
+    }
+    if free.is_empty() {
+        log::warn!(
+            "global_dag_cpu_set: every DAG-pool core is reserved; using the whole DAG pool {pool:?}"
+        );
+        return pool;
+    }
+    free
 }
 
 #[cfg(test)]

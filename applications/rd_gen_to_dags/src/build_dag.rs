@@ -17,7 +17,7 @@ use awkernel_async_lib::dag_sched::{
     precondition::{self, Policy},
 };
 use awkernel_async_lib::{
-    dag::{Dag, DagError, create_dag, record_build_failure},
+    dag::{create_dag, record_build_failure, Dag, DagError},
     dag_sched::admission::AdmissionError,
     scheduler::SchedulerType,
 };
@@ -217,12 +217,8 @@ async fn register_source_node(
         4 => register_source!(dag, node_data, sched_type, u64, u64, u64, u64),
         5 => register_source!(dag, node_data, sched_type, u64, u64, u64, u64, u64),
         6 => register_source!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64),
-        7 => register_source!(
-            dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64
-        ),
-        8 => register_source!(
-            dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64
-        ),
+        7 => register_source!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64),
+        8 => register_source!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64),
         9 => register_source!(
             dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64
         ),
@@ -304,16 +300,10 @@ async fn register_sink_node(
         4 => register_sink!(dag, node_data, sched_type, u64, u64, u64, u64),
         5 => register_sink!(dag, node_data, sched_type, u64, u64, u64, u64, u64),
         6 => register_sink!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64),
-        7 => register_sink!(
-            dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64
-        ),
-        8 => register_sink!(
-            dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64
-        ),
+        7 => register_sink!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64),
+        8 => register_sink!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64),
         9 => {
-            register_sink!(
-                dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64
-            )
+            register_sink!(dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64)
         }
         10 => register_sink!(
             dag, node_data, sched_type, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64
@@ -1214,8 +1204,8 @@ async fn register_dag_nodes(
         }
 
         // Shorter laxity = more urgent: invert so it maps to a *larger*
-        // `node_priority`, matching `gedf.rs`'s ordering
-        // (`GEDFTask`'s `Ord` picks the *largest* `node_priority` first
+        // `node_priority`, matching `edf.rs`'s ordering
+        // (its run queue picks the *largest* `node_priority` first
         // among equal-deadline tasks). Called here, before
         // `finish_create_dags`, per `set_node_priority`'s own doc
         // requirement. `node.get_id()` is safe to use directly as the
@@ -1287,10 +1277,10 @@ async fn build_dag_impl(
         let assignment =
             _federated_assignment.ok_or(BuildDagError::FederatedNotAdmitted(dag_id))?;
         let sched_type = assignment.scheduler_type;
-        if let SchedulerType::ClusteredEDF(deadline, cluster) = sched_type {
+        if let SchedulerType::EDF(deadline, cluster) = sched_type {
             let cores: Vec<usize> = cluster.iter().collect();
             log::info!(
-                "DAG#{dag_id}: admitted (federated) as {:?} ({:?}) -> ClusteredEDF(relative_deadline={deadline}, cores={cores:?})",
+                "DAG#{dag_id}: admitted (federated) as {:?} ({:?}) -> EDF(relative_deadline={deadline}, cores={cores:?})",
                 assignment.class,
                 assignment.source
             );
@@ -1304,10 +1294,11 @@ async fn build_dag_impl(
         sched_type
     };
 
-    // "Static Laxity-Based" baseline: plain (non-clustered) GEDF, with a
+    // "Static Laxity-Based" baseline: global EDF over the DAG pool (the
+    // former GEDF, now `EDF` with `global_dag_cpu_set()`), with a
     // per-node priority tie-break computed offline from `compute_node_laxity`
     // (shorter laxity = more urgent = higher priority, per `dag.rs`/
-    // `gedf.rs`/`clustered_edf.rs`'s shared "higher `node_priority` picked
+    // `edf.rs`/`dp_wrap.rs`'s shared "higher `node_priority` picked
     // first" convention). This baseline has no published primary source of
     // its own -- see `compute_node_laxity`'s own doc for why -- it exists as
     // a self-derived structural counterpart to He et al. 2019 for
@@ -1321,7 +1312,10 @@ async fn build_dag_impl(
                 critical_path: stats.critical_path,
                 relative_deadline,
             })?;
-        let sched_type = SchedulerType::GEDF(relative_deadline);
+        let sched_type = SchedulerType::EDF(
+            relative_deadline,
+            awkernel_async_lib::scheduler::global_dag_cpu_set(),
+        );
         log::info!(
             "DAG#{dag_id}: admitted (laxity) {config:?} -> {sched_type:?}, node_laxity={laxity:?}"
         );
@@ -1346,8 +1340,8 @@ async fn build_dag_impl(
     // DAG-Fluid tasks actually sharing capacity).
     //
     // Dispatch: still a *placeholder*, not the papers' DP-Fair/DP-Wrap
-    // fluid-rate execution -- plain `GEDF` over the shared pool (the same
-    // placeholder role Federated's light tasks already use `GEDF` for).
+    // fluid-rate execution -- global `EDF` over the shared pool (the same
+    // placeholder role Federated's light tasks already use it for).
     // The real DP-Wrap dispatch mechanism (Funk, Levin, Sadowski, Pye,
     // Brandt, "DP-Fair: A unifying theory for optimal hard real-time
     // multiprocessor scheduling", Real-Time Systems 2011) is not
@@ -1385,8 +1379,8 @@ async fn build_dag_impl(
         // (`stats.volume > d_star`, i.e. the `τ_paral` case, Section 4.1)
         // -- a `τ_seq` task (whole DAG stretched into one sequential unit)
         // has no segments to convert or register, and keeps the plain
-        // `GEDF` placeholder dispatch DAG-Fluid's static-only Phase 0 used
-        // (see `SchedulerType::GEDF`'s own doc: fine for a task DP-Wrap
+        // global-EDF placeholder dispatch DAG-Fluid's static-only Phase 0 used
+        // (formerly `GEDF`, now `EDF` over the DAG pool: fine for a task DP-Wrap
         // would reduce to trivially anyway with no segment boundaries to
         // track).
         let d_star = awkernel_async_lib::dag_sched::policy::dag_fluid::virtual_deadline(period, relative_deadline, stats.critical_path);
@@ -1399,7 +1393,10 @@ async fn build_dag_impl(
         let sched_type = if schedule.is_some() {
             SchedulerType::DpWrap(dag_id)
         } else {
-            SchedulerType::GEDF(relative_deadline)
+            SchedulerType::EDF(
+                relative_deadline,
+                awkernel_async_lib::scheduler::global_dag_cpu_set(),
+            )
         };
         log::info!(
             "DAG#{dag_id}: admitted (dagfluid, shared pool) required_capacity={required:.3} -> {sched_type:?}"
