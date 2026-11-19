@@ -696,7 +696,7 @@ def parse_args():
     p.add_argument("--target-os", choices=["windows", "linux"], default="windows",
                     help="which one-shot-PXE-boot mechanism to drive over ssh: bcdedit+shutdown "
                          "(windows) or efibootmgr+reboot (linux)")
-    p.add_argument("--target-mac", default="80:fa:5b:79:11:e1",
+    p.add_argument("--target-mac", default="40:c2:ba:a8:5f:f9",
                     help="target's PXE NIC MAC: identifies the right `efibootmgr -v` entry on "
                          "--target-os linux")
     p.add_argument("--trial-interval-secs", type=int, default=30,
@@ -760,8 +760,30 @@ def parse_args():
     return args
 
 
+def check_pxe_server():
+    """Fail fast if dnsmasq (DHCP+TFTP for PXE) is not running.
+
+    With `bind-interfaces`, dnsmasq exits at boot when the direct-link NIC is
+    unplugged and never comes back; scripts/pxe_host_setup.sh switches it to
+    `bind-dynamic` so it survives cable unplug/replug.
+    """
+    if shutil.which("systemctl") is None:
+        return
+    state = subprocess.run(
+        ["systemctl", "is-active", "dnsmasq"], capture_output=True, text=True, check=False,
+    ).stdout.strip()
+    if state != "active":
+        sys.exit(
+            f"[pxe] dnsmasq is {state or 'unknown'}; the target cannot PXE boot.\n"
+            "      Plug in the LAN cable, then `sudo systemctl restart dnsmasq`.\n"
+            "      To stop this recurring, run scripts/pxe_host_setup.sh once."
+        )
+
+
 def main():
     args = parse_args()
+    if not args.dry_run:
+        check_pxe_server()
     state_path = args.log_dir / "dag_selection.json"
     boot_cache_path = args.log_dir / "real_machine_boot_entry.json"
     state = load_json(state_path, [])
