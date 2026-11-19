@@ -140,7 +140,63 @@ struct PoolEntry {
 
 /// Everything one run needs: from the command line, or asked on stdin
 /// when the program is started without arguments (see [`Params::ask`]).
+/// The real-machine configuration a run is meant for (the evaluation plan
+/// of 2026-10-26: S0 -> S1 -> S2 remove one interference at a time on the
+/// i7-14650HX, P-core 8 with HT + E-core 8). It picks the default `m`, names
+/// the result directory, and is recorded in `<manifest>.params.json` so
+/// `scripts/real_machine_trial.py` builds the matching kernel.
+#[derive(Clone, Copy, PartialEq)]
+enum EvalConfig {
+    /// HT on, P- and E-cores: 24 logical CPUs, m = 22.
+    S0Ht,
+    /// HT off (`smt_disable`), P- and E-cores: 16 CPUs, m = 14.
+    S1NoHt,
+    /// HT off, P-cores only: 8 CPUs, m = 7 (not implemented in the kernel yet).
+    S2POnly,
+    /// Anything else (and every command-line run).
+    Custom,
+}
+
+impl EvalConfig {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::S0Ht => "S0-HT",
+            Self::S1NoHt => "S1-noHT",
+            Self::S2POnly => "S2-Ponly",
+            Self::Custom => "custom",
+        }
+    }
+
+    fn default_m(self) -> &'static str {
+        match self {
+            Self::S0Ht => "22",
+            Self::S1NoHt | Self::Custom => "14",
+            Self::S2POnly => "7",
+        }
+    }
+
+    /// Whether the kernel must be built with `smt_disable` (None: not known).
+    fn smt_disable(self) -> Option<bool> {
+        match self {
+            Self::S0Ht => Some(false),
+            Self::S1NoHt | Self::S2POnly => Some(true),
+            Self::Custom => None,
+        }
+    }
+
+    fn parse(v: &str) -> Result<Self, String> {
+        match v.to_ascii_lowercase().as_str() {
+            "s0" | "0" => Ok(Self::S0Ht),
+            "s1" | "1" => Ok(Self::S1NoHt),
+            "s2" | "2" => Ok(Self::S2POnly),
+            "c" | "custom" => Ok(Self::Custom),
+            _ => Err("answer s0, s1, s2 or c".to_string()),
+        }
+    }
+}
+
 struct Params {
+    config: EvalConfig,
     pool_dir: String,
     real_cores: u16,
     dags_per_set: usize,
@@ -168,7 +224,8 @@ const DEFAULT_TRIALS_DIR_RELATIVE_TO_HOME: &str = "ws/awkernel_script/rd_gen_tri
 fn trials_root() -> PathBuf {
     match env::var_os("AWKERNEL_TRIALS_DIR") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => PathBuf::from(env::var("HOME").unwrap_or_default()).join(DEFAULT_TRIALS_DIR_RELATIVE_TO_HOME),
+        _ => PathBuf::from(env::var("HOME").unwrap_or_default())
+            .join(DEFAULT_TRIALS_DIR_RELATIVE_TO_HOME),
     }
 }
 
@@ -195,14 +252,20 @@ fn timestamp() -> String {
 /// line arguments, but not for answers typed at a prompt).
 fn expand_tilde(v: &str) -> String {
     match (v.strip_prefix('~'), env::var("HOME")) {
-        (Some(rest), Ok(home)) if rest.is_empty() || rest.starts_with('/') => format!("{home}{rest}"),
+        (Some(rest), Ok(home)) if rest.is_empty() || rest.starts_with('/') => {
+            format!("{home}{rest}")
+        }
         _ => v.to_string(),
     }
 }
 
 /// Default pool for the interactive mode: RD-Gen's wide pool
 /// (`scripts/generate_wide_pool.py`), next to this repository.
-const DEFAULT_POOL_RELATIVE_TO_HOME: &str = "azumi-lab/RD-Gen/test/awkernel_wide_pool";
+/// The first that exists is the default (relative to `$HOME`).
+const DEFAULT_POOL_CANDIDATES: [&str; 2] = [
+    "ws/RD-Gen/test/awkernel_wide_pool",
+    "azumi-lab/RD-Gen/test/awkernel_wide_pool",
+];
 
 fn parse_positive<T: std::str::FromStr + PartialOrd + Default>(
     name: &str,
@@ -251,6 +314,7 @@ impl Params {
             None => rand::random::<u64>(),
         };
         Ok(Self {
+            config: EvalConfig::Custom,
             pool_dir: p.clone(),
             real_cores: parse_positive("real_cores", c)?,
             dags_per_set: parse_positive("dags_per_set", d)?,
@@ -267,9 +331,25 @@ impl Params {
     /// Ask for every value on stderr/stdin (stdout stays the CSV), with the
     /// default in brackets taken on an empty answer.
     fn ask() -> Result<Self, String> {
-        let default_pool = env::var("HOME")
-            .map(|home| format!("{home}/{DEFAULT_POOL_RELATIVE_TO_HOME}"))
-            .unwrap_or_default();
+        eprintln!("evaluation configuration (i7-14650HX):");
+        eprintln!("  s0 = S0 HT on,  P+E cores (24 CPUs, m = 22)");
+        eprintln!("  s1 = S1 HT off, P+E cores (16 CPUs, m = 14)");
+        eprintln!(
+            "  s2 = S2 HT off, P-cores only (8 CPUs, m = 7; not implemented in the kernel yet)"
+        );
+        eprintln!("  c  = custom");
+        let config = ask_until("configuration [s0/s1/s2/c]", Some("s0"), EvalConfig::parse)?;
+        if config == EvalConfig::S2POnly {
+            eprintln!(
+                "  note: the kernel cannot boot P-cores only yet; real_machine_trial.py refuses S2 manifests"
+            );
+        }
+        let home = env::var("HOME").unwrap_or_default();
+        let default_pool = DEFAULT_POOL_CANDIDATES
+            .iter()
+            .map(|rel| format!("{home}/{rel}"))
+            .find(|p| Path::new(p).is_dir())
+            .unwrap_or_else(|| format!("{home}/{}", DEFAULT_POOL_CANDIDATES[0]));
         let pool_dir = ask_until("DAG pool directory", Some(&default_pool), |v| {
             let v = expand_tilde(v);
             if Path::new(&v).is_dir() {
@@ -278,10 +358,11 @@ impl Params {
                 Err(format!("'{v}' is not a directory"))
             }
         })?;
-        let real_cores: u16 =
-            ask_until("real cores m (the DAG-pool core count)", Some("14"), |v| {
-                parse_positive("m", v)
-            })?;
+        let real_cores: u16 = ask_until(
+            "real cores m (the DAG-pool core count)",
+            Some(config.default_m()),
+            |v| parse_positive("m", v),
+        )?;
         let dags_per_set: usize =
             ask_until("DAGs per set N", Some("8"), |v| parse_positive("N", v))?;
         let trials_per_bin: usize = ask_until("trials per u_norm", Some("500"), |v| {
@@ -308,7 +389,11 @@ impl Params {
                 .map_err(|_| format!("seed must be a u64, got '{v}'"))
         })?;
         let default_manifest = trials_root()
-            .join(format!("{}_m{real_cores}_n{dags_per_set}", timestamp()))
+            .join(format!(
+                "{}_{}_m{real_cores}_n{dags_per_set}",
+                timestamp(),
+                config.tag()
+            ))
             .join("manifest.jsonl")
             .display()
             .to_string();
@@ -333,6 +418,7 @@ impl Params {
             true
         };
         Ok(Self {
+            config,
             pool_dir,
             real_cores,
             dags_per_set,
@@ -492,13 +578,14 @@ fn main() -> ExitCode {
         }
     }
 
-    if let Some(parent) = Path::new(manifest_jsonl_path).parent() {
-        if !parent.as_os_str().is_empty() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                eprintln!("cannot create '{}': {e}", parent.display());
-                return ExitCode::FAILURE;
-            }
-        }
+    let manifest_parent = Path::new(manifest_jsonl_path)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    if let Some((parent, Err(e))) =
+        manifest_parent.map(|parent| (parent, fs::create_dir_all(parent)))
+    {
+        eprintln!("cannot create '{}': {e}", parent.display());
+        return ExitCode::FAILURE;
     }
     let mut manifest = match fs::OpenOptions::new()
         .create(true)
@@ -520,11 +607,16 @@ fn main() -> ExitCode {
         "{{\"pool_dir\":\"{}\",\"real_cores\":{real_cores},\"dags_per_set\":{dags_per_set},\
          \"trials_per_bin\":{trials_per_bin},\"u_norm_min\":{u_norm_min},\"u_norm_max\":{u_norm_max},\
          \"u_norm_step\":{u_norm_step},\"seed\":{seed},\"window_fraction_of_step\":{WINDOW_FRACTION_OF_STEP},\
-         \"pool_dags\":{},\"skipped_u_norm\":{:?},\"command\":\"{}\"}}\n",
+         \"pool_dags\":{},\"skipped_u_norm\":{:?},\"command\":\"{}\",\"config\":\"{}\",\"smt_disable\":{}}}\n",
         dags_dir.display(),
         pool.len(),
         short_bins,
         params.command_line(),
+        params.config.tag(),
+        params
+            .config
+            .smt_disable()
+            .map_or_else(|| "null".to_string(), |b| b.to_string()),
     );
     if let Err(e) = fs::write(&params_path, params_json) {
         eprintln!("cannot write '{params_path}': {e}");
@@ -538,7 +630,8 @@ fn main() -> ExitCode {
 
     // The CSV goes to stdout and, so it is kept with the manifest, to a file.
     let ratio_path = format!("{manifest_jsonl_path}.ratio.csv");
-    let mut ratio_csv = String::from("u_norm,federated_ratio,vfed_ratio,dag_fluid_ratio,sfs_ratio\n");
+    let mut ratio_csv =
+        String::from("u_norm,federated_ratio,vfed_ratio,dag_fluid_ratio,sfs_ratio\n");
     print!("{ratio_csv}");
     for &u_norm in &u_norms {
         let (lo, hi) = window_of(u_norm, per_dag_scale, delta);

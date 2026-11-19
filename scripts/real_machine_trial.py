@@ -758,6 +758,8 @@ def parse_args():
     args = p.parse_args()
     args.smt_disable = not args.no_smt_disable
     args.fix_freq = not args.no_fix_freq
+    if args.trials_jsonl is not None:
+        apply_manifest_config(p, args)
     if args.log_dir is None:
         if args.trials_jsonl is not None:
             args.log_dir = args.trials_jsonl.expanduser().resolve().parent / "real_machine"
@@ -776,6 +778,29 @@ def parse_args():
             and FLUID_TABLE_ALGORITHMS.intersection(args.algorithms)):
         p.error("--algorithms dagfluid/dagfluid_node without --trials-jsonl needs --fluid-pool-cpus")
     return args
+
+
+def apply_manifest_config(parser, args):
+    """Match the build to the evaluation configuration theory_vs_reality.rs
+    recorded in `<manifest>.params.json` (`config`, `smt_disable`): S0 (HT on)
+    builds without smt_disable, S1 with it, and S2 (P-cores only) is refused
+    because the kernel cannot boot P-cores only yet. Manifests without the
+    record (older ones, or command-line runs) keep the flags as given."""
+    params_path = Path(str(args.trials_jsonl.expanduser()) + ".params.json")
+    if not params_path.exists():
+        return
+    params = load_json(params_path, {})
+    config = params.get("config")
+    if config == "S2-Ponly":
+        parser.error(f"{params_path}: configuration S2 (P-cores only) is not implemented in the kernel yet")
+    want = params.get("smt_disable")
+    if want is None:
+        return
+    if args.no_smt_disable and want:
+        parser.error(f"{params_path}: configuration {config} needs smt_disable, but --no-smt-disable was given")
+    args.smt_disable = bool(want)
+    print(f"[config] {config} (from {params_path.name}): smt_disable={args.smt_disable}, "
+          f"real_cores={params.get('real_cores')}")
 
 
 def check_pxe_server():
