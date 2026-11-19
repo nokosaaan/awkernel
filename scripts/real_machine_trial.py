@@ -4,11 +4,18 @@
   wait for target reachable over SSH
   -> pick DAG(s) to stage and stage them (see "Two selection modes" below)
   -> build awkernel with them embedded (RD_GEN_DAGS_DIR)
-  -> start minicom logging to log/trace_<n>.log
+  -> start minicom logging to <log-dir>/trace_<n>_<algorithm>.log
   -> set the target's next boot to PXE (bcdedit or efibootmgr, see
      --target-os) and reboot it
   -> wait for the trace to finish (marker in the log, or a timeout)
-  -> stop minicom, record the trial in log/dag_selection.json
+  -> stop minicom, record the trial in <log-dir>/dag_selection.json
+
+Results stay out of the awkernel tree. --log-dir defaults to
+<manifest dir>/real_machine/ with --trials-jsonl (next to the manifest,
+params and ratio CSV theory_vs_reality writes), else to
+<results root>/<YYYYmmdd-HHMMSS>_pool/, where the results root is
+$AWKERNEL_TRIALS_DIR or ~/ws/awkernel_script/rd_gen_trials. The cached
+PXE boot entry lives in ~/.cache/awkernel/ so every run reuses it.
 
 Run repeatedly with --trials N to fire off N trials unattended.
 
@@ -43,6 +50,10 @@ from pathlib import Path
 DEFAULT_AWKERNEL_DIR = Path("/home/nokosan/ws/awkernel")
 DEFAULT_POOL_DIR = Path("/home/nokosan/ws/RD-Gen/test/awkernel_theory_vs_reality_pool_fanout16/DAGs")
 DEFAULT_STAGING_DIR = Path("/home/nokosan/ws/RD-Gen/test/awkernel_staged")
+# Root of per-run result directories (also theory_vs_reality.rs's default).
+DEFAULT_TRIALS_ROOT = Path.home() / "ws" / "awkernel_script" / "rd_gen_trials"
+# The PXE boot entry does not depend on the run, so it is cached outside it.
+BOOT_CACHE_PATH = Path.home() / ".cache" / "awkernel" / "real_machine_boot_entry.json"
 
 # rd_gen_to_dags's admission policy (see build_dag.rs) is picked at kernel
 # build time via cargo feature, not at runtime -- None means Federated, the
@@ -707,7 +718,10 @@ def parse_args():
     p.add_argument("--serial-device", default="/dev/ttyUSB0")
     p.add_argument("--baud", type=int, default=115200)
     p.add_argument("--sudo-minicom", action="store_true", help="run minicom under sudo (default: off; relies on dialout group membership)")
-    p.add_argument("--log-dir", type=Path, default=None, help="default: <awkernel-dir>/log")
+    p.add_argument("--log-dir", type=Path, default=None,
+                   help="where trace logs and dag_selection.json go (default: <manifest dir>/real_machine "
+                        "with --trials-jsonl, else <results root>/<timestamp>_pool; results root = "
+                        "$AWKERNEL_TRIALS_DIR or ~/ws/awkernel_script/rd_gen_trials)")
     p.add_argument("--log-prefix", default="trace_")
     p.add_argument("--marker", default="TRACE_END", help="string that marks trace completion in the growing log")
     p.add_argument("--max-wait-secs", type=int, default=50000,
@@ -745,7 +759,11 @@ def parse_args():
     args.smt_disable = not args.no_smt_disable
     args.fix_freq = not args.no_fix_freq
     if args.log_dir is None:
-        args.log_dir = args.awkernel_dir / "log"
+        if args.trials_jsonl is not None:
+            args.log_dir = args.trials_jsonl.expanduser().resolve().parent / "real_machine"
+        else:
+            root = Path(os.environ.get("AWKERNEL_TRIALS_DIR") or DEFAULT_TRIALS_ROOT)
+            args.log_dir = root / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}_pool"
     args.algorithms = [a.strip() for a in args.algorithms.split(",") if a.strip()]
     unknown = [a for a in args.algorithms if a not in ALGO_FEATURES]
     if unknown:
@@ -785,7 +803,12 @@ def main():
     if not args.dry_run:
         check_pxe_server()
     state_path = args.log_dir / "dag_selection.json"
-    boot_cache_path = args.log_dir / "real_machine_boot_entry.json"
+    print(f"[log] trace logs and dag_selection.json go to {args.log_dir}")
+    boot_cache_path = BOOT_CACHE_PATH
+    legacy_boot_cache = args.awkernel_dir / "log" / "real_machine_boot_entry.json"
+    if not boot_cache_path.exists() and legacy_boot_cache.exists() and not args.dry_run:
+        # Carry over the entry cached by older versions under <awkernel-dir>/log.
+        save_json(boot_cache_path, load_json(legacy_boot_cache, {}))
     state = load_json(state_path, [])
     trials_jsonl = (
         load_trials_jsonl(args.trials_jsonl, args.include_rejected, args.algorithms)

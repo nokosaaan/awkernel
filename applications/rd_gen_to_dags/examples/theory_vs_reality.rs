@@ -89,8 +89,16 @@
 //! and how many pool DAGs fall in it (a window with fewer than
 //! `dags_per_set` is skipped), and writes the run's values, the seed and the
 //! equivalent command line to `<manifest_jsonl_path>.params.json`. It prints
-//! `u_norm,federated_ratio,vfed_ratio,dag_fluid_ratio` CSV to stdout (one
-//! row per `u_norm` bin with enough DAGs in its window, ascending `u_norm`).
+//! `u_norm,federated_ratio,vfed_ratio,dag_fluid_ratio,sfs_ratio` CSV to stdout
+//! (one row per `u_norm` bin with enough DAGs in its window, ascending
+//! `u_norm`) and writes the same CSV to `<manifest_jsonl_path>.ratio.csv`.
+//!
+//! Results stay out of the awkernel tree: the interactive default manifest is
+//! `<results root>/<YYYYmmdd-HHMMSS>_m<m>_n<N>/manifest.jsonl`, where the
+//! results root is `$AWKERNEL_TRIALS_DIR` or
+//! `~/ws/awkernel_script/rd_gen_trials`. Missing parent directories of the
+//! manifest are created, and a leading `~/` in an interactive answer is
+//! expanded to `$HOME`.
 
 use std::{
     env, fs,
@@ -150,6 +158,47 @@ struct Params {
 const USAGE: &str = "usage: theory_vs_reality <pool_dir> <real_cores> <dags_per_set> <trials_per_bin> \
                      <manifest_jsonl_path> [<u_norm_min> <u_norm_max> <u_norm_step> [<seed>]]\n       \
                      theory_vs_reality            (no arguments: asks for each value)";
+
+/// Results root when `$AWKERNEL_TRIALS_DIR` is unset, relative to `$HOME`:
+/// next to the trial logs `scripts/real_machine_trial.py` writes for the same
+/// manifest, in the awkernel_script repository.
+const DEFAULT_TRIALS_DIR_RELATIVE_TO_HOME: &str = "ws/awkernel_script/rd_gen_trials";
+
+/// `$AWKERNEL_TRIALS_DIR`, else `~/ws/awkernel_script/rd_gen_trials`.
+fn trials_root() -> PathBuf {
+    match env::var_os("AWKERNEL_TRIALS_DIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => PathBuf::from(env::var("HOME").unwrap_or_default()).join(DEFAULT_TRIALS_DIR_RELATIVE_TO_HOME),
+    }
+}
+
+/// Local time as `YYYYmmdd-HHMMSS` (from `date`, which knows the time zone),
+/// or the Unix time in seconds if `date` is unavailable.
+fn timestamp() -> String {
+    std::process::Command::new("date")
+        .arg("+%Y%m%d-%H%M%S")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs().to_string())
+                .unwrap_or_default()
+        })
+}
+
+/// A leading `~` or `~/` replaced by `$HOME` (the shell does this for command
+/// line arguments, but not for answers typed at a prompt).
+fn expand_tilde(v: &str) -> String {
+    match (v.strip_prefix('~'), env::var("HOME")) {
+        (Some(rest), Ok(home)) if rest.is_empty() || rest.starts_with('/') => format!("{home}{rest}"),
+        _ => v.to_string(),
+    }
+}
 
 /// Default pool for the interactive mode: RD-Gen's wide pool
 /// (`scripts/generate_wide_pool.py`), next to this repository.
@@ -222,8 +271,9 @@ impl Params {
             .map(|home| format!("{home}/{DEFAULT_POOL_RELATIVE_TO_HOME}"))
             .unwrap_or_default();
         let pool_dir = ask_until("DAG pool directory", Some(&default_pool), |v| {
-            if Path::new(v).is_dir() {
-                Ok(v.to_string())
+            let v = expand_tilde(v);
+            if Path::new(&v).is_dir() {
+                Ok(v)
             } else {
                 Err(format!("'{v}' is not a directory"))
             }
@@ -257,9 +307,13 @@ impl Params {
             v.parse::<u64>()
                 .map_err(|_| format!("seed must be a u64, got '{v}'"))
         })?;
-        let default_manifest = format!("theory_vs_reality_m{real_cores}_n{dags_per_set}.jsonl");
+        let default_manifest = trials_root()
+            .join(format!("{}_m{real_cores}_n{dags_per_set}", timestamp()))
+            .join("manifest.jsonl")
+            .display()
+            .to_string();
         let manifest_path = ask_until("manifest JSONL path", Some(&default_manifest), |v| {
-            Ok(v.to_string())
+            Ok(expand_tilde(v))
         })?;
         let append = if Path::new(&manifest_path).exists() {
             let answer = ask_until(
@@ -438,6 +492,14 @@ fn main() -> ExitCode {
         }
     }
 
+    if let Some(parent) = Path::new(manifest_jsonl_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                eprintln!("cannot create '{}': {e}", parent.display());
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     let mut manifest = match fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -468,12 +530,16 @@ fn main() -> ExitCode {
         eprintln!("cannot write '{params_path}': {e}");
     }
     eprintln!("seed {seed}; repeat with: {}", params.command_line());
+    eprintln!("manifest: {manifest_jsonl_path}");
 
     let mut rng = StdRng::seed_from_u64(seed);
     let per_dag_scale = real_cores as f64 / dags_per_set as f64;
     let delta = WINDOW_FRACTION_OF_STEP * u_norm_step * per_dag_scale;
 
-    println!("u_norm,federated_ratio,vfed_ratio,dag_fluid_ratio,sfs_ratio");
+    // The CSV goes to stdout and, so it is kept with the manifest, to a file.
+    let ratio_path = format!("{manifest_jsonl_path}.ratio.csv");
+    let mut ratio_csv = String::from("u_norm,federated_ratio,vfed_ratio,dag_fluid_ratio,sfs_ratio\n");
+    print!("{ratio_csv}");
     for &u_norm in &u_norms {
         let (lo, hi) = window_of(u_norm, per_dag_scale, delta);
         let window: Vec<&PoolEntry> = pool
@@ -567,14 +633,21 @@ fn main() -> ExitCode {
             );
         }
 
-        println!(
-            "{u_norm:.4},{:.2},{:.2},{:.2},{:.2}",
+        let row = format!(
+            "{u_norm:.4},{:.2},{:.2},{:.2},{:.2}\n",
             100.0 * fed_accepted as f64 / trials_per_bin as f64,
             100.0 * vfed_accepted as f64 / trials_per_bin as f64,
             100.0 * dag_fluid_accepted as f64 / trials_per_bin as f64,
             100.0 * sfs_accepted as f64 / trials_per_bin as f64,
         );
+        print!("{row}");
+        ratio_csv.push_str(&row);
     }
+
+    if let Err(e) = fs::write(&ratio_path, ratio_csv) {
+        eprintln!("cannot write '{ratio_path}': {e}");
+    }
+    eprintln!("wrote {manifest_jsonl_path}, {params_path}, {ratio_path}");
 
     ExitCode::SUCCESS
 }
