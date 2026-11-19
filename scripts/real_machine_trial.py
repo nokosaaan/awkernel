@@ -552,13 +552,34 @@ def stop_minicom(handle):
     handle.drain_thread.join(timeout=2)
 
 
-def wait_for_marker_or_timeout(log_path, marker, max_wait_secs, poll_interval=2):
-    deadline = time.monotonic() + max_wait_secs
+class TrialStalled(Exception):
+    """The target printed something, then nothing for --stall-secs: Awkernel
+    hung (it does not reboot on its own then), so later trials cannot run
+    until the target is power-cycled by hand."""
+
+
+def wait_for_marker_or_timeout(log_path, marker, max_wait_secs, stall_secs=0, poll_interval=2):
+    """Wait for `marker` in the growing log. Returns "marker", "stalled" (the
+    log grew at least once, then stopped growing for `stall_secs`; 0
+    disables this) or "timeout" (`max_wait_secs` overall). The stall clock
+    only starts at the first output, since the target's own reboot into PXE
+    prints nothing on the serial port for a while."""
+    start = time.monotonic()
+    deadline = start + max_wait_secs
+    last_size = 0
+    last_growth = None
     while time.monotonic() < deadline:
-        if log_path.exists() and marker in log_path.read_text(errors="ignore"):
-            return True
+        if log_path.exists():
+            size = log_path.stat().st_size
+            if size != last_size:
+                last_size = size
+                last_growth = time.monotonic()
+                if marker in log_path.read_text(errors="ignore"):
+                    return "marker"
+            elif stall_secs > 0 and last_growth is not None and time.monotonic() - last_growth >= stall_secs:
+                return "stalled"
         time.sleep(poll_interval)
-    return False
+    return "timeout"
 
 
 def next_trial_id(state):
@@ -598,6 +619,7 @@ def run_trial_for_algorithm(args, state, boot_cache_path, batch_id, algorithm, s
     if args.dry_run:
         boot_entry = "DRY-RUN"
         marker_found = False
+        outcome = "dry-run"
     else:
         # The previous reboot (this batch's earlier algorithm, or the
         # previous batch's last one) needs time to actually come back up
@@ -608,7 +630,8 @@ def run_trial_for_algorithm(args, state, boot_cache_path, batch_id, algorithm, s
             args.host, args.user, boot_cache_path, args.rediscover_boot_entry, args.target_os, args.target_mac,
         )
         trigger_reboot_to_pxe(args.host, args.user, args.target_os, boot_entry)
-        marker_found = wait_for_marker_or_timeout(log_path, args.marker, args.max_wait_secs)
+        outcome = wait_for_marker_or_timeout(log_path, args.marker, args.max_wait_secs, args.stall_secs)
+        marker_found = outcome == "marker"
         stop_minicom(minicom_handle)
 
     record = {
@@ -627,17 +650,36 @@ def run_trial_for_algorithm(args, state, boot_cache_path, batch_id, algorithm, s
         "log_file": str(log_path),
         "boot_entry": boot_entry,
         "marker_found": marker_found,
+        "outcome": outcome,
         "timestamp": now_iso(),
     }
     state.append(record)
-    save_json(args.log_dir / "dag_selection.json", state)
+    # A dry run only prints the plan: persisting it would number the next
+    # real trials after phantom ones (marker_found false, boot_entry DRY-RUN).
+    if not args.dry_run:
+        save_json(args.log_dir / "dag_selection.json", state)
     if args.dry_run:
         status = "dry-run, no reboot/wait performed"
     elif marker_found:
         status = "marker found"
+    elif outcome == "stalled":
+        status = f"stalled: no serial output for {args.stall_secs}s"
     else:
         status = f"timed out after {args.max_wait_secs}s"
     print(f"[trial {batch_id}] done ({status}) -> {log_path}")
+    if outcome == "stalled":
+        raise TrialStalled(
+            f"trial {trial_id} ({algorithm}) stalled: the log stopped growing for {args.stall_secs}s "
+            f"without {args.marker!r}; last line: {last_log_line(log_path)!r}"
+        )
+
+
+def last_log_line(log_path):
+    try:
+        lines = [l.strip() for l in log_path.read_text(errors="ignore").splitlines() if l.strip()]
+    except OSError:
+        return ""
+    return lines[-1][-200:] if lines else ""
 
 
 def run_trial(args, state, boot_cache_path, trials_jsonl):
@@ -724,6 +766,11 @@ def parse_args():
                         "$AWKERNEL_TRIALS_DIR or ~/ws/awkernel_script/rd_gen_trials)")
     p.add_argument("--log-prefix", default="trace_")
     p.add_argument("--marker", default="TRACE_END", help="string that marks trace completion in the growing log")
+    p.add_argument("--stall-secs", type=int, default=120,
+                   help="give up on a trial once the target has printed something and then nothing "
+                        "for this many seconds (Awkernel hung), record it as outcome=stalled and stop "
+                        "the run, since the hung target has to be power-cycled by hand; 0 disables "
+                        "(default: 120)")
     p.add_argument("--max-wait-secs", type=int, default=50000,
                     help="hard cap per trial while waiting for the marker -- keep above "
                          "kernel/src/config.rs's AUTO_REBOOT_SECS (currently 50000s) plus some "
@@ -844,6 +891,14 @@ def main():
     for i in range(args.trials):
         try:
             run_trial(args, state, boot_cache_path, trials_jsonl)
+        except TrialStalled as e:
+            print(f"[stalled] {e}", file=sys.stderr)
+            print("[stalled] the target is hung inside Awkernel and will not come back by itself:\n"
+                  "          power it off and on by hand (it boots the normal OS; the one-shot PXE\n"
+                  "          entry is used up), then rerun the same command to continue with the\n"
+                  "          next trial. The stalled trial is recorded in dag_selection.json.",
+                  file=sys.stderr)
+            sys.exit(3)
         except Exception as e:  # noqa: BLE001 -- surface any failure and stop the loop rather than burn through trials blind
             # str(CalledProcessError) is just "Command '[...]' returned
             # non-zero exit status N" -- the actual reason (e.g. sudo's own

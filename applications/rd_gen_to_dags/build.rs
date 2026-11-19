@@ -85,9 +85,10 @@ fn generate_fluid_table(contents: &[String], out_dir: &Path) {
                         .map(Vec::len)
                         .sum();
                     println!(
-                        "cargo:warning=DAG-Fluid offline table: DAG files {admitted:?} on {pool_cpus} CPUs, hyperperiod {} ns, {} spans, {entries} entries{}",
+                        "cargo:warning=DAG-Fluid offline table: DAG files {admitted:?} on {pool_cpus} CPUs, hyperperiod {} ns, {} spans (shortest {} us), {entries} entries{}",
                         table.hyperperiod_ns,
                         table.spans.len(),
+                        table.min_span_ns() / 1000,
                         if per_node { " (per node)" } else { "" }
                     );
                     let mut code = table.to_rust(module, "FLUID_TABLE");

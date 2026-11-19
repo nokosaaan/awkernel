@@ -1863,8 +1863,8 @@ mod tests {
     #[test]
     fn job_release_matches_the_release_of_the_deadline() {
         let dag = create_dag();
-        let source = dag.add_node_with_topic_edges(&[], &["release_test_topic".into()]);
-        let sink = dag.add_node_with_topic_edges(&["release_test_topic".into()], &[]);
+        let source = dag.add_node_with_topic_edges(&[], &["release_test_topic".into()], None);
+        let sink = dag.add_node_with_topic_edges(&["release_test_topic".into()], &[], None);
         // A release reads the source's next interval tick target and the sink's deadline.
         dag.set_next_release_time(Instant::zero());
         dag.set_relative_deadline(sink, Duration::from_micros(10))

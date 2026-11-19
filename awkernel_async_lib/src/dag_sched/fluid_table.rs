@@ -26,12 +26,16 @@
 //! zero-length slot owns no CPU time), and consecutive entries for the same
 //! owner are folded.
 //!
-//! The hyperperiod is cut into spans at window boundaries (releases of any
-//! DAG) so that no CPU has more than
+//! The hyperperiod is cut into spans so that no CPU has more than
 //! [`switch_table::SWITCH_TABLE_CAPACITY`] entries in a span; each span is
-//! published as one plane. Every CPU's list in a span starts at the span's
-//! start, since `plan_window` writes an entry for every CPU at every DP
-//! boundary.
+//! published as one plane. Spans normally start at window boundaries
+//! (releases of any DAG), where `plan_window` writes an entry for every CPU.
+//! A window that needs more entries on some CPU than a plane holds is itself
+//! cut into several spans at switch points inside it: a CPU without a switch
+//! at such a cut gets a copy of its current slot there (same owner, so the
+//! switch changes nothing), so every CPU's list in a span still starts at the
+//! span's start. The planner already publishes one span ahead, whatever the
+//! span's length, so the runtime needs no change; only the spans get shorter.
 
 use super::{
     job_table::SegmentTemplate,
@@ -111,13 +115,6 @@ pub enum TableError {
     HyperperiodOverflow,
     /// A CPU needs more than [`MAX_ENTRIES_PER_CPU`] entries.
     TooManyEntries {
-        cpu: usize,
-        entries: usize,
-    },
-    /// A single window between two releases already needs more entries on
-    /// one CPU than a plane holds.
-    WindowTooLarge {
-        at_ns: u64,
         cpu: usize,
         entries: usize,
     },
@@ -254,6 +251,9 @@ pub fn build(dags: &[OfflineDag], cpus: usize, per_node: bool) -> Result<BuiltTa
         })
     };
 
+    let same_owner =
+        |a: &TableEntry, b: &TableEntry| a.dag == b.dag && a.node == b.node && a.job == b.job;
+
     let mut spans: Vec<BuiltSpan> = Vec::new();
     let mut current: Option<BuiltSpan> = None;
     for window in cuts.windows(2) {
@@ -265,7 +265,7 @@ pub fn build(dags: &[OfflineDag], cpus: usize, per_node: bool) -> Result<BuiltTa
         }
         let planned = plan_window_with(&plan_dags, ws, we, cpus, per_node);
         let mut lists: Vec<Vec<TableEntry>> = Vec::with_capacity(cpus);
-        for (cpu, plan) in planned.iter().enumerate() {
+        for plan in planned.iter() {
             let mut list: Vec<TableEntry> = Vec::with_capacity(plan.len());
             for e in plan {
                 let entry = to_entry(e)?;
@@ -275,51 +275,46 @@ pub fn build(dags: &[OfflineDag], cpus: usize, per_node: bool) -> Result<BuiltTa
                     _ => list.push(entry),
                 }
             }
-            if list.len() > SWITCH_TABLE_CAPACITY {
-                return Err(TableError::WindowTooLarge {
-                    at_ns: since(ws, start)?,
-                    cpu,
-                    entries: list.len(),
-                });
-            }
+            // Fold here already, so only the switches that change the owner
+            // count against a plane (the first entry stays: it starts the
+            // window).
+            list.dedup_by(|later, earlier| same_owner(earlier, later));
             lists.push(list);
         }
 
-        let fits = current.as_ref().is_some_and(|span| {
-            span.cpus
-                .iter()
-                .zip(lists.iter())
-                .all(|(have, add)| have.len() + add.len() <= SWITCH_TABLE_CAPACITY)
-        });
-        if fits {
-            if let Some(span) = current.as_mut() {
-                for (have, add) in span.cpus.iter_mut().zip(lists) {
-                    for entry in add {
-                        match have.last_mut() {
-                            Some(last) if last.at_ns == entry.at_ns => *last = entry,
-                            _ => have.push(entry),
+        for piece in split_to_capacity(since(ws, start)?, lists, SWITCH_TABLE_CAPACITY) {
+            let fits = current.as_ref().is_some_and(|span| {
+                span.cpus
+                    .iter()
+                    .zip(piece.cpus.iter())
+                    .all(|(have, add)| have.len() + add.len() <= SWITCH_TABLE_CAPACITY)
+            });
+            if fits {
+                if let Some(span) = current.as_mut() {
+                    for (have, add) in span.cpus.iter_mut().zip(piece.cpus) {
+                        for entry in add {
+                            match have.last_mut() {
+                                Some(last) if last.at_ns == entry.at_ns => *last = entry,
+                                _ => have.push(entry),
+                            }
                         }
                     }
                 }
+            } else {
+                if let Some(span) = current.take() {
+                    spans.push(span);
+                }
+                current = Some(piece);
             }
-        } else {
-            if let Some(span) = current.take() {
-                spans.push(span);
-            }
-            current = Some(BuiltSpan {
-                start_ns: since(ws, start)?,
-                cpus: lists,
-            });
         }
     }
     if let Some(span) = current.take() {
         spans.push(span);
     }
 
-    // Fold consecutive entries for the same owner (the first entry of each
-    // span stays: a CPU moves to a span's plane at the span's start).
-    let same_owner =
-        |a: &TableEntry, b: &TableEntry| a.dag == b.dag && a.node == b.node && a.job == b.job;
+    // Fold consecutive entries for the same owner across joined windows (the
+    // first entry of each span stays: a CPU moves to a span's plane at the
+    // span's start).
     for span in &mut spans {
         for list in &mut span.cpus {
             list.dedup_by(|later, earlier| same_owner(earlier, later));
@@ -346,7 +341,109 @@ pub fn build(dags: &[OfflineDag], cpus: usize, per_node: bool) -> Result<BuiltTa
     })
 }
 
+/// Cut one window, starting at `start_ns` with every CPU's (folded) list
+/// starting there, into pieces of at most `capacity` entries per CPU. A
+/// piece starts at a switch time of some CPU; every other CPU gets a copy of
+/// the slot it is in at that time, so each CPU's list in a piece starts at
+/// the piece's start. A window that fits is returned as one piece.
+///
+/// Each list must be strictly increasing in `at_ns` (as `build` makes it).
+fn split_to_capacity(
+    start_ns: u64,
+    lists: Vec<Vec<TableEntry>>,
+    capacity: usize,
+) -> Vec<BuiltSpan> {
+    if capacity < 2 || lists.iter().all(|list| list.len() <= capacity) {
+        return alloc::vec![BuiltSpan {
+            start_ns,
+            cpus: lists,
+        }];
+    }
+
+    // Every switch time in the window, in order.
+    let mut times: Vec<u64> = lists.iter().flatten().map(|e| e.at_ns).collect();
+    times.sort_unstable();
+    times.dedup();
+
+    let at_of = |cpu: usize, i: usize| lists.get(cpu).and_then(|l| l.get(i)).map(|e| e.at_ns);
+
+    let mut pieces = Vec::new();
+    // Per CPU: index of its first entry not yet placed in a piece.
+    let mut cursor: Vec<usize> = alloc::vec![0; lists.len()];
+    let mut t = 0;
+    while let Some(&piece_start) = times.get(t) {
+        // Every CPU starts the piece with one entry: its own at
+        // `piece_start`, or a copy of the slot it is in then.
+        let mut count: Vec<usize> = alloc::vec![1; lists.len()];
+        let mut scan = cursor.clone();
+        for (cpu, s) in scan.iter_mut().enumerate() {
+            if at_of(cpu, *s) == Some(piece_start) {
+                *s += 1;
+            }
+        }
+        let mut end = t + 1;
+        while let Some(&at) = times.get(end) {
+            let full = (0..lists.len())
+                .any(|cpu| at_of(cpu, scan[cpu]) == Some(at) && count[cpu] >= capacity);
+            if full {
+                break;
+            }
+            for cpu in 0..lists.len() {
+                if at_of(cpu, scan[cpu]) == Some(at) {
+                    count[cpu] += 1;
+                    scan[cpu] += 1;
+                }
+            }
+            end += 1;
+        }
+
+        let mut cpus_out = Vec::with_capacity(lists.len());
+        for (cpu, list) in lists.iter().enumerate() {
+            let from = cursor[cpu];
+            let to = scan[cpu];
+            let mut out = Vec::with_capacity(to - from + 1);
+            if at_of(cpu, from) != Some(piece_start) {
+                // The slot this CPU is in at `piece_start`: its last entry
+                // before it (every list starts at the window's start).
+                if let Some(prev) = from.checked_sub(1).and_then(|i| list.get(i)) {
+                    out.push(TableEntry {
+                        at_ns: piece_start,
+                        ..*prev
+                    });
+                }
+            }
+            out.extend(list.get(from..to).unwrap_or(&[]).iter().copied());
+            cpus_out.push(out);
+        }
+        pieces.push(BuiltSpan {
+            start_ns: piece_start,
+            cpus: cpus_out,
+        });
+        cursor = scan;
+        t = end;
+    }
+    pieces
+}
+
 impl BuiltTable {
+    /// The shortest span, in nanoseconds (the last one runs to the end of
+    /// the hyperperiod). The planner publishes one span ahead, so it has to
+    /// wake and publish within this time.
+    pub fn min_span_ns(&self) -> u64 {
+        let ends = self
+            .spans
+            .iter()
+            .skip(1)
+            .map(|span| span.start_ns)
+            .chain(core::iter::once(self.hyperperiod_ns));
+        self.spans
+            .iter()
+            .zip(ends)
+            .map(|(span, end)| end.saturating_sub(span.start_ns))
+            .min()
+            .unwrap_or(0)
+    }
+
     /// Rust source declaring this table as `pub(crate) static {name}:
     /// FluidTable`, with `module` the path of this module as seen from the
     /// generated code (e.g. `awkernel_async_lib::dag_sched::fluid_table`).
@@ -615,6 +712,96 @@ mod tests {
             T.switch_entry(&E[1], base, 0, &[7]).node.map(|n| n.job),
             Some(0)
         );
+    }
+
+    fn e(at_ns: u64, dag: u16) -> TableEntry {
+        TableEntry {
+            at_ns,
+            dag,
+            node: NO_NODE,
+            job: 0,
+        }
+    }
+
+    /// The owner of `list` at time `at` (its last entry at or before `at`).
+    fn owner_at(list: &[TableEntry], at: u64) -> Option<u16> {
+        list.iter()
+            .take_while(|x| x.at_ns <= at)
+            .last()
+            .map(|x| x.dag)
+    }
+
+    #[test]
+    fn a_window_over_capacity_is_split_without_changing_any_owner() {
+        // CPU 0 switches at every ms, CPU 1 only twice: with capacity 3,
+        // CPU 0 forces cuts and CPU 1 gets copies of its slot there.
+        let cpu0: Vec<TableEntry> = (0..10).map(|i| e(i * 1000, (i % 2) as u16)).collect();
+        let cpu1 = alloc::vec![e(0, 5), e(4500, 6)];
+        let lists = alloc::vec![cpu0.clone(), cpu1.clone()];
+        let pieces = split_to_capacity(0, lists, 3);
+        assert!(pieces.len() >= 4, "{pieces:?}");
+        for piece in &pieces {
+            for list in &piece.cpus {
+                assert!(list.len() <= 3, "{piece:?}");
+                assert_eq!(list.first().map(|x| x.at_ns), Some(piece.start_ns));
+                for pair in list.windows(2) {
+                    assert!(pair[0].at_ns < pair[1].at_ns, "{pair:?}");
+                }
+            }
+        }
+        for pair in pieces.windows(2) {
+            assert!(pair[0].start_ns < pair[1].start_ns);
+        }
+        // Concatenated, every CPU owns the same DAG at every time as before.
+        for (cpu, original) in [cpu0, cpu1].iter().enumerate() {
+            let joined: Vec<TableEntry> = pieces
+                .iter()
+                .flat_map(|p| p.cpus[cpu].iter().copied())
+                .collect();
+            for at in (0..10_000).step_by(250) {
+                assert_eq!(
+                    owner_at(&joined, at),
+                    owner_at(original, at),
+                    "cpu {cpu} at {at}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_window_within_capacity_stays_one_piece() {
+        let lists = alloc::vec![alloc::vec![e(7, 1), e(9, 2)], alloc::vec![e(7, 3)]];
+        let pieces = split_to_capacity(7, lists.clone(), 3);
+        assert_eq!(
+            pieces,
+            alloc::vec![BuiltSpan {
+                start_ns: 7,
+                cpus: lists
+            }]
+        );
+    }
+
+    #[test]
+    fn a_dense_task_set_builds_instead_of_failing() {
+        // Many DAGs with many segments on few CPUs: far more than one
+        // plane's worth of switches per window on some CPU.
+        let dags: Vec<OfflineDag> = (0..12)
+            .map(|i| OfflineDag {
+                period: ms(100),
+                virtual_deadline: ms(100),
+                segments: (0..20)
+                    .map(|j| seg(j * 5, 5, 0.1 + 0.01 * f64::from(i as u32), &[j as u32]))
+                    .collect(),
+            })
+            .collect();
+        let t = build(&dags, 2, true).unwrap();
+        assert!(t.spans.len() > 1);
+        for span in &t.spans {
+            for list in &span.cpus {
+                assert!(list.len() <= SWITCH_TABLE_CAPACITY);
+                assert_eq!(list.first().map(|x| x.at_ns), Some(span.start_ns));
+            }
+        }
     }
 
     #[test]
