@@ -88,6 +88,24 @@ pub(crate) static NUM_CLUSTERED_TASKS_IN_QUEUE: AtomicU32 = AtomicU32::new(0);
 pub(crate) static NUM_CLUSTERED_TASKS_ALIVE: [AtomicU32; NUM_MAX_CPU] =
     array![_ => AtomicU32::new(0); NUM_MAX_CPU];
 
+/// The cores a clustered task falls back to when the cpu_set it was spawned
+/// with has no usable core: the DAG-pool cores (see `scheduler::pool`), never
+/// CPU 0 or the regular-pool core. Widening to every worker instead would let
+/// a reserving scheduler (ActiveVp/PassiveVp/MixedVp) reserve the
+/// regular-pool core, and then no regular-pool task (logger, shell, ...)
+/// could ever run again.
+fn fallback_workers() -> CpuSet {
+    let n = num_cpu();
+    let pool = (1..n)
+        .filter(|&cpu| crate::scheduler::pool::is_dag_pool_core(cpu))
+        .fold(CpuSet::empty(), |set, cpu| set.with(cpu));
+    if pool.is_empty() {
+        all_workers(n)
+    } else {
+        pool
+    }
+}
+
 /// True if `cpu` is currently dedicated to clustered tasks.
 /// See [`NUM_CLUSTERED_TASKS_ALIVE`].
 #[inline(always)]
@@ -422,13 +440,13 @@ impl Tasks {
                     let masked = masked_workers(set, num_cpu());
                     let normalized = if masked.is_empty() {
                         // `cpu::sanity_check()` guarantees num_cpu() >= 2 at boot,
-                        // so `all_workers(num_cpu())` below is always non-empty.
+                        // so `fallback_workers()` below is always non-empty.
                         log::warn!(
-                            "The CPU set must contain at least one core between 1 and {}. Falling back to all worker cores. Given set: {:?}",
+                            "The CPU set must contain at least one core between 1 and {}. Falling back to the DAG-pool cores. Given set: {:?}",
                             num_cpu() - 1,
                             set
                         );
-                        all_workers(num_cpu())
+                        fallback_workers()
                     } else {
                         masked
                     };
@@ -445,11 +463,11 @@ impl Tasks {
                     let masked = masked_workers(set, num_cpu());
                     let normalized = if masked.is_empty() {
                         log::warn!(
-                            "ActiveVp: CPU set must contain at least one core between 1 and {}. Falling back to all worker cores. Given set: {:?}",
+                            "ActiveVp: CPU set must contain at least one core between 1 and {}. Falling back to the DAG-pool cores. Given set: {:?}",
                             num_cpu() - 1,
                             set
                         );
-                        all_workers(num_cpu())
+                        fallback_workers()
                     } else {
                         masked
                     };
@@ -469,11 +487,11 @@ impl Tasks {
                     let masked = masked_workers(set, num_cpu());
                     let normalized = if masked.is_empty() {
                         log::warn!(
-                            "PassiveVp: CPU set must contain at least one core between 1 and {}. Falling back to all worker cores. Given set: {:?}",
+                            "PassiveVp: CPU set must contain at least one core between 1 and {}. Falling back to the DAG-pool cores. Given set: {:?}",
                             num_cpu() - 1,
                             set
                         );
-                        all_workers(num_cpu())
+                        fallback_workers()
                     } else {
                         masked
                     };
@@ -487,17 +505,33 @@ impl Tasks {
                     // (they must stay disjoint — a DAG never borrows its
                     // own cores — so they cannot share one fallback).
                     let masked_active = masked_workers(active_set, num_cpu());
-                    let normalized_active = if masked_active.is_empty() {
+                    let masked_passive = masked_workers(passive_set, num_cpu());
+                    // An empty active set with a non-empty passive one is a
+                    // valid assignment (V-Fed Theorem 4: a heavy DAG covered
+                    // entirely by other DAGs' passive-VPs, see
+                    // `VFedAssignment::into_scheduler_type`); keep it empty
+                    // rather than widening it to some fallback, which would
+                    // reserve cores the DAG was never given.
+                    let normalized_active = if masked_active.is_empty()
+                        && !masked_passive.is_empty()
+                    {
+                        CpuSet::empty()
+                    } else if masked_active.is_empty() {
                         log::warn!(
-                            "MixedVp: active CPU set must contain at least one core between 1 and {}. Falling back to all worker cores. Given set: {:?}",
+                            "MixedVp: active CPU set must contain at least one core between 1 and {}. Falling back to the DAG-pool cores. Given set: {:?}",
                             num_cpu() - 1,
                             active_set
                         );
-                        all_workers(num_cpu())
+                        fallback_workers()
                     } else {
                         masked_active
                     };
-                    let normalized_leading = if normalized_active.contains(leading_cpu) {
+                    let normalized_leading = if normalized_active.contains(leading_cpu)
+                        || normalized_active.is_empty()
+                    {
+                        // Nothing reads `leading` when the active set is
+                        // empty (`MixedVpScheduler` only consults it for
+                        // cores in the active set).
                         leading_cpu
                     } else {
                         log::warn!(
@@ -505,7 +539,6 @@ impl Tasks {
                         );
                         normalized_active.iter().next().unwrap_or(leading_cpu)
                     };
-                    let masked_passive = masked_workers(passive_set, num_cpu());
                     scheduler_type = SchedulerType::MixedVp(
                         normalized_active,
                         normalized_leading,
