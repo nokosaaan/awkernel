@@ -56,9 +56,11 @@ DEFAULT_TRIALS_ROOT = Path.home() / "ws" / "awkernel_script" / "rd_gen_trials"
 BOOT_CACHE_PATH = Path.home() / ".cache" / "awkernel" / "real_machine_boot_entry.json"
 
 # rd_gen_to_dags's admission policy (see build_dag.rs) is picked at kernel
-# build time via cargo feature, not at runtime -- None means Federated, the
-# default that needs no extra feature. Threaded into the build via the
-# Makefile's EXTRA_FEATURES (see run_build).
+# build time via cargo feature, not at runtime. Federated is rd_gen_to_dags
+# without a policy feature; it still needs `rd_gen_to_dags` itself, since
+# userland's default features are empty (without it no application is
+# built in at all). Threaded into the build via the Makefile's
+# EXTRA_FEATURES (see run_build).
 #
 # DAG-Fluid (DP-Wrap dispatch, scheduler::dp_wrap / dag_sched::planner) in
 # three variants:
@@ -72,7 +74,7 @@ BOOT_CACHE_PATH = Path.home() / ".cache" / "awkernel" / "real_machine_boot_entry
 # rd_gen_to_dags's build.rs plans at build time for the staged DAG set and
 # RD_GEN_FLUID_POOL_CPUS pool CPUs (see FLUID_TABLE_ALGORITHMS).
 ALGO_FEATURES = {
-    "federated": None,
+    "federated": "rd_gen_to_dags",
     "vfed": "rd_gen_vfed",
     "laxity": "rd_gen_laxity",
     "dagfluid": "rd_gen_dagfluid",
