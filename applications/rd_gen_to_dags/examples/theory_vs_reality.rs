@@ -83,7 +83,12 @@
 //!
 //! Usage: `theory_vs_reality <pool_dir> <real_cores> <dags_per_set>
 //! <trials_per_bin> <manifest_jsonl_path> [<u_norm_min> <u_norm_max>
-//! <u_norm_step>]` (defaults `0.10 1.00 0.05`), prints
+//! <u_norm_step> [<seed>]]` (defaults `0.10 1.00 0.05`, random seed), or
+//! `theory_vs_reality` without arguments to be asked for each value (stdin;
+//! prompts go to stderr). Before drawing, it prints each `u_norm`'s window
+//! and how many pool DAGs fall in it (a window with fewer than
+//! `dags_per_set` is skipped), and writes the run's values, the seed and the
+//! equivalent command line to `<manifest_jsonl_path>.params.json`. It prints
 //! `u_norm,federated_ratio,vfed_ratio,dag_fluid_ratio` CSV to stdout (one
 //! row per `u_norm` bin with enough DAGs in its window, ascending `u_norm`).
 
@@ -104,7 +109,7 @@ use awkernel_async_lib::dag_sched::{
         vfed::{self, PackingStrategy},
     },
 };
-use rand::seq::IndexedRandom;
+use rand::{SeedableRng, rngs::StdRng, seq::IndexedRandom};
 
 const DEFAULT_U_NORM_MIN: f64 = 0.10;
 const DEFAULT_U_NORM_MAX: f64 = 1.00;
@@ -125,57 +130,250 @@ struct PoolEntry {
     utilization: f64,
 }
 
-fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
-    let (pool_dir, real_cores, dags_per_set, trials_per_bin, manifest_jsonl_path, u_norm_range) =
-        match args.as_slice() {
-            [_, p, c, d, t, m] => (p, c, d, t, m, None),
-            [_, p, c, d, t, m, lo, hi, step] => (p, c, d, t, m, Some((lo, hi, step))),
-            _ => {
-                eprintln!(
-                    "usage: theory_vs_reality <pool_dir> <real_cores> <dags_per_set> \
-                     <trials_per_bin> <manifest_jsonl_path> [<u_norm_min> <u_norm_max> <u_norm_step>]"
-                );
-                return ExitCode::from(2);
+/// Everything one run needs: from the command line, or asked on stdin
+/// when the program is started without arguments (see [`Params::ask`]).
+struct Params {
+    pool_dir: String,
+    real_cores: u16,
+    dags_per_set: usize,
+    trials_per_bin: usize,
+    manifest_path: String,
+    /// Keep the manifest's existing records (always, on the command line).
+    append: bool,
+    u_norm_min: f64,
+    u_norm_max: f64,
+    u_norm_step: f64,
+    /// Seed of the set drawing; drawn at random (and reported) if not given.
+    seed: u64,
+}
+
+const USAGE: &str = "usage: theory_vs_reality <pool_dir> <real_cores> <dags_per_set> <trials_per_bin> \
+                     <manifest_jsonl_path> [<u_norm_min> <u_norm_max> <u_norm_step> [<seed>]]\n       \
+                     theory_vs_reality            (no arguments: asks for each value)";
+
+/// Default pool for the interactive mode: RD-Gen's wide pool
+/// (`scripts/generate_wide_pool.py`), next to this repository.
+const DEFAULT_POOL_RELATIVE_TO_HOME: &str = "azumi-lab/RD-Gen/test/awkernel_wide_pool";
+
+fn parse_positive<T: std::str::FromStr + PartialOrd + Default>(
+    name: &str,
+    v: &str,
+) -> Result<T, String> {
+    match v.trim().parse::<T>() {
+        Ok(n) if n > T::default() => Ok(n),
+        _ => Err(format!("{name} must be a positive number, got '{v}'")),
+    }
+}
+
+fn check_u_norm_range(lo: f64, hi: f64, step: f64) -> Result<(), String> {
+    if lo > 0.0 && hi >= lo && step > 0.0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "u_norm_min/u_norm_max/u_norm_step must satisfy 0 < min <= max and step > 0, got {lo} {hi} {step}"
+        ))
+    }
+}
+
+impl Params {
+    fn from_args(args: &[String]) -> Result<Self, String> {
+        let (p, c, d, t, m, range, seed) = match args {
+            [p, c, d, t, m] => (p, c, d, t, m, None, None),
+            [p, c, d, t, m, lo, hi, step] => (p, c, d, t, m, Some((lo, hi, step)), None),
+            [p, c, d, t, m, lo, hi, step, s] => (p, c, d, t, m, Some((lo, hi, step)), Some(s)),
+            _ => return Err(USAGE.to_string()),
+        };
+        let (u_norm_min, u_norm_max, u_norm_step) = match range {
+            None => (DEFAULT_U_NORM_MIN, DEFAULT_U_NORM_MAX, DEFAULT_U_NORM_STEP),
+            Some((lo, hi, step)) => (
+                lo.parse::<f64>()
+                    .map_err(|_| format!("bad u_norm_min '{lo}'"))?,
+                hi.parse::<f64>()
+                    .map_err(|_| format!("bad u_norm_max '{hi}'"))?,
+                step.parse::<f64>()
+                    .map_err(|_| format!("bad u_norm_step '{step}'"))?,
+            ),
+        };
+        check_u_norm_range(u_norm_min, u_norm_max, u_norm_step)?;
+        let seed = match seed {
+            Some(s) => s
+                .parse::<u64>()
+                .map_err(|_| format!("seed must be a u64, got '{s}'"))?,
+            None => rand::random::<u64>(),
+        };
+        Ok(Self {
+            pool_dir: p.clone(),
+            real_cores: parse_positive("real_cores", c)?,
+            dags_per_set: parse_positive("dags_per_set", d)?,
+            trials_per_bin: parse_positive("trials_per_bin", t)?,
+            manifest_path: m.clone(),
+            append: true,
+            u_norm_min,
+            u_norm_max,
+            u_norm_step,
+            seed,
+        })
+    }
+
+    /// Ask for every value on stderr/stdin (stdout stays the CSV), with the
+    /// default in brackets taken on an empty answer.
+    fn ask() -> Result<Self, String> {
+        let default_pool = env::var("HOME")
+            .map(|home| format!("{home}/{DEFAULT_POOL_RELATIVE_TO_HOME}"))
+            .unwrap_or_default();
+        let pool_dir = ask_until("DAG pool directory", Some(&default_pool), |v| {
+            if Path::new(v).is_dir() {
+                Ok(v.to_string())
+            } else {
+                Err(format!("'{v}' is not a directory"))
+            }
+        })?;
+        let real_cores: u16 =
+            ask_until("real cores m (the DAG-pool core count)", Some("14"), |v| {
+                parse_positive("m", v)
+            })?;
+        let dags_per_set: usize =
+            ask_until("DAGs per set N", Some("8"), |v| parse_positive("N", v))?;
+        let trials_per_bin: usize = ask_until("trials per u_norm", Some("500"), |v| {
+            parse_positive("trials", v)
+        })?;
+        let (u_norm_min, u_norm_max, u_norm_step) = loop {
+            let lo: f64 = ask_until("u_norm min", Some("0.10"), |v| {
+                parse_positive("u_norm min", v)
+            })?;
+            let hi: f64 = ask_until("u_norm max", Some("1.00"), |v| {
+                parse_positive("u_norm max", v)
+            })?;
+            let step: f64 = ask_until("u_norm step", Some("0.05"), |v| {
+                parse_positive("u_norm step", v)
+            })?;
+            match check_u_norm_range(lo, hi, step) {
+                Ok(()) => break (lo, hi, step),
+                Err(e) => eprintln!("  {e}"),
             }
         };
-
-    let real_cores: u16 = match real_cores.parse() {
-        Ok(n) if n > 0 => n,
-        _ => {
-            eprintln!("real_cores must be a positive integer, got '{real_cores}'");
-            return ExitCode::from(2);
-        }
-    };
-    let dags_per_set: usize = match dags_per_set.parse() {
-        Ok(n) if n > 0 => n,
-        _ => {
-            eprintln!("dags_per_set must be a positive integer, got '{dags_per_set}'");
-            return ExitCode::from(2);
-        }
-    };
-    let trials_per_bin: usize = match trials_per_bin.parse() {
-        Ok(n) if n > 0 => n,
-        _ => {
-            eprintln!("trials_per_bin must be a positive integer, got '{trials_per_bin}'");
-            return ExitCode::from(2);
-        }
-    };
-    let (u_norm_min, u_norm_max, u_norm_step) = match u_norm_range {
-        None => (DEFAULT_U_NORM_MIN, DEFAULT_U_NORM_MAX, DEFAULT_U_NORM_STEP),
-        Some((lo, hi, step)) => match (lo.parse::<f64>(), hi.parse::<f64>(), step.parse::<f64>()) {
-            (Ok(lo), Ok(hi), Ok(step)) if lo > 0.0 && hi >= lo && step > 0.0 => (lo, hi, step),
-            _ => {
-                eprintln!(
-                    "u_norm_min/u_norm_max/u_norm_step must satisfy 0 < min <= max and step > 0, \
-                     got '{lo}' '{hi}' '{step}'"
-                );
-                return ExitCode::from(2);
+        let random_seed = rand::random::<u64>().to_string();
+        let seed: u64 = ask_until("seed (blank: random)", Some(&random_seed), |v| {
+            v.parse::<u64>()
+                .map_err(|_| format!("seed must be a u64, got '{v}'"))
+        })?;
+        let default_manifest = format!("theory_vs_reality_m{real_cores}_n{dags_per_set}.jsonl");
+        let manifest_path = ask_until("manifest JSONL path", Some(&default_manifest), |v| {
+            Ok(v.to_string())
+        })?;
+        let append = if Path::new(&manifest_path).exists() {
+            let answer = ask_until(
+                "manifest exists: [a]ppend / [o]verwrite / [q]uit",
+                Some("q"),
+                |v| match v {
+                    "a" | "o" | "q" => Ok(v.to_string()),
+                    _ => Err("answer a, o or q".to_string()),
+                },
+            )?;
+            match answer.as_str() {
+                "a" => true,
+                "o" => false,
+                _ => return Err("cancelled".to_string()),
             }
-        },
-    };
+        } else {
+            true
+        };
+        Ok(Self {
+            pool_dir,
+            real_cores,
+            dags_per_set,
+            trials_per_bin,
+            manifest_path,
+            append,
+            u_norm_min,
+            u_norm_max,
+            u_norm_step,
+            seed,
+        })
+    }
 
-    let dags_dir = resolve_dags_dir(Path::new(pool_dir));
+    /// The command line that repeats this run (the manifest is appended to).
+    fn command_line(&self) -> String {
+        format!(
+            "theory_vs_reality {} {} {} {} {} {} {} {} {}",
+            self.pool_dir,
+            self.real_cores,
+            self.dags_per_set,
+            self.trials_per_bin,
+            self.manifest_path,
+            self.u_norm_min,
+            self.u_norm_max,
+            self.u_norm_step,
+            self.seed
+        )
+    }
+}
+
+/// Print `question [default]: ` to stderr and read one line until `parse`
+/// accepts it (an empty line takes `default`).
+fn ask_until<T>(
+    question: &str,
+    default: Option<&str>,
+    parse: impl Fn(&str) -> Result<T, String>,
+) -> Result<T, String> {
+    let stdin = std::io::stdin();
+    loop {
+        match default {
+            Some(d) if !d.is_empty() => eprint!("{question} [{d}]: "),
+            _ => eprint!("{question}: "),
+        }
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        if stdin.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+            return Err("stdin closed".to_string());
+        }
+        let line = line.trim();
+        let value = if line.is_empty() {
+            default.unwrap_or("")
+        } else {
+            line
+        };
+        match parse(value) {
+            Ok(v) => return Ok(v),
+            Err(e) => eprintln!("  {e}"),
+        }
+    }
+}
+
+/// `u_norm`'s per-DAG utilization window `[lo, hi]`.
+fn window_of(u_norm: f64, per_dag_scale: f64, delta: f64) -> (f64, f64) {
+    let center = u_norm * per_dag_scale;
+    (center - delta, center + delta)
+}
+
+fn main() -> ExitCode {
+    let args: Vec<String> = env::args().skip(1).collect();
+    let interactive = args.is_empty();
+    let params = if interactive {
+        Params::ask()
+    } else {
+        Params::from_args(&args)
+    };
+    let params = match params {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
+    let Params {
+        real_cores,
+        dags_per_set,
+        trials_per_bin,
+        u_norm_min,
+        u_norm_max,
+        u_norm_step,
+        seed,
+        ..
+    } = params;
+    let manifest_jsonl_path = params.manifest_path.as_str();
+
+    let dags_dir = resolve_dags_dir(Path::new(&params.pool_dir));
     let (pool, dropped) = match load_and_prefilter_pool(&dags_dir) {
         Ok(p) => p,
         Err(e) => {
@@ -189,26 +387,95 @@ fn main() -> ExitCode {
         pool.len(),
     );
 
+    let per_dag_scale = real_cores as f64 / dags_per_set as f64;
+    let delta = WINDOW_FRACTION_OF_STEP * u_norm_step * per_dag_scale;
+    let u_norms = u_norm_values(u_norm_min, u_norm_max, u_norm_step);
+
+    // Coverage check before drawing anything: a window with fewer DAGs
+    // than dags_per_set is skipped (no CSV row, no manifest record).
+    let window_counts: Vec<usize> = u_norms
+        .iter()
+        .map(|&u_norm| {
+            let (lo, hi) = window_of(u_norm, per_dag_scale, delta);
+            pool.iter()
+                .filter(|e| e.utilization >= lo && e.utilization <= hi)
+                .count()
+        })
+        .collect();
+    let pool_max_u = pool.iter().map(|e| e.utilization).fold(0.0f64, f64::max);
+    eprintln!(
+        "m={real_cores} N={dags_per_set}: per-DAG utilization = u_norm * {per_dag_scale:.4} \
+         +- {delta:.4} (pool reaches {pool_max_u:.3})"
+    );
+    eprintln!("  u_norm   window             DAGs");
+    let mut short_bins = Vec::new();
+    for (&u_norm, &count) in u_norms.iter().zip(&window_counts) {
+        let (lo, hi) = window_of(u_norm, per_dag_scale, delta);
+        let mark = if count < dags_per_set {
+            short_bins.push(u_norm);
+            "  <- too few, skipped"
+        } else {
+            ""
+        };
+        eprintln!("  {u_norm:.4}   [{lo:.4}, {hi:.4}]   {count:5}{mark}");
+    }
+    if !short_bins.is_empty() {
+        eprintln!(
+            "{} of {} u_norm points have fewer than N={dags_per_set} DAGs in their window and \
+             will be skipped (the pool must reach u_norm_max * m / N = {:.3})",
+            short_bins.len(),
+            u_norms.len(),
+            u_norm_max * per_dag_scale + delta,
+        );
+        if interactive {
+            match ask_until("continue anyway? [y/N]", Some("n"), |v| match v {
+                "y" | "n" => Ok(v == "y"),
+                _ => Err("answer y or n".to_string()),
+            }) {
+                Ok(true) => {}
+                _ => return ExitCode::from(2),
+            }
+        }
+    }
+
     let mut manifest = match fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .append(params.append)
+        .truncate(!params.append)
         .open(manifest_jsonl_path)
     {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("cannot open '{manifest_jsonl_path}' for appending: {e}");
+            eprintln!("cannot open '{manifest_jsonl_path}' for writing: {e}");
             return ExitCode::FAILURE;
         }
     };
 
-    let mut rng = rand::rng();
+    // The values of this run next to the manifest, so it can be repeated.
+    let params_path = format!("{manifest_jsonl_path}.params.json");
+    let params_json = format!(
+        "{{\"pool_dir\":\"{}\",\"real_cores\":{real_cores},\"dags_per_set\":{dags_per_set},\
+         \"trials_per_bin\":{trials_per_bin},\"u_norm_min\":{u_norm_min},\"u_norm_max\":{u_norm_max},\
+         \"u_norm_step\":{u_norm_step},\"seed\":{seed},\"window_fraction_of_step\":{WINDOW_FRACTION_OF_STEP},\
+         \"pool_dags\":{},\"skipped_u_norm\":{:?},\"command\":\"{}\"}}\n",
+        dags_dir.display(),
+        pool.len(),
+        short_bins,
+        params.command_line(),
+    );
+    if let Err(e) = fs::write(&params_path, params_json) {
+        eprintln!("cannot write '{params_path}': {e}");
+    }
+    eprintln!("seed {seed}; repeat with: {}", params.command_line());
+
+    let mut rng = StdRng::seed_from_u64(seed);
     let per_dag_scale = real_cores as f64 / dags_per_set as f64;
     let delta = WINDOW_FRACTION_OF_STEP * u_norm_step * per_dag_scale;
 
     println!("u_norm,federated_ratio,vfed_ratio,dag_fluid_ratio,sfs_ratio");
-    for u_norm in u_norm_values(u_norm_min, u_norm_max, u_norm_step) {
-        let center = u_norm * per_dag_scale;
-        let (lo, hi) = (center - delta, center + delta);
+    for &u_norm in &u_norms {
+        let (lo, hi) = window_of(u_norm, per_dag_scale, delta);
         let window: Vec<&PoolEntry> = pool
             .iter()
             .filter(|e| e.utilization >= lo && e.utilization <= hi)
