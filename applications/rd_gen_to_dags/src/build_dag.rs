@@ -194,6 +194,7 @@ macro_rules! register_source {
                 pub_topics,
                 $sched_type,
                 convert_duration($node_data.get_period().expect("Source node's period should always be Some.")),
+                Some(convert_duration(execution_time)),
             ).await;
             Ok(())
         }
@@ -281,6 +282,7 @@ macro_rules! register_sink {
                 sub_topics,
                 $sched_type,
                 convert_duration($node_data.get_end_to_end_deadline().expect("Sink node's relative_deadline should always be Some.")),
+                Some(convert_duration(execution_time)),
             ).await;
             Ok(())
         }
@@ -382,6 +384,7 @@ macro_rules! register_intermediate {
                 sub_topics,
                 pub_topics,
                 $sched_type,
+                Some(convert_duration(execution_time)),
             ).await;
             Ok(())
         }
