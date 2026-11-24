@@ -139,6 +139,8 @@ async fn test_mixed_vp_group() {
             return;
         }
     };
+    // This test's metrics are already in microseconds (the unit of `uptime()`).
+    donor_assignment.arm_budgets(|budget| budget);
     let VFedAssignment::Heavy {
         active: donor_active,
         passive: donor_passive,
@@ -173,6 +175,8 @@ async fn test_mixed_vp_group() {
             return;
         }
     };
+    // This test's metrics are already in microseconds (the unit of `uptime()`).
+    consumer_assignment.arm_budgets(|budget| budget);
     let VFedAssignment::Heavy {
         active: consumer_active,
         passive: consumer_passive,

@@ -294,6 +294,14 @@ pub async fn run() {
         }
     };
 
+    // Admission ran in this build's DAG time unit (`time_unit`, milliseconds
+    // by default); the active-VP budgets are charged in microseconds.
+    for assignment in &assignments {
+        assignment.arm_budgets(|budget| {
+            u64::try_from(time_unit::convert_duration(budget).as_micros()).unwrap_or(u64::MAX)
+        });
+    }
+
     let dags_data = match parse_yaml::parse_dags(DAG_FILES) {
         Ok(data) => data,
         Err(e) => {

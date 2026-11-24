@@ -112,9 +112,11 @@ pub(crate) fn active_eligible(cpu_id: usize) -> bool {
     true
 }
 
-/// Each active-VP core's initial (replenish-to) budget, in nanoseconds. `0`
-/// means "no active-VP group currently claims this core." Set once by
-/// [`set_initial_budget`] when `vfed` admits a heavy DAG's active-VP group
+/// Each active-VP core's initial (replenish-to) budget, in microseconds (the
+/// unit of `awkernel_lib::delay::uptime()`, which [`tick_budget`] charges it
+/// with). `0` means "no active-VP group currently claims this core." Set once
+/// by [`set_initial_budget`] when a heavy DAG's active-VP group is armed
+/// (`dag_sched::policy::vfed::VFedAssignment::arm_budgets`)
 /// (mirrors `task::NUM_CLUSTERED_TASKS_ALIVE`: per-cpu metadata fixed at
 /// admission/spawn time, read continuously by the scheduler).
 static INITIAL_BUDGET: [AtomicU64; NUM_MAX_CPU] = array![_ => AtomicU64::new(0); NUM_MAX_CPU];
@@ -138,17 +140,17 @@ static LAST_TICK: [AtomicU64; NUM_MAX_CPU] = array![_ => AtomicU64::new(0); NUM_
 static WAS_RUNNING: [AtomicBool; NUM_MAX_CPU] = array![_ => AtomicBool::new(false); NUM_MAX_CPU];
 
 /// Claim `cpu` for an active-VP group with initial (per-job) budget
-/// `budget_ns`, and arm its remaining budget so it is immediately usable
+/// `budget_us` (microseconds), and arm its remaining budget so it is immediately usable
 /// (equivalent to the group's first job having just been released). Called
-/// once per core by `dag_sched::policy::vfed` when it admits a heavy DAG's
+/// once per core by `dag_sched::policy::vfed::VFedAssignment::arm_budgets` for a heavy DAG's
 /// active-VP group.
-pub(crate) fn set_initial_budget(cpu: usize, budget_ns: u64) {
+pub(crate) fn set_initial_budget(cpu: usize, budget_us: u64) {
     let Some(initial) = INITIAL_BUDGET.get(cpu) else {
         return;
     };
-    initial.store(budget_ns, Ordering::Relaxed);
+    initial.store(budget_us, Ordering::Relaxed);
     if let Some(remaining) = BUDGET_REMAINING.get(cpu) {
-        remaining.store(budget_ns, Ordering::Relaxed);
+        remaining.store(budget_us, Ordering::Relaxed);
     }
 }
 
@@ -520,12 +522,12 @@ mod tests {
 
     #[test]
     fn test_tick_budget_does_not_charge_idle_gap() {
-        set_initial_budget(202, 1_000_000_000); // 1s, plenty of headroom
+        set_initial_budget(202, 1_000_000); // 1 s in microseconds, plenty of headroom
         mark_idle(202);
         // First tick after being idle: primes LAST_TICK, charges nothing.
         tick_budget(202);
         let after_first = BUDGET_REMAINING[202].load(Ordering::Relaxed);
-        assert_eq!(after_first, 1_000_000_000);
+        assert_eq!(after_first, 1_000_000);
     }
 
     #[test]

@@ -122,7 +122,9 @@ fn sbf(delta: u64, budget: u64, period: u64, deadline: u64) -> u64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActiveVp {
     pub cpu: usize,
-    /// Initial budget `θ_z`: replenished to this value at every job
+    /// Initial budget `θ_z`, in the time unit of the admitted
+    /// [`DagMetrics`] (see [`VFedAssignment::arm_budgets`] for how it reaches
+    /// the scheduler in microseconds): replenished to this value at every job
     /// release, consumed 1:1 with execution, forcing the served task off
     /// this core once exhausted (see the module doc's "not yet
     /// implemented" list — that enforcement is mechanism-layer work).
@@ -709,6 +711,26 @@ pub enum VFedAssignment {
 }
 
 impl VFedAssignment {
+    /// Arm the active-VP budget of every core this assignment claims, so
+    /// `scheduler::active_vp` can dispatch onto them. Call it once per
+    /// assignment after admission, before the DAG's tasks are spawned.
+    ///
+    /// Admission works in the time unit of its [`DagMetrics`] (whatever the
+    /// caller used for `volume`/`period`/`relative_deadline`), but the
+    /// scheduler charges the budget in microseconds of
+    /// `awkernel_lib::delay::uptime()`. `to_micros` converts one budget from
+    /// the former to the latter (for example, milliseconds to microseconds
+    /// for `rd_gen_to_dags`'s default `milliseconds` time unit). Arming the
+    /// raw value instead made a 15 ms budget last 15 us, so a pure
+    /// active-VP DAG barely ran.
+    pub fn arm_budgets(&self, to_micros: impl Fn(u64) -> u64) {
+        if let VFedAssignment::Heavy { active, .. } = self {
+            for a in active {
+                crate::scheduler::active_vp::set_initial_budget(a.cpu, to_micros(a.budget));
+            }
+        }
+    }
+
     /// Turn this admission decision into the `SchedulerType` every node of
     /// the DAG it was decided for should be registered with.
     ///
@@ -800,14 +822,8 @@ fn admit_heavy(config: DagMetrics) -> Result<VFedAssignment, AdmissionError> {
         .map(|(cpu, budget)| ActiveVp { cpu, budget })
         .collect();
 
-    // Arm each claimed core's active-VP budget immediately, ahead of the
-    // scheduler mechanism (`scheduler::active_vp`) that will eventually
-    // dispatch onto it — this admission decision is the single source of
-    // truth for what each core's budget *should* be, so it is set here
-    // rather than left for some later, separate wiring step to get wrong.
-    for a in &active {
-        crate::scheduler::active_vp::set_initial_budget(a.cpu, a.budget);
-    }
+    // The budgets are armed by the caller (`VFedAssignment::arm_budgets`),
+    // which knows the time unit of `config`.
 
     let new_passives = generate_passive_vps(
         &plan.active_budgets,
@@ -1067,9 +1083,6 @@ pub fn admit_batch(
             .zip(plan.active_budgets.iter().copied())
             .map(|(&cpu, budget)| ActiveVp { cpu, budget })
             .collect();
-        for a in &active {
-            crate::scheduler::active_vp::set_initial_budget(a.cpu, a.budget);
-        }
 
         // Same replay order as `try_alloc_heavy_within` planned against:
         // this DAG's own passive-VPs enter `V` first, then its `Π` leaves.
