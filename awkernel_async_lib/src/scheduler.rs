@@ -358,10 +358,15 @@ pub(crate) fn clustered_queued_cpu_mask() -> CpuSet {
 /// Get the next executable task.
 #[inline]
 pub(crate) fn get_next_task(execution_ensured: bool) -> Option<Arc<Task>> {
-    let mut node = MCSNode::new();
-    let _guard = GLOBAL_WAKE_GET_MUTEX.lock(&mut node);
-
     let cpu_id = awkernel_lib::cpu::cpu_id();
+    // DAG-Fluid switch latency breakdown (idle path, `perf` only): no-ops
+    // unless this CPU has an open switch record.
+    dp_wrap::dp_switch::measure::mark(cpu_id, dp_wrap::dp_switch::measure::ENTERED);
+
+    let mut node = MCSNode::new();
+    dp_wrap::dp_switch::measure::mark(cpu_id, dp_wrap::dp_switch::measure::PRE_LOCK);
+    let _guard = GLOBAL_WAKE_GET_MUTEX.lock(&mut node);
+    dp_wrap::dp_switch::measure::mark(cpu_id, dp_wrap::dp_switch::measure::WAKE_LOCK);
 
     // A CPU reserved by a clustered task's cpu_set (see
     // `task::NUM_CLUSTERED_TASKS_ALIVE`/`task::is_cpu_reserved`) — e.g. a

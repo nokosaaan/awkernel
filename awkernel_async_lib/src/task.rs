@@ -1891,6 +1891,18 @@ pub fn get_tasks_running() -> Vec<RunningTask> {
     tasks
 }
 
+/// Whether `task_id` is running on any CPU. Unlike [`get_tasks_running`],
+/// it allocates nothing, so it is safe in interrupt context. Only the
+/// DAG-Fluid slot record (`perf`) uses it.
+#[cfg(feature = "perf")]
+pub(crate) fn is_task_running(task_id: u32) -> bool {
+    let num_cpus = awkernel_lib::cpu::num_cpu();
+    RUNNING
+        .iter()
+        .take(num_cpus)
+        .any(|running| running.load(Ordering::Relaxed) == task_id)
+}
+
 /// Get the running task for the given CPU.
 ///
 /// `cpu_id` must be less than `awkernel_lib::cpu::num_cpu()`.

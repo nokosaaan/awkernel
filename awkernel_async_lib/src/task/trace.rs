@@ -65,6 +65,16 @@ pub struct DpSwitchEvent {
     pub path: u8,
     /// Due entries passed over because the handler ran late.
     pub skipped: u32,
+    /// Points between `handler_ns` and `decided_ns` (0: not reached), see
+    /// `scheduler::dp_wrap::dp_switch::measure::mark`: the successor search
+    /// started (IPI 255 path: `prepare_preemption_on_cpu`; idle: the run
+    /// loop's `get_next_task`), `GLOBAL_WAKE_GET_MUTEX` acquired, and the
+    /// `DpWrap` scheduler's lock acquired.
+    pub entered_ns: u64,
+    pub wake_lock_ns: u64,
+    pub data_lock_ns: u64,
+    /// Just before taking `GLOBAL_WAKE_GET_MUTEX` for the search.
+    pub pre_lock_ns: u64,
 }
 
 pub const DPSW_CAP: usize = 4096;
@@ -563,7 +573,8 @@ pub fn dump_to_console() {
     }
 
     // TRACE_DPSW,<cpu>,<scheduled_ns>,<handler_ns>,<decided_ns|->,
-    //   <started_ns|->,<from_dag|->,<to_dag|->,<path>,<skipped>
+    //   <started_ns|->,<from_dag|->,<to_dag|->,<path>,<skipped>,
+    //   <entered_ns|->,<wake_lock_ns|->,<data_lock_ns|->,<pre_lock_ns|->
     // One applied DAG-Fluid switch point (see `DpSwitchEvent`).
     let ns_or_dash = |v: u64| if v == 0 { "-".into() } else { format!("{v}") };
     let dag_or_dash = |v: u32| {
@@ -581,7 +592,7 @@ pub fn dump_to_console() {
             if let Some(buf) = bufs[cpu_id].as_ref() {
                 for e in buf.iter().take(n.min(DPSW_CAP)) {
                     out.push_str(&format!(
-                        "TRACE_DPSW,{cpu_id},{},{},{},{},{},{},{},{}\r\n",
+                        "TRACE_DPSW,{cpu_id},{},{},{},{},{},{},{},{},{},{},{},{}\r\n",
                         e.scheduled_ns,
                         e.handler_ns,
                         ns_or_dash(e.decided_ns),
@@ -590,6 +601,10 @@ pub fn dump_to_console() {
                         dag_or_dash(e.to_dag),
                         dpsw_path_name(e.path),
                         e.skipped,
+                        ns_or_dash(e.entered_ns),
+                        ns_or_dash(e.wake_lock_ns),
+                        ns_or_dash(e.data_lock_ns),
+                        ns_or_dash(e.pre_lock_ns),
                     ));
                     if out.len() > 4096 {
                         console::print(&out);

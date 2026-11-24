@@ -311,6 +311,11 @@ pub(crate) fn task_overrun(task: &Task) -> bool {
 /// For the slot record (`slot_measure`): the state of `dag_id`'s slot node
 /// `slot` that could not be taken, given whether it is in the ready nodes,
 /// and its task id (0 if unknown).
+///
+/// Only for the trace (`perf`): the dispatch itself never needs it. It is
+/// called on the switch path, in interrupt context, so it must not
+/// allocate; it reads `RUNNING` directly instead of `get_tasks_running()`.
+#[cfg(feature = "perf")]
 fn classify_slot(dag_id: u32, slot: NodeSlot, in_ready: bool) -> (u8, u32) {
     use slot_measure::{
         SLOT_BEHIND, SLOT_DONE, SLOT_NOT_WOKEN, SLOT_READY, SLOT_RUNNING_ELSEWHERE,
@@ -323,28 +328,12 @@ fn classify_slot(dag_id: u32, slot: NodeSlot, in_ready: bool) -> (u8, u32) {
         SLOT_DONE
     } else if done < slot.job {
         SLOT_BEHIND
-    } else if crate::task::get_tasks_running()
-        .iter()
-        .any(|rt| rt.task_id == entry.task_id)
-    {
+    } else if crate::task::is_task_running(entry.task_id) {
         SLOT_RUNNING_ELSEWHERE
     } else {
         SLOT_NOT_WOKEN
     };
     (state, entry.task_id)
-}
-
-/// For `dp_switch`: [`classify_slot`], looking the ready nodes up itself.
-#[cfg_attr(feature = "no_preempt", allow(dead_code))]
-pub(crate) fn classify_slot_locked(dag_id: u32, slot: NodeSlot) -> (u8, u32) {
-    let in_ready = {
-        let mut node = MCSNode::new();
-        let data = SCHEDULER.data.lock(&mut node);
-        (*data)
-            .as_ref()
-            .is_some_and(|data| data.ready_nodes.contains_key(&(dag_id, slot.node_id)))
-    };
-    classify_slot(dag_id, slot, in_ready)
 }
 
 /// Whether `cpu_id` is a DAG-Fluid pool CPU (it has a placeholder task).
@@ -618,17 +607,22 @@ impl Scheduler for DpWrapScheduler {
 
         let mut node = MCSNode::new();
         let mut data = self.data.lock(&mut node);
+        dp_switch::measure::mark(cpu_id, dp_switch::measure::DATA_LOCK);
         let data = (*data).as_mut()?;
 
         let node_task = match (NODE_SLOTS, dag_id, slot) {
             (true, Some(dag_id), Some(slot)) => {
+                #[cfg(feature = "perf")]
                 let in_ready = data.ready_nodes.contains_key(&(dag_id, slot.node_id));
                 let task = data.take_node(dag_id, slot);
-                let (state, task_id) = match &task {
-                    Some(task) => (crate::scheduler::dp_wrap::slot_measure::SLOT_READY, task.id),
-                    None => classify_slot(dag_id, slot, in_ready),
-                };
-                slot_measure::observe(cpu_id, dag_id, slot.node_id, state, task_id);
+                #[cfg(feature = "perf")]
+                {
+                    let (state, task_id) = match &task {
+                        Some(task) => (slot_measure::SLOT_READY, task.id),
+                        None => classify_slot(dag_id, slot, in_ready),
+                    };
+                    slot_measure::observe(cpu_id, dag_id, slot.node_id, state, task_id);
+                }
                 Some(task)
             }
             // A no-DAG slot runs only overrun nodes.

@@ -1,5 +1,8 @@
 use array_macro::array;
-use core::{sync::atomic::AtomicBool, time::Duration};
+use core::{
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
 #[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
@@ -193,7 +196,7 @@ pub fn register_timer_callback(id: TimerRequestId, callback: Box<dyn Fn() + Send
 }
 
 /// Invoke `id`'s registered callback, if any, with `TIMER_CALLBACKS[id]`'s
-/// own lock *not* held. This matters: [`arm_and_recheck`] can recurse back
+/// own lock *not* held. This matters: [`arm_and_recheck`] can call back
 /// into [`handle_timer_fire`] -> `invoke_callback` for the very same `id`
 /// on the very same call stack (e.g. a callback that re-`request_at`s a
 /// deadline that's already passed by the time the hardware write
@@ -215,24 +218,71 @@ fn invoke_callback(id: TimerRequestId) {
     }
 }
 
+/// Per CPU: [`handle_timer_fire`] is running on this CPU (directly from the
+/// timer IRQ, or from [`arm_and_recheck`]'s loop). Only that CPU reads or
+/// writes its own entry, so `Relaxed` is enough.
+static FIRING: [AtomicBool; NUM_MAX_CPU] = array![_ => AtomicBool::new(false); NUM_MAX_CPU];
+
+/// Per CPU: a deadline was found already passed while [`FIRING`] was set,
+/// so the running [`fire_until_settled`] loop must call
+/// [`handle_timer_fire_once`] again.
+static REFIRE: [AtomicBool; NUM_MAX_CPU] = array![_ => AtomicBool::new(false); NUM_MAX_CPU];
+
 /// Arm the physical timer for `deadline`, then immediately recheck whether
 /// it has already passed -- the risk `fully_one_shot_timer` trades periodic
 /// mode's lost-edge safety net away for (see this module's own doc). If so,
-/// fire synchronously right here instead of waiting for an interrupt that
-/// may never come. This mirrors
-/// `awkernel_lib::cpu::sleep_cpu_no_std::sleep`'s own pre-existing
-/// elapsed-time recheck immediately before committing to halt, for exactly
-/// the same reason (edge-triggered interrupts arriving while interrupts
-/// are masked are lost).
+/// fire right here instead of waiting for an interrupt that may never come.
+/// This mirrors `awkernel_lib::cpu::sleep_cpu_no_std::sleep`'s own
+/// pre-existing elapsed-time recheck immediately before committing to halt,
+/// for exactly the same reason (edge-triggered interrupts arriving while
+/// interrupts are masked are lost).
 ///
 /// Every caller of `arm_at` in this module (there is no other) goes through
 /// here rather than calling it directly, specifically so this recheck can
 /// never be forgotten at a new call site the way it originally was at two
 /// of this function's own three call sites.
+///
+/// The recheck must not be dropped, but it used to recurse: firing invokes
+/// callbacks, a callback re-arms through [`request_at`], and the re-arm
+/// fires again whenever its deadline has already passed, so a run of past
+/// deadlines grew the stack without bound. Now a recheck made while this
+/// CPU is already firing only sets [`REFIRE`], and the outermost
+/// [`fire_until_settled`] loop fires again. The stack depth stays bounded
+/// (one nested call at most), and no expired deadline is lost: every one
+/// either fires in the current pass or sets `REFIRE` for the next.
 fn arm_and_recheck(deadline: Instant) {
     arm_at(deadline);
-    if Instant::now() >= deadline {
-        handle_timer_fire();
+    if Instant::now() < deadline {
+        return;
+    }
+    let cpu = crate::cpu::cpu_id();
+    if FIRING[cpu].load(Ordering::Relaxed) {
+        REFIRE[cpu].store(true, Ordering::Relaxed);
+    } else {
+        fire_until_settled(cpu);
+    }
+}
+
+/// Run [`handle_timer_fire_once`] on `cpu` (the calling CPU) until no pass
+/// leaves an expired deadline behind. Must not be called while `cpu` is
+/// already firing.
+fn fire_until_settled(cpu: usize) {
+    loop {
+        FIRING[cpu].store(true, Ordering::Relaxed);
+        loop {
+            REFIRE[cpu].store(false, Ordering::Relaxed);
+            handle_timer_fire_once(cpu);
+            if !REFIRE[cpu].load(Ordering::Relaxed) {
+                break;
+            }
+        }
+        FIRING[cpu].store(false, Ordering::Relaxed);
+        // A timer IRQ between the last check and clearing `FIRING` saw this
+        // CPU still firing and only set `REFIRE`; take that request now. Any
+        // later IRQ sees `FIRING` clear and fires by itself.
+        if !REFIRE[cpu].load(Ordering::Relaxed) {
+            break;
+        }
     }
 }
 
@@ -260,7 +310,7 @@ pub fn cancel(id: TimerRequestId) {
     let cpu = crate::cpu::cpu_id();
 
     // Read the lock's result and drop the guard *before* arming: `arm_and_recheck`
-    // can recurse into `handle_timer_fire`, which re-locks this same
+    // can call into `handle_timer_fire_once`, which re-locks this same
     // per-CPU mutex -- holding it here would deadlock.
     let next = {
         let mut node = MCSNode::new();
@@ -280,8 +330,21 @@ pub fn cancel(id: TimerRequestId) {
 /// registered callback, if any), then re-arm for whatever remains. Safe to
 /// call even if nothing has actually reached its deadline yet (a no-op
 /// re-arm in that case).
+///
+/// If the IRQ arrives while this CPU is already firing (a callback running
+/// with interrupts enabled), it only asks the running pass to fire again,
+/// so the two never run nested.
 pub fn handle_timer_fire() {
     let cpu = crate::cpu::cpu_id();
+    if FIRING[cpu].load(Ordering::Relaxed) {
+        REFIRE[cpu].store(true, Ordering::Relaxed);
+    } else {
+        fire_until_settled(cpu);
+    }
+}
+
+/// One pass of [`handle_timer_fire`] on `cpu` (the calling CPU).
+fn handle_timer_fire_once(cpu: usize) {
     let now = Instant::now();
 
     for id in TimerRequestId::ALL {
@@ -304,8 +367,9 @@ pub fn handle_timer_fire() {
         }
     }
 
-    // Same reasoning as `cancel`: drop the lock before arming, since
-    // `arm_and_recheck` may recurse back into this very function.
+    // Same reasoning as `cancel`: drop the lock before arming. While this CPU
+    // is firing, `arm_and_recheck` does not fire again itself; it sets
+    // `REFIRE` and `fire_until_settled` runs another pass.
     let next = {
         let mut node = MCSNode::new();
         let state = TIMER_REQUESTS[cpu].lock(&mut node);

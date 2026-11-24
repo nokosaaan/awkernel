@@ -238,6 +238,9 @@ pub(crate) mod measure {
             skipped: AtomicU32,
             /// The successor task whose start closes the record (0: none yet).
             task: AtomicU32,
+            /// [`mark`]'s points, indexed by [`ENTERED`]/[`WAKE_LOCK`]/[`DATA_LOCK`]/
+            /// [`PRE_LOCK`].
+            points: [AtomicU64; 4],
         }
 
         impl Pending {
@@ -252,6 +255,12 @@ pub(crate) mod measure {
                     path: AtomicU8::new(0),
                     skipped: AtomicU32::new(0),
                     task: AtomicU32::new(0),
+                    points: [
+                        AtomicU64::new(0),
+                        AtomicU64::new(0),
+                        AtomicU64::new(0),
+                        AtomicU64::new(0),
+                    ],
                 }
             }
         }
@@ -275,6 +284,10 @@ pub(crate) mod measure {
                 to_dag: p.to.load(Ordering::Relaxed),
                 path: p.path.load(Ordering::Relaxed),
                 skipped: p.skipped.load(Ordering::Relaxed),
+                entered_ns: p.points[ENTERED].load(Ordering::Relaxed),
+                wake_lock_ns: p.points[WAKE_LOCK].load(Ordering::Relaxed),
+                data_lock_ns: p.points[DATA_LOCK].load(Ordering::Relaxed),
+                pre_lock_ns: p.points[PRE_LOCK].load(Ordering::Relaxed),
             });
         }
 
@@ -305,6 +318,9 @@ pub(crate) mod measure {
             p.path.store(path, Ordering::Relaxed);
             p.skipped.store(skipped, Ordering::Relaxed);
             p.task.store(0, Ordering::Relaxed);
+            for point in &p.points {
+                point.store(0, Ordering::Relaxed);
+            }
             p.open.store(true, Ordering::Relaxed);
             if path != PREEMPT && path != IDLE {
                 close(p, 0);
@@ -319,6 +335,37 @@ pub(crate) mod measure {
             if p.open.load(Ordering::Relaxed) && p.task.load(Ordering::Relaxed) == 0 {
                 p.decided.store(ns(Instant::now()), Ordering::Relaxed);
                 p.task.store(task_id, Ordering::Relaxed);
+            }
+        }
+
+        /// The successor search started: the IPI 255 path entered
+        /// `prepare_preemption_on_cpu`, or the idle run loop entered
+        /// `get_next_task`.
+        pub(crate) const ENTERED: usize = 0;
+        /// `GLOBAL_WAKE_GET_MUTEX` was acquired for the search.
+        pub(crate) const WAKE_LOCK: usize = 1;
+        /// The `DpWrap` scheduler's lock was acquired for the search.
+        pub(crate) const DATA_LOCK: usize = 2;
+        /// About to take `GLOBAL_WAKE_GET_MUTEX` for the search: the time
+        /// from here to [`WAKE_LOCK`] is the wait for that lock alone.
+        pub(crate) const PRE_LOCK: usize = 3;
+
+        /// Note that the open record's successor search reached `point` now.
+        /// Only the first time per record, and only until the successor is
+        /// decided, so calls from unrelated searches before or after do not
+        /// overwrite it. Atomics only: safe in interrupt context and cheap on
+        /// the run loop's hot path when no record is open.
+        pub(crate) fn mark(cpu_id: usize, point: usize) {
+            let Some(p) = PENDING.get(cpu_id) else {
+                return;
+            };
+            if !p.open.load(Ordering::Relaxed) || p.task.load(Ordering::Relaxed) != 0 {
+                return;
+            }
+            if let Some(slot) = p.points.get(point) {
+                if slot.load(Ordering::Relaxed) == 0 {
+                    slot.store(ns(Instant::now()), Ordering::Relaxed);
+                }
             }
         }
 
@@ -382,6 +429,11 @@ pub(crate) mod measure {
         ) {
         }
         pub(crate) fn decided(_cpu_id: usize, _task_id: u32) {}
+        pub(crate) const ENTERED: usize = 0;
+        pub(crate) const WAKE_LOCK: usize = 1;
+        pub(crate) const DATA_LOCK: usize = 2;
+        pub(crate) const PRE_LOCK: usize = 3;
+        pub(crate) fn mark(_cpu_id: usize, _point: usize) {}
         #[cfg_attr(feature = "no_preempt", allow(dead_code))]
         pub(crate) fn set_path(_cpu_id: usize, _path: u8) {}
         #[cfg_attr(feature = "no_preempt", allow(dead_code))]
@@ -454,21 +506,35 @@ mod preemption_side {
     }
 
     /// With [`NODE_SLOTS`]: take `dag_id`'s slot node if it is ready and on
-    /// the slot's job.
-    fn take_slot_node(dag_id: u32, slot: switch_table::NodeSlot) -> Option<Arc<Task>> {
+    /// the slot's job. Also returns whether the node was in the ready nodes,
+    /// read under the same lock, so the slot record (`perf`) does not take
+    /// the scheduler's lock a second time.
+    fn take_slot_node(dag_id: u32, slot: switch_table::NodeSlot) -> (Option<Arc<Task>>, bool) {
+        let cpu_id = awkernel_lib::cpu::cpu_id();
         let mut node = MCSNode::new();
+        measure::mark(cpu_id, measure::PRE_LOCK);
         let _guard = GLOBAL_WAKE_GET_MUTEX.lock(&mut node);
+        measure::mark(cpu_id, measure::WAKE_LOCK);
         let mut node_inner = MCSNode::new();
         let mut data = SCHEDULER.data.lock(&mut node_inner);
-        (*data).as_mut()?.take_node(dag_id, slot)
+        measure::mark(cpu_id, measure::DATA_LOCK);
+        let Some(data) = (*data).as_mut() else {
+            return (None, false);
+        };
+        let in_ready = data.ready_nodes.contains_key(&(dag_id, slot.node_id));
+        (data.take_node(dag_id, slot), in_ready)
     }
 
     /// Pop the first runnable task of `dag_id`'s ready queue.
     fn pop_successor(dag_id: u32) -> Option<Arc<Task>> {
+        let cpu_id = awkernel_lib::cpu::cpu_id();
         let mut node = MCSNode::new();
+        measure::mark(cpu_id, measure::PRE_LOCK);
         let _guard = GLOBAL_WAKE_GET_MUTEX.lock(&mut node);
+        measure::mark(cpu_id, measure::WAKE_LOCK);
         let mut node_inner = MCSNode::new();
         let mut data = SCHEDULER.data.lock(&mut node_inner);
+        measure::mark(cpu_id, measure::DATA_LOCK);
         let queue = (*data).as_mut()?.queues.get_mut(&dag_id)?;
         loop {
             let DpWrapTask { task, .. } = queue.pop()?;
@@ -486,6 +552,7 @@ mod preemption_side {
     /// the running task's DAG, queues the entitled DAG's next task as the
     /// preemption-pending successor.
     pub(crate) fn prepare_preemption_on_cpu(cpu_id: usize) {
+        measure::mark(cpu_id, measure::ENTERED);
         if KICK
             .get(cpu_id)
             .is_some_and(|kick| kick.swap(false, Ordering::AcqRel))
@@ -549,12 +616,21 @@ mod preemption_side {
         // wakes up (`DpWrapScheduler::wake_task`).
         let successor = match slot {
             Some(slot) => {
-                let taken = take_slot_node(dag_id, slot);
-                let (state, task_id) = match &taken {
-                    Some(task) => (crate::scheduler::dp_wrap::slot_measure::SLOT_READY, task.id),
-                    None => super::super::classify_slot_locked(dag_id, slot),
-                };
-                super::super::slot_measure::observe(cpu_id, dag_id, slot.node_id, state, task_id);
+                let (taken, _in_ready) = take_slot_node(dag_id, slot);
+                #[cfg(feature = "perf")]
+                {
+                    let (state, task_id) = match &taken {
+                        Some(task) => (super::super::slot_measure::SLOT_READY, task.id),
+                        None => super::super::classify_slot(dag_id, slot, _in_ready),
+                    };
+                    super::super::slot_measure::observe(
+                        cpu_id,
+                        dag_id,
+                        slot.node_id,
+                        state,
+                        task_id,
+                    );
+                }
                 taken
             }
             .or_else(|| {
