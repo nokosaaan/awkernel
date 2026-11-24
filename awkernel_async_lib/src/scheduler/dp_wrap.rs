@@ -48,8 +48,8 @@ pub mod slot_measure;
 pub mod switch_table;
 
 use super::{
-    get_priority, peek_preemption_pending, push_preemption_pending, Scheduler, SchedulerType, Task,
-    GLOBAL_WAKE_GET_MUTEX, PREEMPTION_ENABLED,
+    get_priority, peek_preemption_pending, push_preemption_pending, ConditionalNext, Scheduler,
+    SchedulerType, Task, GLOBAL_WAKE_GET_MUTEX, PREEMPTION_ENABLED,
 };
 use crate::task::NUM_DAG_POOL_TASK_IN_QUEUE;
 use crate::{
@@ -678,6 +678,13 @@ impl Scheduler for DpWrapScheduler {
 
             return Some(task.task);
         }
+    }
+
+    fn get_next_if(&self, _pred: &dyn Fn(&Task) -> bool) -> ConditionalNext {
+        // `get_next_if` runs on the primary CPU, and CPU 0 is not in the DAG pool, so it never
+        // takes a task from this queue (`get_next_task_if` does not even
+        // examine it; this only satisfies the trait).
+        ConditionalNext::Empty
     }
 
     fn scheduler_name(&self) -> SchedulerType {

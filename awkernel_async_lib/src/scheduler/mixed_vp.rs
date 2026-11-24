@@ -46,7 +46,8 @@
 
 use super::{
     active_vp, get_priority, passive_vp, peek_preemption_pending, push_preemption_pending,
-    ClusteredTask, Scheduler, SchedulerType, Task, GLOBAL_WAKE_GET_MUTEX, PREEMPTION_ENABLED,
+    ClusteredTask, ConditionalNext, Scheduler, SchedulerType, Task, GLOBAL_WAKE_GET_MUTEX,
+    PREEMPTION_ENABLED,
 };
 use crate::{
     dag::{calculate_and_update_dag_deadline, is_job_release_wake},
@@ -217,6 +218,13 @@ impl Scheduler for MixedVpScheduler {
         }
 
         dispatched
+    }
+
+    fn get_next_if(&self, _pred: &dyn Fn(&Task) -> bool) -> ConditionalNext {
+        // `get_next_if` runs on the primary CPU, and spawn removes CPU 0 from every mixed-VP set, so it never
+        // takes a task from this queue (`get_next_task_if` does not even
+        // examine it; this only satisfies the trait).
+        ConditionalNext::Empty
     }
 
     fn scheduler_name(&self) -> SchedulerType {

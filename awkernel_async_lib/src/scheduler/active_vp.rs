@@ -33,8 +33,8 @@
 //! - Does not log, format, or call user code.
 
 use super::{
-    get_priority, peek_preemption_pending, push_preemption_pending, ClusteredTask, Scheduler,
-    SchedulerType, Task, GLOBAL_WAKE_GET_MUTEX, PREEMPTION_ENABLED,
+    get_priority, peek_preemption_pending, push_preemption_pending, ClusteredTask, ConditionalNext,
+    Scheduler, SchedulerType, Task, GLOBAL_WAKE_GET_MUTEX, PREEMPTION_ENABLED,
 };
 use crate::atomic_u64::AtomicU64;
 use crate::{
@@ -408,6 +408,13 @@ impl Scheduler for ActiveVpScheduler {
 
             return Some(task);
         }
+    }
+
+    fn get_next_if(&self, _pred: &dyn Fn(&Task) -> bool) -> ConditionalNext {
+        // `get_next_if` runs on the primary CPU, and spawn removes CPU 0 from every active-VP set, so it never
+        // takes a task from this queue (`get_next_task_if` does not even
+        // examine it; this only satisfies the trait).
+        ConditionalNext::Empty
     }
 
     fn scheduler_name(&self) -> SchedulerType {
