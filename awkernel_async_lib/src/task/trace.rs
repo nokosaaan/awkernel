@@ -13,6 +13,8 @@
 //! - `events()` must only be called after `stop()`; a record racing past the
 //!   enabled-check may at worst leave one torn event at the tail.
 
+mod compact;
+
 use crate::atomic_u64::AtomicU64;
 use alloc::vec::Vec;
 use array_macro::array;
@@ -94,18 +96,6 @@ pub const DPSW_NO_SUCCESSOR: u8 = 4;
 /// running node was stopped (the CPU's placeholder task took over) and the
 /// slot is left empty.
 pub const DPSW_STOP: u8 = 5;
-
-fn dpsw_path_name(path: u8) -> &'static str {
-    match path {
-        DPSW_PREEMPT => "preempt",
-        DPSW_IDLE => "idle",
-        DPSW_SAME => "same",
-        DPSW_TO_NONE => "none",
-        DPSW_NO_SUCCESSOR => "nosucc",
-        DPSW_STOP => "stop",
-        _ => "?",
-    }
-}
 
 static DPSW_IDX: [AtomicUsize; NUM_MAX_CPU] = array![_ => AtomicUsize::new(0); NUM_MAX_CPU];
 
@@ -526,36 +516,24 @@ pub fn dump_to_console() {
 
     for cpu_id in 0..awkernel_lib::cpu::num_cpu() {
         let evs = events(cpu_id);
-        let mut out = String::new();
+        // TRACE_EV,<cpu>,<task_id>,<S|E>,<tsc>[,<period_index|->], sent in
+        // the compact form (see `compact`): `TRACE_EVZ,<cpu>` then one
+        // `e...` line per event. The period field is only present under
+        // `period-index-propagation`, matching `plot_trace.py`'s
+        // backward-compatible parsing.
+        let mut out = format!("TRACE_EVZ,{cpu_id}\n");
+        let mut enc = compact::EvEncoder::default();
         for e in &evs {
             let kind = match e.kind {
                 KIND_START => 'S',
                 KIND_END => 'E',
                 _ => 'R',
             };
-
-            // TRACE_EV,<cpu>,<task_id>,<S|E>,<tsc>[,<period_index|->]
-            // The 6th field is only emitted under `period-index-propagation`,
-            // matching `plot_trace.py`'s backward-compatible parsing (an
-            // older 5-field line is still accepted).
             #[cfg(feature = "period-index-propagation")]
-            {
-                match e.period_index {
-                    Some(p) => out.push_str(&format!(
-                        "TRACE_EV,{cpu_id},{},{kind},{},{p}\r\n",
-                        e.task_id, e.tsc
-                    )),
-                    None => out.push_str(&format!(
-                        "TRACE_EV,{cpu_id},{},{kind},{},-\r\n",
-                        e.task_id, e.tsc
-                    )),
-                }
-            }
+            let period = Some(e.period_index);
             #[cfg(not(feature = "period-index-propagation"))]
-            out.push_str(&format!(
-                "TRACE_EV,{cpu_id},{},{kind},{}\r\n",
-                e.task_id, e.tsc
-            ));
+            let period = None;
+            enc.push(&mut out, e.task_id, kind, e.tsc, period);
 
             // Flush in chunks so a single huge String is not required.
             if out.len() > 4096 {
@@ -577,37 +555,21 @@ pub fn dump_to_console() {
     // TRACE_DPSW,<cpu>,<scheduled_ns>,<handler_ns>,<decided_ns|->,
     //   <started_ns|->,<from_dag|->,<to_dag|->,<path>,<skipped>,
     //   <entered_ns|->,<wake_lock_ns|->,<data_lock_ns|->,<pre_lock_ns|->
-    // One applied DAG-Fluid switch point (see `DpSwitchEvent`).
-    let ns_or_dash = |v: u64| if v == 0 { "-".into() } else { format!("{v}") };
-    let dag_or_dash = |v: u32| {
-        if v == u32::MAX {
-            "-".into()
-        } else {
-            format!("{v}")
-        }
-    };
+    // One applied DAG-Fluid switch point (see `DpSwitchEvent`), sent in the
+    // compact form: `TRACE_DPSWZ,<cpu>` then one `d...` line each.
     for cpu_id in 0..awkernel_lib::cpu::num_cpu() {
         let n = DPSW_IDX[cpu_id].load(Ordering::Relaxed);
-        let mut out = String::new();
+        let mut out = if n > 0 {
+            format!("TRACE_DPSWZ,{cpu_id}\n")
+        } else {
+            String::new()
+        };
+        let mut enc = compact::DpswEncoder::default();
         unsafe {
             let bufs = &*core::ptr::addr_of!(DPSW_BUFS);
             if let Some(buf) = bufs[cpu_id].as_ref() {
                 for e in buf.iter().take(n.min(DPSW_CAP)) {
-                    out.push_str(&format!(
-                        "TRACE_DPSW,{cpu_id},{},{},{},{},{},{},{},{},{},{},{},{}\r\n",
-                        e.scheduled_ns,
-                        e.handler_ns,
-                        ns_or_dash(e.decided_ns),
-                        ns_or_dash(e.started_ns),
-                        dag_or_dash(e.from_dag),
-                        dag_or_dash(e.to_dag),
-                        dpsw_path_name(e.path),
-                        e.skipped,
-                        ns_or_dash(e.entered_ns),
-                        ns_or_dash(e.wake_lock_ns),
-                        ns_or_dash(e.data_lock_ns),
-                        ns_or_dash(e.pre_lock_ns),
-                    ));
+                    enc.push(&mut out, e);
                     if out.len() > 4096 {
                         console::print(&out);
                         out.clear();
@@ -621,6 +583,14 @@ pub fn dump_to_console() {
         }
     }
 
+    let ns_or_dash = |v: u64| if v == 0 { "-".into() } else { format!("{v}") };
+    let dag_or_dash = |v: u32| {
+        if v == u32::MAX {
+            "-".into()
+        } else {
+            format!("{v}")
+        }
+    };
     // TRACE_SLOT,<cpu>,<dag|->,<node|->,<job|->,<start_ns>,<end_ns>,<state>,
     //   <observed_ns|->,<ready_ns|->,<started_ns|->,<skipped>
     // One per-node slot a CPU held (see `SlotEvent`).
@@ -666,25 +636,23 @@ pub fn dump_to_console() {
     //   a job release: its scheduled time and when the source woke for it.
     // TRACE_NDONE,<dag_id>,<node_id>,<job>,<done_ns>
     //   a node finishing a job.
+    // Both sent in the compact form: `TRACE_DAGEVZ,<cpu>` then `r...` /
+    // `n...` lines.
     let mut dropped_dag_events = 0;
     for cpu_id in 0..awkernel_lib::cpu::num_cpu() {
         let n = DAG_EV_IDX[cpu_id].load(Ordering::Relaxed);
         dropped_dag_events += n.saturating_sub(DAG_EV_CAP);
-        let mut out = String::new();
+        let mut out = if n > 0 {
+            format!("TRACE_DAGEVZ,{cpu_id}\n")
+        } else {
+            String::new()
+        };
+        let mut enc = compact::DagEvEncoder::default();
         unsafe {
             let bufs = &*core::ptr::addr_of!(DAG_EV_BUFS);
             if let Some(buf) = bufs[cpu_id].as_ref() {
                 for e in buf.iter().take(n.min(DAG_EV_CAP)) {
-                    match e.kind {
-                        DAG_EV_RELEASE => out.push_str(&format!(
-                            "TRACE_REL,{},{},{},{}\r\n",
-                            e.dag_id, e.job, e.at_ns, e.observed_ns
-                        )),
-                        _ => out.push_str(&format!(
-                            "TRACE_NDONE,{},{},{},{}\r\n",
-                            e.dag_id, e.node_id, e.job, e.at_ns
-                        )),
-                    }
+                    enc.push(&mut out, e);
                     if out.len() > 4096 {
                         console::print(&out);
                         out.clear();
