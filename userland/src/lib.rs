@@ -65,5 +65,8 @@ pub async fn run() -> Result<(), Cow<'static, str>> {
     #[cfg(feature = "test_active_vp")]
     test_active_vp::run().await; // smoke test for V-Fed's pure active-VP scheduling path
 
+    #[cfg(feature = "test_llft")]
+    test_llft::run().await;
+
     Ok(())
 }

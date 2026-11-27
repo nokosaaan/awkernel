@@ -21,8 +21,10 @@ use awkernel_lib::{
 use alloc::boxed::Box;
 
 pub(crate) mod active_vp;
+mod clustered;
 pub mod dp_wrap;
 mod edf;
+mod llft;
 pub(crate) mod mixed_vp;
 pub(super) mod panicked;
 pub(crate) mod passive_vp;
@@ -99,7 +101,7 @@ pub enum SchedulerType {
     /// normalized and gated exactly like `PassiveVp`'s. Disjoint from
     /// `active_set` by construction (a DAG never borrows its own cores).
     MixedVp(CpuSet, usize, CpuSet),
-    /// EDF: `(relative_deadline, cpu_set)`.
+    /// Earliest Deadline First (EDF): `(relative_deadline, cpu_set)`.
     ///
     /// `cpu_set` is the set of cores the task may run on. It is normalized at
     /// spawn time: CPU 0 (the primary core) and any out-of-range bits are
@@ -129,6 +131,12 @@ pub enum SchedulerType {
     /// own doc). `cpu_set()`/`is_clustered()` therefore both treat this
     /// variant like any non-clustered scheduler.
     DpWrap(u32),
+    /// Least Latest Finish Time (LLFT): `(relative_deadline, cpu_set)`.
+    ///
+    /// DAG tasks are ordered by their estimated latest finish; standalone
+    /// tasks use their relative deadline in microseconds. Affinity is
+    /// normalized in the same way as for EDF.
+    LLFT(u64, CpuSet),
     PrioritizedFIFO(u8),
     PrioritizedRR(u8),
     Panicked,
@@ -146,6 +154,7 @@ impl SchedulerType {
                 | (SchedulerType::DpWrap(_), SchedulerType::DpWrap(_))
                 | (SchedulerType::EDF(_, _), SchedulerType::EDF(_, _))
                 | (SchedulerType::PassiveVp(_), SchedulerType::PassiveVp(_))
+                | (SchedulerType::LLFT(_, _), SchedulerType::LLFT(_, _))
                 | (
                     SchedulerType::PrioritizedFIFO(_),
                     SchedulerType::PrioritizedFIFO(_)
@@ -158,15 +167,16 @@ impl SchedulerType {
         )
     }
 
-    /// Return the CPU affinity set if this is a [`SchedulerType::EDF`],
+    /// Return the CPU affinity set for a clustered scheduler
+    /// ([`SchedulerType::EDF`], [`SchedulerType::LLFT`],
     /// [`SchedulerType::ActiveVp`], [`SchedulerType::PassiveVp`], or
-    /// [`SchedulerType::MixedVp`] scheduler.
+    /// [`SchedulerType::MixedVp`]).
     ///
     /// Returns `Some(set)` where `set` is the set of CPU cores (`1..num_cpu()`) the task
     /// may run on. Returns `None` for all other scheduler variants.
     pub const fn cpu_set(&self) -> Option<CpuSet> {
         match self {
-            SchedulerType::EDF(_, set) => Some(*set),
+            SchedulerType::EDF(_, set) | SchedulerType::LLFT(_, set) => Some(*set),
             SchedulerType::ActiveVp(set, _) => Some(*set),
             SchedulerType::PassiveVp(set) => Some(*set),
             SchedulerType::MixedVp(active_set, _, passive_set) => {
@@ -186,6 +196,7 @@ impl SchedulerType {
             SchedulerType::ActiveVp(_, _)
                 | SchedulerType::MixedVp(_, _, _)
                 | SchedulerType::EDF(_, _)
+                | SchedulerType::LLFT(_, _)
                 | SchedulerType::PassiveVp(_)
         )
     }
@@ -225,12 +236,14 @@ impl SchedulerType {
 /// - The fourth highest priority.
 ///   - EDF scheduler (clustered, partitioned, and global over a set).
 /// - The fifth highest priority.
-///   - Passive-VP scheduler (V-Fed). Below `EDF` because a passive-VP's
+///   - LLFT scheduler (clustered, like EDF).
+/// - The sixth highest priority.
+///   - Passive-VP scheduler (V-Fed). Below `EDF`/`LLFT` because a passive-VP's
 ///     whole premise is "leftover capacity", lower priority than any
 ///     exclusive cluster reservation elsewhere.
-/// - The sixth highest priority.
-///   - Prioritized FIFO scheduler.
 /// - The seventh highest priority.
+///   - Prioritized FIFO scheduler.
+/// - The eighth highest priority.
 ///   - Prioritized Round-Robin scheduler.
 /// - The lowest priority.
 ///   - Panicked scheduler.
@@ -238,11 +251,12 @@ impl SchedulerType {
 /// The list is laid out as the DAG-pool prefix, then the clustered block,
 /// then the regular-pool tail; `get_next_task` relies on that layout (checked
 /// at compile time below).
-static PRIORITY_LIST: [SchedulerType; 8] = [
+static PRIORITY_LIST: [SchedulerType; 9] = [
     SchedulerType::DpWrap(0),
     SchedulerType::ActiveVp(CpuSet::empty(), 0),
     SchedulerType::MixedVp(CpuSet::empty(), 0, CpuSet::empty()),
     SchedulerType::EDF(0, CpuSet::empty()),
+    SchedulerType::LLFT(0, CpuSet::empty()),
     SchedulerType::PassiveVp(CpuSet::empty()),
     SchedulerType::PrioritizedFIFO(0),
     SchedulerType::PrioritizedRR(0),
@@ -303,14 +317,15 @@ static GLOBAL_WAKE_GET_MUTEX: Mutex<()> = Mutex::new(());
 /// # Implementing a clustered scheduler
 ///
 /// A clustered scheduler keeps tasks that may run only on a subset of CPUs.
-/// Every clustered scheduler must:
+/// Use [`clustered::ClusteredScheduler`] to share the affinity-aware queue,
+/// clustered-task accounting, and queued CPU mask implementation. Implement
+/// [`clustered::ClusteredOrdering`] to identify the scheduler type and define
+/// how ready tasks are ordered.
 ///
-/// 1. Wrap each entry of its run queue in [`ClusteredTask`] so that
-///    `NUM_CLUSTERED_TASKS_IN_QUEUE` is kept consistent.
-/// 2. Implement [`Scheduler::queued_cpu_mask`] to report the exact set of
-///    CPUs its queued tasks are runnable on (`wake_workers` relies on it).
-/// 3. Be placed in the clustered block of `PRIORITY_LIST` and be matched by
-///    `SchedulerType::is_clustered` (checked at compile time).
+/// The scheduler type must still be placed in the clustered block of
+/// `PRIORITY_LIST` (after the DAG-pool prefix) and matched by
+/// [`SchedulerType::is_clustered`]. The block requirement is checked at
+/// compile time.
 pub(crate) trait Scheduler {
     /// Enqueue an executable task.
     /// The enqueued task will be taken by `get_next()`.
@@ -537,6 +552,7 @@ pub(crate) fn get_scheduler(sched_type: &SchedulerType) -> &'static dyn Schedule
         SchedulerType::ActiveVp(_, _) => &active_vp::SCHEDULER,
         SchedulerType::MixedVp(_, _, _) => &mixed_vp::SCHEDULER,
         SchedulerType::PassiveVp(_) => &passive_vp::SCHEDULER,
+        SchedulerType::LLFT(_, _) => &llft::SCHEDULER,
         SchedulerType::Panicked => &panicked::SCHEDULER,
     }
 }

@@ -98,6 +98,10 @@ optional = true
 path = "../applications/tests/test_active_vp"
 optional = true
 
+[dependencies.test_llft]
+path = "../applications/tests/test_llft"
+optional = true
+
 [features]
 default = []
 perf = ["awkernel/perf", "awkernel_services/perf"]
@@ -163,3 +167,4 @@ test_voluntary_preemption = ["dep:test_voluntary_preemption"]
 test_edf = ["dep:test_edf"]
 test_clustered_dag = ["dep:test_clustered_dag"]
 test_active_vp = ["dep:test_active_vp"]
+test_llft = ["dep:test_llft"]

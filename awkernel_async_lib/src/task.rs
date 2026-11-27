@@ -435,7 +435,12 @@ impl Tasks {
             if let btree_map::Entry::Vacant(e) = self.id_to_task.entry(id) {
                 // Validate and normalise the CPU set before creating TaskInfo so that
                 // info.scheduler_type and task.cpu_set stay in sync.
-                let cpu_set = if let SchedulerType::EDF(deadline, set) = scheduler_type {
+                // Only EDF/LLFT take this generic path. `cpu_set()` is also
+                // `Some` for the V-Fed schedulers below, which need their own
+                // normalization (leading core, disjoint active/passive sets).
+                let cpu_set = if let SchedulerType::EDF(_, set) | SchedulerType::LLFT(_, set) =
+                    scheduler_type
+                {
                     // CPU 0 is the primary core and cannot run clustered tasks.
                     let masked = masked_workers(set, num_cpu());
                     let normalized = if masked.is_empty() {
@@ -450,7 +455,13 @@ impl Tasks {
                     } else {
                         masked
                     };
-                    scheduler_type = SchedulerType::EDF(deadline, normalized);
+                    scheduler_type = match scheduler_type {
+                        SchedulerType::EDF(deadline, _) => SchedulerType::EDF(deadline, normalized),
+                        SchedulerType::LLFT(deadline, _) => {
+                            SchedulerType::LLFT(deadline, normalized)
+                        }
+                        other => other,
+                    };
                     Some(normalized)
                 } else if let SchedulerType::ActiveVp(set, leading_cpu) = scheduler_type {
                     // Same normalization as EDF above; ActiveVp
