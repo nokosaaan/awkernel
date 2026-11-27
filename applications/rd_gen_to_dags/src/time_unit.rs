@@ -75,6 +75,18 @@ pub(super) fn simulated_execution_time(duration: u64) {
     awkernel_async_lib::task::cpu_time::spin_cpu_time(convert_duration(duration));
 }
 
+/// Log how [`simulated_execution_time`] realizes a node's execution time, so
+/// the trace analysis (`trace_view/exec_breakdown.py`) knows how to read the
+/// run: `busy_work` does a fixed amount of work (the time follows the core's
+/// speed), `cpu_time_work` runs for a fixed amount of CPU time (the work
+/// follows the core's speed).
+pub(super) fn log_execution_mode() {
+    #[cfg(not(feature = "cpu_time_work"))]
+    log::info!("rd_gen_to_dags: node execution = busy_work");
+    #[cfg(feature = "cpu_time_work")]
+    log::info!("rd_gen_to_dags: node execution = cpu_time_work");
+}
+
 // default
 #[cfg(not(any(
     feature = "seconds",

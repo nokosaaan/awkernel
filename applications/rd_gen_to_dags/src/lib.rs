@@ -174,6 +174,7 @@ fn federated_admit_batch(
 #[cfg(not(feature = "vfed"))]
 pub async fn run() {
     wait_millisec(1000);
+    time_unit::log_execution_mode();
 
     // DAG-Fluid's per-core switch timer (方式B): each DAG-pool CPU switches
     // at the times of its own switch table, which the planner started below
@@ -270,6 +271,7 @@ pub async fn run() {
 #[cfg(feature = "vfed")]
 pub async fn run() {
     wait_millisec(1000);
+    time_unit::log_execution_mode();
 
     // Pass 1: every DAG's `DagMetrics`, computed up front -- reparses
     // `DAG_FILES` independently of the `parse_yaml::parse_dags` call below

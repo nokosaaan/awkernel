@@ -49,9 +49,19 @@ pub const RATE_MAX_PCT: u32 = 200;
 const RATE_BUCKETS: usize = (RATE_MAX_PCT - RATE_MIN_PCT + 1) as usize + 2;
 /// CPUs with a record (the rest are not recorded).
 pub const RATE_CPUS: usize = 64;
+/// Steps shorter than this are not recorded: their fixed per-step cost
+/// (`cpu_id()`, the two clock reads) would dominate the ratio.
+const SHORT_MIN_NS: u64 = 5_000;
 
 static RECORD_RATES: AtomicBool = AtomicBool::new(false);
+/// Full [`CHUNK_NS`] chunks (the `busy_work` node execution).
 static RATES: [[AtomicU32; RATE_BUCKETS]; RATE_CPUS] =
+    [const { [const { AtomicU32::new(0) }; RATE_BUCKETS] }; RATE_CPUS];
+/// Shorter steps, from [`SHORT_MIN_NS`] up to [`CHUNK_NS`]: the 10 us steps
+/// `awkernel_async_lib::task::cpu_time::spin_cpu_time` (`cpu_time_work`)
+/// runs, and the last chunk of a `spin_work`. Kept apart because their
+/// fixed per-step cost makes the ratio a little larger.
+static SHORT_RATES: [[AtomicU32; RATE_BUCKETS]; RATE_CPUS] =
     [const { [const { AtomicU32::new(0) }; RATE_BUCKETS] }; RATE_CPUS];
 
 /// Start (`true`, after clearing every count) or stop recording chunk rates.
@@ -59,7 +69,7 @@ static RATES: [[AtomicU32; RATE_BUCKETS]; RATE_CPUS] =
 /// itself, so the record covers the same window.
 pub fn record_rates(on: bool) {
     if on {
-        for cpu in RATES.iter() {
+        for cpu in RATES.iter().chain(SHORT_RATES.iter()) {
             for bucket in cpu.iter() {
                 bucket.store(0, Ordering::Relaxed);
             }
@@ -73,7 +83,19 @@ pub fn record_rates(on: bool) {
 /// the below-range bucket reports `RATE_MIN_PCT - 1` and the above-range
 /// bucket `RATE_MAX_PCT + 1`.
 pub fn recorded_rates(cpu_id: usize) -> impl Iterator<Item = (u32, u32)> {
-    RATES
+    buckets_of(&RATES, cpu_id)
+}
+
+/// Like [`recorded_rates`], for the steps shorter than a full chunk.
+pub fn recorded_short_rates(cpu_id: usize) -> impl Iterator<Item = (u32, u32)> {
+    buckets_of(&SHORT_RATES, cpu_id)
+}
+
+fn buckets_of(
+    table: &'static [[AtomicU32; RATE_BUCKETS]; RATE_CPUS],
+    cpu_id: usize,
+) -> impl Iterator<Item = (u32, u32)> {
+    table
         .get(cpu_id)
         .into_iter()
         .flat_map(|cpu| cpu.iter().enumerate())
@@ -85,7 +107,12 @@ pub fn recorded_rates(cpu_id: usize) -> impl Iterator<Item = (u32, u32)> {
 }
 
 fn record_rate(cpu_id: usize, elapsed_ns: u64, step_ns: u64) {
-    let Some(cpu) = RATES.get(cpu_id) else {
+    let table = if step_ns >= CHUNK_NS {
+        &RATES
+    } else {
+        &SHORT_RATES
+    };
+    let Some(cpu) = table.get(cpu_id) else {
         return;
     };
     let pct = elapsed_ns.saturating_mul(100) / step_ns.max(1);
@@ -198,9 +225,9 @@ pub fn spin_work(duration: Duration) {
         };
 
         let iters = per_ms.saturating_mul(step_ns) / 1_000_000;
-        // Only a full chunk is a fair sample (a short last chunk has a
-        // larger share of fixed cost).
-        let start = (step_ns == CHUNK_NS && RECORD_RATES.load(Ordering::Relaxed))
+        // Full chunks and shorter steps are recorded apart (see
+        // `SHORT_RATES`); steps too short to measure are not recorded.
+        let start = (step_ns >= SHORT_MIN_NS && RECORD_RATES.load(Ordering::Relaxed))
             .then(crate::delay::uptime_nano);
         for _ in 0..iters {
             acc = busy_iteration(acc);

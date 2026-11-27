@@ -426,8 +426,15 @@ def stage_group(dags_dir, dag_names, staging_dir):
     return staged
 
 
+# How a node's execution time is realized (rd_gen_to_dags' time_unit.rs):
+# busy_work does a calibrated amount of work, so the time follows the core's
+# speed; cpu_time runs until the task has been on a CPU for the specified
+# time (the `rd_gen_cpu_time` userland feature), so the work follows it.
+EXEC_MODE_FEATURES = {"busy_work": None, "cpu_time": "rd_gen_cpu_time"}
+
+
 def run_build(awkernel_dir, staging_dir, dry_run, algorithm="federated", smt_disable=True, fix_freq=True,
-              fluid_pool_cpus=None):
+              fluid_pool_cpus=None, exec_mode="busy_work"):
     make_args = ["make", "x86_64", "RELEASE=1"]
     features = []
     algo_feature = ALGO_FEATURES[algorithm]
@@ -442,6 +449,8 @@ def run_build(awkernel_dir, staging_dir, dry_run, algorithm="federated", smt_dis
     # execution speed doesn't drift with turbo/thermal headroom across trials.
     if fix_freq:
         features.append("fix_freq")
+    if EXEC_MODE_FEATURES[exec_mode]:
+        features.append(EXEC_MODE_FEATURES[exec_mode])
     if features:
         make_args.append(f"EXTRA_FEATURES=--features {','.join(features)}")
     env = {**os.environ, "RD_GEN_DAGS_DIR": str(staging_dir)}
@@ -606,12 +615,13 @@ def run_trial_for_algorithm(args, state, boot_cache_path, batch_id, algorithm, s
     algorithms share one `batch_id`, so it alone can't serve as a state
     record's primary key)."""
     trial_id = next_trial_id(state)
-    print(f"--- trial {batch_id} (algorithm={algorithm}, smt_disable={args.smt_disable}, fix_freq={args.fix_freq}) ---")
+    print(f"--- trial {batch_id} (algorithm={algorithm}, smt_disable={args.smt_disable}, fix_freq={args.fix_freq}, "
+          f"exec_mode={args.exec_mode}) ---")
 
     fluid_pool_cpus = resolve_fluid_pool_cpus(args, algorithm, trial_record)
     run_build(
         args.awkernel_dir, args.staging_dir, args.dry_run, algorithm, args.smt_disable, args.fix_freq,
-        fluid_pool_cpus,
+        fluid_pool_cpus, args.exec_mode,
     )
 
     log_path = args.log_dir / f"{args.log_prefix}{batch_id}_{algorithm}.log"
@@ -642,6 +652,7 @@ def run_trial_for_algorithm(args, state, boot_cache_path, batch_id, algorithm, s
         "algorithm": algorithm,
         "smt_disable": args.smt_disable,
         "fix_freq": args.fix_freq,
+        "exec_mode": args.exec_mode,
         "fluid_pool_cpus": fluid_pool_cpus,
         **selection_info,
         # This algorithm's own offline verdict for the staged set (the
@@ -803,6 +814,11 @@ def parse_args():
     p.add_argument("--no-fix-freq", action="store_true",
                     help="build without the kernel's fix_freq feature, i.e. leave CPU frequency "
                          "under firmware control including turbo (default: fix_freq is on)")
+    p.add_argument("--exec-mode", choices=sorted(EXEC_MODE_FEATURES), default="busy_work",
+                   help="how a node's execution time is realized: busy_work (default) does the calibrated "
+                        "amount of work, so the time follows the core's speed; cpu_time runs until the node "
+                        "has been on a CPU for its specified time (adds the rd_gen_cpu_time feature). "
+                        "cpu_time trials go to real_machine_cpu_time/ by default so the two never mix")
     p.add_argument("--dry-run", action="store_true", help="print planned actions without touching the network/build/serial port")
     args = p.parse_args()
     args.smt_disable = not args.no_smt_disable
@@ -810,11 +826,13 @@ def parse_args():
     if args.trials_jsonl is not None:
         apply_manifest_config(p, args)
     if args.log_dir is None:
+        # One directory per execution mode, so analyze_trials.py never mixes them.
+        suffix = "" if args.exec_mode == "busy_work" else f"_{args.exec_mode}"
         if args.trials_jsonl is not None:
-            args.log_dir = args.trials_jsonl.expanduser().resolve().parent / "real_machine"
+            args.log_dir = args.trials_jsonl.expanduser().resolve().parent / f"real_machine{suffix}"
         else:
             root = Path(os.environ.get("AWKERNEL_TRIALS_DIR") or DEFAULT_TRIALS_ROOT)
-            args.log_dir = root / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}_pool"
+            args.log_dir = root / f"{datetime.now().strftime('%Y%m%d-%H%M%S')}_pool{suffix}"
     args.algorithms = [a.strip() for a in args.algorithms.split(",") if a.strip()]
     unknown = [a for a in args.algorithms if a not in ALGO_FEATURES]
     if unknown:

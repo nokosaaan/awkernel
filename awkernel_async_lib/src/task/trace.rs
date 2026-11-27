@@ -718,6 +718,23 @@ pub fn dump_to_console() {
             .map_or_else(|| "-".into(), |v| format!("{v}"));
         console::print(&format!("TRACE_BUSY,{cpu_id},{per_ms},{buckets}\r\n"));
     }
+    // TRACE_BUSY_SHORT: the same for steps shorter than one chunk (the 10 us
+    // steps of `cpu_time_work`, and the last chunk of a `spin_work`).
+    for cpu_id in 0..awkernel_lib::cpu::num_cpu() {
+        let mut buckets = String::new();
+        for (pct, count) in awkernel_lib::busy_work::recorded_short_rates(cpu_id) {
+            if !buckets.is_empty() {
+                buckets.push(';');
+            }
+            buckets.push_str(&format!("{pct}:{count}"));
+        }
+        if buckets.is_empty() {
+            continue;
+        }
+        let per_ms = awkernel_lib::busy_work::iters_per_ms(cpu_id)
+            .map_or_else(|| "-".into(), |v| format!("{v}"));
+        console::print(&format!("TRACE_BUSY_SHORT,{cpu_id},{per_ms},{buckets}\r\n"));
+    }
 
     console::print("TRACE_END\r\n");
 }
