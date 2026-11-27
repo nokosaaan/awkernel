@@ -323,7 +323,33 @@ fn init_cpu_execution_speed(cpu_id: usize) {
     }
 
     match awkernel_lib::busy_work::calibrate_current_cpu() {
-        Some(per_ms) => log::info!("busy_work: CPU#{cpu_id} calibrated at {per_ms} iterations/ms"),
+        Some(per_ms) => {
+            log::info!("busy_work: CPU#{cpu_id} calibrated at {per_ms} iterations/ms");
+            // Which hardware thread this is (the x86 APIC ID): SMT siblings
+            // share it but for the lowest bit, so the analysis can tell
+            // whether a node's sibling thread was busy while it ran.
+            log::info!(
+                "cpu: CPU#{cpu_id} raw CPU ID {}",
+                awkernel_lib::cpu::raw_cpu_id()
+            );
+            // Self-check, right after calibration (same frequency): time a
+            // `spin_work` of `SELF_CHECK` with interrupts disabled. A result
+            // far from `SELF_CHECK` means `spin_work`'s loop runs at a
+            // different speed than the calibration loop; a result close to
+            // it, while nodes still run long later, points at the frequency
+            // changing after boot instead.
+            const SELF_CHECK: core::time::Duration = core::time::Duration::from_millis(5);
+            let took_us = {
+                let _int_guard = awkernel_lib::interrupt::InterruptGuard::new();
+                let start = awkernel_lib::delay::uptime();
+                awkernel_lib::busy_work::spin_work(SELF_CHECK);
+                awkernel_lib::delay::uptime().saturating_sub(start)
+            };
+            log::info!(
+                "busy_work: CPU#{cpu_id} self-check spin_work({} us) took {took_us} us",
+                SELF_CHECK.as_micros()
+            );
+        }
         None => log::warn!("busy_work: CPU#{cpu_id} could not be calibrated"),
     }
 }

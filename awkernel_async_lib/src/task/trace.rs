@@ -393,6 +393,7 @@ pub fn start() {
     super::perf::reset_pubsub_tables();
 
     // Buffers must be visible before any CPU starts recording.
+    awkernel_lib::busy_work::record_rates(true);
     ENABLED.store(true, Ordering::Release);
 }
 
@@ -401,6 +402,7 @@ pub fn stop() {
     if !ENABLED.swap(false, Ordering::AcqRel) {
         return;
     }
+    awkernel_lib::busy_work::record_rates(false);
 
     CAL_END_TSC.store(awkernel_lib::delay::cpu_counter(), Ordering::Relaxed);
     CAL_END_US.store(awkernel_lib::delay::uptime(), Ordering::Relaxed);
@@ -694,6 +696,27 @@ pub fn dump_to_console() {
     }
     if dropped_dag_events > 0 {
         console::print(&format!("TRACE_DAG_EV_DROPPED,{dropped_dag_events}\r\n"));
+    }
+
+    // TRACE_BUSY,<cpu>,<calibrated iterations/ms|->,<pct>:<count>;...
+    // How long each busy_work chunk took relative to its calibrated length,
+    // in hundredths, over the trace window (see
+    // `awkernel_lib::busy_work::record_rates`). 79 is "below 80", 201 is
+    // "above 200".
+    for cpu_id in 0..awkernel_lib::cpu::num_cpu() {
+        let mut buckets = String::new();
+        for (pct, count) in awkernel_lib::busy_work::recorded_rates(cpu_id) {
+            if !buckets.is_empty() {
+                buckets.push(';');
+            }
+            buckets.push_str(&format!("{pct}:{count}"));
+        }
+        if buckets.is_empty() {
+            continue;
+        }
+        let per_ms = awkernel_lib::busy_work::iters_per_ms(cpu_id)
+            .map_or_else(|| "-".into(), |v| format!("{v}"));
+        console::print(&format!("TRACE_BUSY,{cpu_id},{per_ms},{buckets}\r\n"));
     }
 
     console::print("TRACE_END\r\n");

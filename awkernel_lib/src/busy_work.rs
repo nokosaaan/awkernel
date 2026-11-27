@@ -13,7 +13,7 @@
 
 use core::{
     hint::black_box,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -32,6 +32,74 @@ const SAMPLE_EVERY: u64 = 4096;
 /// enough to amortize it (~0.3% at 100us); a chunk interrupted by a migration is
 /// charged at its starting CPU's rate, an error bounded by one chunk.
 const CHUNK_NS: u64 = 100_000;
+
+/// Runtime-rate record (see [`record_rates`]): per CPU, how long each
+/// [`spin_work`] chunk actually took relative to its calibrated length, in
+/// hundredths, bucketed from [`RATE_MIN_PCT`] to [`RATE_MAX_PCT`]. The two
+/// extra buckets hold everything below / above that range.
+///
+/// A chunk that no interrupt hit takes exactly the loop's runtime speed, so
+/// the low end of a CPU's distribution is how fast the loop really ran there
+/// (the frequency and sharing at run time); chunks hit by an interrupt land
+/// higher. Comparing it with the calibration tells whether a node runs long
+/// because the loop itself got slower or because something else ran inside
+/// its slices.
+pub const RATE_MIN_PCT: u32 = 80;
+pub const RATE_MAX_PCT: u32 = 200;
+const RATE_BUCKETS: usize = (RATE_MAX_PCT - RATE_MIN_PCT + 1) as usize + 2;
+/// CPUs with a record (the rest are not recorded).
+pub const RATE_CPUS: usize = 64;
+
+static RECORD_RATES: AtomicBool = AtomicBool::new(false);
+static RATES: [[AtomicU32; RATE_BUCKETS]; RATE_CPUS] =
+    [const { [const { AtomicU32::new(0) }; RATE_BUCKETS] }; RATE_CPUS];
+
+/// Start (`true`, after clearing every count) or stop recording chunk rates.
+/// The trace (`awkernel_async_lib::task::trace`) starts and stops it with
+/// itself, so the record covers the same window.
+pub fn record_rates(on: bool) {
+    if on {
+        for cpu in RATES.iter() {
+            for bucket in cpu.iter() {
+                bucket.store(0, Ordering::Relaxed);
+            }
+        }
+    }
+    RECORD_RATES.store(on, Ordering::Release);
+}
+
+/// `cpu_id`'s recorded chunk counts as `(pct, count)` for every non-empty
+/// bucket, in increasing order. `pct` is the bucket's ratio in hundredths;
+/// the below-range bucket reports `RATE_MIN_PCT - 1` and the above-range
+/// bucket `RATE_MAX_PCT + 1`.
+pub fn recorded_rates(cpu_id: usize) -> impl Iterator<Item = (u32, u32)> {
+    RATES
+        .get(cpu_id)
+        .into_iter()
+        .flat_map(|cpu| cpu.iter().enumerate())
+        .filter_map(|(i, bucket)| {
+            let count = bucket.load(Ordering::Relaxed);
+            let pct = (RATE_MIN_PCT + i as u32).saturating_sub(1);
+            (count != 0).then_some((pct, count))
+        })
+}
+
+fn record_rate(cpu_id: usize, elapsed_ns: u64, step_ns: u64) {
+    let Some(cpu) = RATES.get(cpu_id) else {
+        return;
+    };
+    let pct = elapsed_ns.saturating_mul(100) / step_ns.max(1);
+    let index = if pct < u64::from(RATE_MIN_PCT) {
+        0
+    } else if pct > u64::from(RATE_MAX_PCT) {
+        RATE_BUCKETS - 1
+    } else {
+        (pct - u64::from(RATE_MIN_PCT)) as usize + 1
+    };
+    if let Some(bucket) = cpu.get(index) {
+        bucket.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 #[inline(always)]
 fn busy_iteration(acc: u64) -> u64 {
@@ -117,11 +185,12 @@ pub fn spin_work(duration: Duration) {
     while remaining_ns > 0 {
         let step_ns = remaining_ns.min(CHUNK_NS);
 
-        let Some(per_ms) = iters_per_ms(crate::cpu::cpu_id()) else {
+        let cpu_id = crate::cpu::cpu_id();
+        let Some(per_ms) = iters_per_ms(cpu_id) else {
             if !WARNED_UNCALIBRATED.swap(true, Ordering::Relaxed) {
                 log::warn!(
                     "busy_work: CPU#{} is not calibrated; falling back to a wall-clock wait",
-                    crate::cpu::cpu_id()
+                    cpu_id
                 );
             }
             crate::delay::wait_microsec(remaining_ns.div_ceil(1000));
@@ -129,8 +198,16 @@ pub fn spin_work(duration: Duration) {
         };
 
         let iters = per_ms.saturating_mul(step_ns) / 1_000_000;
+        // Only a full chunk is a fair sample (a short last chunk has a
+        // larger share of fixed cost).
+        let start = (step_ns == CHUNK_NS && RECORD_RATES.load(Ordering::Relaxed))
+            .then(crate::delay::uptime_nano);
         for _ in 0..iters {
             acc = busy_iteration(acc);
+        }
+        if let Some(start) = start {
+            let elapsed = crate::delay::uptime_nano().saturating_sub(start);
+            record_rate(cpu_id, u64::try_from(elapsed).unwrap_or(u64::MAX), step_ns);
         }
 
         remaining_ns -= step_ns;
